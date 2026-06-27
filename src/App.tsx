@@ -81,6 +81,7 @@ type ArrowEdgeType = Edge<FlowArrowData>;
 type SaveStatus = "saving" | "saved" | "error";
 type CtrlWheelState = { x: number; y: number } | null;
 type MoveMode = "x" | "y" | "free";
+type ResizeEdge = "right" | "bottom" | "corner";
 type SidebarResizeSide = "left" | "right";
 
 const LEFT_SIDEBAR_DEFAULT_WIDTH = 320;
@@ -89,13 +90,58 @@ const LEFT_SIDEBAR_MAX_WIDTH = 560;
 const RIGHT_SIDEBAR_DEFAULT_WIDTH = 340;
 const RIGHT_SIDEBAR_MIN_WIDTH = 280;
 const RIGHT_SIDEBAR_MAX_WIDTH = 600;
+const MODULE_RESIZE_MIN_WIDTH = 170;
+const MODULE_RESIZE_MAX_WIDTH = 2400;
+const MODULE_RESIZE_MIN_HEIGHT = 96;
+const MODULE_RESIZE_MAX_HEIGHT = 400;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function clampModuleWidth(value: number) {
+  return clamp(value, MODULE_RESIZE_MIN_WIDTH, MODULE_RESIZE_MAX_WIDTH);
+}
+
+function clampModuleHeight(value: number) {
+  return clamp(value, MODULE_RESIZE_MIN_HEIGHT, MODULE_RESIZE_MAX_HEIGHT);
+}
+
 function clampWithDefault(value: unknown, fallback: number, min: number, max: number) {
   return clamp(typeof value === "number" && Number.isFinite(value) ? value : fallback, min, max);
+}
+
+function isResizableShape(shape: ModuleShape) {
+  return shape === "rectangle" || shape === "ellipse";
+}
+
+function getPositiveDimension(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  if (typeof value === "string") {
+    const parsed = Number.parseFloat(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return null;
+}
+
+function getModuleNodeDimensions(node: ModuleNodeType) {
+  const fallbackHeight = node.data.shape === "ellipse" ? 118 : 128;
+  const width =
+    getPositiveDimension(node.data.customWidth) ??
+    getPositiveDimension(node.style?.width) ??
+    getPositiveDimension(node.width) ??
+    getPositiveDimension(node.measured?.width) ??
+    MODULE_RESIZE_MIN_WIDTH;
+  const height =
+    getPositiveDimension(node.data.customHeight) ??
+    getPositiveDimension(node.style?.height) ??
+    getPositiveDimension(node.height) ??
+    getPositiveDimension(node.measured?.height) ??
+    fallbackHeight;
+  return {
+    width: clampModuleWidth(width),
+    height: clampModuleHeight(height),
+  };
 }
 
 const SHAPE_ICONS: Record<ModuleShape, typeof Square> = {
@@ -117,6 +163,14 @@ const SHAPE_CLASS: Record<ModuleShape, string> = {
 const COMMAND_KEYWORDS = ["arrow", "to", "type", ...ARROW_TYPES];
 
 function moduleToNode(module: FlowModule, selected: boolean): ModuleNodeType {
+  const style: React.CSSProperties = {};
+  if (isResizableShape(module.data.shape) && typeof module.data.customWidth === "number" && module.data.customWidth > 0) {
+    style.width = module.data.customWidth;
+  }
+  if (isResizableShape(module.data.shape) && typeof module.data.customHeight === "number" && module.data.customHeight > 0) {
+    style.height = module.data.customHeight;
+  }
+
   return {
     id: module.id,
     type: "module",
@@ -124,6 +178,7 @@ function moduleToNode(module: FlowModule, selected: boolean): ModuleNodeType {
     sourcePosition: Position.Bottom,
     targetPosition: Position.Top,
     data: module.data,
+    style: Object.keys(style).length > 0 ? style : undefined,
     selected,
     draggable: true,
   };
@@ -213,14 +268,14 @@ function ShapeVisual({ shape }: { shape: ModuleShape }) {
 
   if (shape === "ellipse") {
     return (
-      <svg className="module-shape-visual" viewBox="0 0 170 132" aria-hidden>
+      <svg className="module-shape-visual" viewBox="0 0 170 132" preserveAspectRatio="none" aria-hidden>
         <ellipse cx="85" cy="66" rx="76" ry="48" />
       </svg>
     );
   }
 
   return (
-    <svg className="module-shape-visual" viewBox="0 0 170 132" aria-hidden>
+    <svg className="module-shape-visual" viewBox="0 0 170 132" preserveAspectRatio="none" aria-hidden>
       <rect x="9" y="18" width="152" height="96" rx="7" />
     </svg>
   );
@@ -228,6 +283,17 @@ function ShapeVisual({ shape }: { shape: ModuleShape }) {
 
 const ModuleNode = memo(function ModuleNode({ id, data, selected }: NodeProps<ModuleNodeType>) {
   const updateNodeInternals = useUpdateNodeInternals();
+  const customStyle = useMemo(() => {
+    const style: React.CSSProperties = {};
+    if (isResizableShape(data.shape) && typeof data.customWidth === "number" && data.customWidth > 0) {
+      style.width = data.customWidth;
+    }
+    if (isResizableShape(data.shape) && typeof data.customHeight === "number" && data.customHeight > 0) {
+      style.height = data.customHeight;
+    }
+    return Object.keys(style).length > 0 ? style : undefined;
+  }, [data.customHeight, data.customWidth, data.shape]);
+  const hasCustomDimensions = Boolean(customStyle);
   const html = useMemo(() => {
     if (!data.latexEnabled) return "";
     try {
@@ -240,10 +306,13 @@ const ModuleNode = memo(function ModuleNode({ id, data, selected }: NodeProps<Mo
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => updateNodeInternals(id));
     return () => window.cancelAnimationFrame(frame);
-  }, [data.content, data.latexEnabled, data.moduleType, data.shape, id, updateNodeInternals]);
+  }, [data.content, data.customHeight, data.customWidth, data.latexEnabled, data.moduleType, data.shape, id, updateNodeInternals]);
 
   return (
-    <div className={`module-node shape-${SHAPE_CLASS[data.shape]} ${selected ? "selected" : ""} ${data.enabled ? "" : "disabled"}`}>
+    <div
+      className={`module-node shape-${SHAPE_CLASS[data.shape]} ${hasCustomDimensions ? "custom-sized" : ""} ${selected ? "selected" : ""} ${data.enabled ? "" : "disabled"}`}
+      style={customStyle}
+    >
       <Handle type="target" position={Position.Top} id="top" className="module-handle module-handle-top" />
       <div className={`module-body shape-${SHAPE_CLASS[data.shape]}`}>
         <ShapeVisual shape={data.shape} />
@@ -405,6 +474,17 @@ function AppShell() {
     frame: number | null;
     lastPointer: { x: number; y: number };
   } | null>(null);
+  const resizeDragRef = useRef<{
+    nodeId: string;
+    edge: ResizeEdge;
+    pointerId: number;
+    startClient: { x: number; y: number };
+    startDimensions: { width: number; height: number };
+    lastClient: { x: number; y: number };
+    frame: number | null;
+    target: HTMLElement | null;
+    viewportZoom: number;
+  } | null>(null);
   const loadedRef = useRef(false);
   const projectsRef = useRef<Project[]>([]);
   const groupsRef = useRef<ProjectGroup[]>([]);
@@ -559,6 +639,7 @@ function AppShell() {
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (sidebarResizeRef.current) return;
+      if (resizeDragRef.current) return;
       if (gizmoDragRef.current && !capturedPointerRef.current) {
         resetInteractionStateRef.current();
       }
@@ -628,6 +709,13 @@ function AppShell() {
       if (activeGizmo?.frame !== null && activeGizmo?.frame !== undefined) {
         window.cancelAnimationFrame(activeGizmo.frame);
       }
+      const activeResize = resizeDragRef.current;
+      if (activeResize?.frame !== null && activeResize?.frame !== undefined) {
+        window.cancelAnimationFrame(activeResize.frame);
+      }
+      if (activeResize?.target?.hasPointerCapture?.(activeResize.pointerId)) {
+        activeResize.target.releasePointerCapture(activeResize.pointerId);
+      }
       const captured = capturedPointerRef.current;
       if (captured?.element.hasPointerCapture?.(captured.pointerId)) {
         captured.element.releasePointerCapture(captured.pointerId);
@@ -639,6 +727,7 @@ function AppShell() {
       sidebarResizeRef.current = null;
       capturedPointerRef.current = null;
       gizmoDragRef.current = null;
+      resizeDragRef.current = null;
       isVisualDraggingRef.current = false;
       document.body.style.userSelect = "";
       document.body.style.cursor = "";
@@ -659,7 +748,7 @@ function AppShell() {
 
   useEffect(() => {
     const resetStaleDrag = () => {
-      if (!gizmoDragRef.current && isVisualDraggingRef.current) resetInteractionState();
+      if (!gizmoDragRef.current && !resizeDragRef.current && isVisualDraggingRef.current) resetInteractionState();
     };
     window.addEventListener("pointerup", resetStaleDrag);
     window.addEventListener("pointercancel", resetStaleDrag);
@@ -693,6 +782,58 @@ function AppShell() {
             : project,
         );
       updateProjects(applyPosition);
+    },
+    [currentProjectId, setFlowNodes, updateProjects],
+  );
+
+  const commitNodeDimensions = useCallback(
+    (nodeId: string, customWidth: number, customHeight: number) => {
+      const width = clampModuleWidth(customWidth);
+      const height = clampModuleHeight(customHeight);
+
+      setFlowNodes((previous) => {
+        const next = previous.map((node) =>
+          node.id === nodeId
+            ? {
+                ...node,
+                style: {
+                  ...node.style,
+                  width,
+                  height,
+                },
+                data: {
+                  ...node.data,
+                  customWidth: width,
+                  customHeight: height,
+                },
+              }
+            : node,
+        );
+        flowNodesRef.current = next;
+        return next;
+      });
+
+      updateProjects((previous) =>
+        previous.map((project) =>
+          project.id === currentProjectId
+            ? {
+                ...project,
+                modules: project.modules.map((module) =>
+                  module.id === nodeId
+                    ? {
+                        ...module,
+                        data: {
+                          ...module.data,
+                          customWidth: width,
+                          customHeight: height,
+                        },
+                      }
+                    : module,
+                ),
+              }
+            : project,
+        ),
+      );
     },
     [currentProjectId, setFlowNodes, updateProjects],
   );
@@ -770,6 +911,119 @@ function AppShell() {
     document.addEventListener("mouseup", finishResize);
     document.addEventListener("pointerup", finishResize);
   }, [leftSidebarWidth, resetInteractionState, rightSidebarWidth]);
+
+  const startResizeDrag = useCallback(
+    (event: React.PointerEvent, edge: ResizeEdge) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (gizmoDragRef.current || resizeDragRef.current || isVisualDraggingRef.current) return;
+      if (selectedElement?.kind !== "module") return;
+
+      const selectedNode = flowNodes.find((node) => node.id === selectedElement.id);
+      if (!selectedNode || !isResizableShape(selectedNode.data.shape)) return;
+
+      const startDimensions = getModuleNodeDimensions(selectedNode);
+      const pointerTarget = event.currentTarget as HTMLElement;
+      resizeDragRef.current = {
+        nodeId: selectedNode.id,
+        edge,
+        pointerId: event.pointerId,
+        startClient: { x: event.clientX, y: event.clientY },
+        startDimensions,
+        lastClient: { x: event.clientX, y: event.clientY },
+        frame: null,
+        target: pointerTarget,
+        viewportZoom: viewport.zoom || 1,
+      };
+      isVisualDraggingRef.current = true;
+      setCtrlWheel(null);
+      pointerTarget.setPointerCapture?.(event.pointerId);
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = edge === "right" ? "ew-resize" : edge === "bottom" ? "ns-resize" : "nwse-resize";
+
+      const getResizeDimensions = (active: NonNullable<typeof resizeDragRef.current>) => {
+        const deltaX = (active.lastClient.x - active.startClient.x) / active.viewportZoom;
+        const deltaY = (active.lastClient.y - active.startClient.y) / active.viewportZoom;
+        const nextWidth = active.edge === "bottom" ? active.startDimensions.width : active.startDimensions.width + deltaX;
+        const nextHeight = active.edge === "right" ? active.startDimensions.height : active.startDimensions.height + deltaY;
+        return {
+          width: clampModuleWidth(nextWidth),
+          height: clampModuleHeight(nextHeight),
+        };
+      };
+
+      const applyResize = () => {
+        const active = resizeDragRef.current;
+        if (!active) return;
+        active.frame = null;
+        const nextDimensions = getResizeDimensions(active);
+        setFlowNodes((previous) => {
+          const next = previous.map((node) =>
+            node.id === active.nodeId
+              ? {
+                  ...node,
+                  style: {
+                    ...node.style,
+                    width: nextDimensions.width,
+                    height: nextDimensions.height,
+                  },
+                  data: {
+                    ...node.data,
+                    customWidth: nextDimensions.width,
+                    customHeight: nextDimensions.height,
+                  },
+                }
+              : node,
+          );
+          flowNodesRef.current = next;
+          return next;
+        });
+      };
+
+      const onPointerMove = (moveEvent: PointerEvent) => {
+        const active = resizeDragRef.current;
+        if (!active || moveEvent.pointerId !== active.pointerId) return;
+        active.lastClient = { x: moveEvent.clientX, y: moveEvent.clientY };
+        if (active.frame === null) active.frame = window.requestAnimationFrame(applyResize);
+      };
+
+      let resizeFinished = false;
+      const finishResize = (finishEvent?: Event) => {
+        const active = resizeDragRef.current;
+        if (finishEvent instanceof PointerEvent && active && finishEvent.pointerId !== active.pointerId) return;
+        if (resizeFinished) return;
+        resizeFinished = true;
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", finishResize);
+        window.removeEventListener("pointercancel", finishResize);
+        window.removeEventListener("blur", finishResize);
+        document.removeEventListener("mouseup", finishResize);
+        document.removeEventListener("pointerup", finishResize);
+        if (!active) {
+          resetInteractionState();
+          return;
+        }
+        if (active.frame !== null) window.cancelAnimationFrame(active.frame);
+        const finalDimensions = getResizeDimensions(active);
+        if (active.target?.hasPointerCapture?.(active.pointerId)) {
+          active.target.releasePointerCapture(active.pointerId);
+        }
+        resizeDragRef.current = null;
+        isVisualDraggingRef.current = false;
+        document.body.style.userSelect = "";
+        document.body.style.cursor = "";
+        commitNodeDimensions(active.nodeId, finalDimensions.width, finalDimensions.height);
+      };
+
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", finishResize);
+      window.addEventListener("pointercancel", finishResize);
+      window.addEventListener("blur", finishResize);
+      document.addEventListener("mouseup", finishResize);
+      document.addEventListener("pointerup", finishResize);
+    },
+    [commitNodeDimensions, flowNodes, resetInteractionState, selectedElement, setFlowNodes, viewport.zoom],
+  );
 
   const projectEdges = useMemo(
     () => currentProject?.arrows.map((arrow) => arrowToEdge(arrow, selectedElement?.kind === "arrow" && selectedElement.id === arrow.id)) ?? [],
@@ -981,6 +1235,7 @@ function AppShell() {
   );
 
   const onNodeDragStart = useCallback(() => {
+    if (resizeDragRef.current) return;
     isVisualDraggingRef.current = true;
     setCtrlWheel(null);
   }, []);
@@ -1022,6 +1277,7 @@ function AppShell() {
 
   const startGizmoDrag = useCallback(
     (event: React.PointerEvent, mode: MoveMode) => {
+      if (resizeDragRef.current) return;
       if (!flowInstance || selectedElement?.kind !== "module") return;
       event.preventDefault();
       event.stopPropagation();
@@ -1472,11 +1728,18 @@ function AppShell() {
             <Controls />
           </ReactFlow>
           {selectedGizmoNode && (
-            <MoveGizmo
-              node={selectedGizmoNode}
-              viewport={viewport}
-              onPointerDown={startGizmoDrag}
-            />
+            <>
+              <ResizeHandles
+                node={selectedGizmoNode}
+                viewport={viewport}
+                onResizeStart={startResizeDrag}
+              />
+              <MoveGizmo
+                node={selectedGizmoNode}
+                viewport={viewport}
+                onPointerDown={startGizmoDrag}
+              />
+            </>
           )}
         </div>
 
@@ -1581,6 +1844,62 @@ function MoveGizmo({
         className="move-gizmo-center"
         aria-label="Move freely"
         onPointerDown={(event) => onPointerDown(event, "free")}
+      />
+    </div>
+  );
+}
+
+function ResizeHandles({
+  node,
+  viewport,
+  onResizeStart,
+}: {
+  node: ModuleNodeType;
+  viewport: { x: number; y: number; zoom: number };
+  onResizeStart: (event: React.PointerEvent, edge: ResizeEdge) => void;
+}) {
+  if (node.data.shape !== "rectangle" && node.data.shape !== "ellipse") return null;
+
+  const { width, height } = getModuleNodeDimensions(node);
+  const left = viewport.x + node.position.x * viewport.zoom;
+  const top = viewport.y + node.position.y * viewport.zoom;
+
+  const handlePointerDown = (event: React.PointerEvent, edge: ResizeEdge) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onResizeStart(event, edge);
+  };
+
+  return (
+    <div
+      className="resize-handles"
+      style={{
+        left,
+        top,
+        width: width * viewport.zoom,
+        height: height * viewport.zoom,
+      }}
+    >
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label="Resize width"
+        className="resize-handle resize-right"
+        onPointerDown={(event) => handlePointerDown(event, "right")}
+      />
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label="Resize height"
+        className="resize-handle resize-bottom"
+        onPointerDown={(event) => handlePointerDown(event, "bottom")}
+      />
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label="Resize width and height"
+        className="resize-handle resize-corner"
+        onPointerDown={(event) => handlePointerDown(event, "corner")}
       />
     </div>
   );

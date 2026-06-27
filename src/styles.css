@@ -530,6 +530,23 @@ button {
   box-sizing: border-box;
 }
 
+.module-node.shape-rectangle.custom-sized,
+.module-node.shape-ellipse.custom-sized {
+  min-width: 170px;
+  max-width: none;
+  min-height: 96px;
+  max-height: 400px;
+}
+
+.module-node.shape-rectangle.custom-sized .module-body,
+.module-node.shape-ellipse.custom-sized .module-body {
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  min-height: 0;
+  max-height: 100%;
+}
+
 .module-node.shape-circle {
   position: relative;
   width: 154px;
@@ -757,6 +774,21 @@ button {
   max-width: 250px;
   min-width: 0;
   -webkit-line-clamp: 1;
+}
+
+.module-node.shape-rectangle.custom-sized .module-content,
+.module-node.shape-ellipse.custom-sized .module-content {
+  width: 100%;
+  max-width: none;
+}
+
+.module-node.shape-rectangle.custom-sized .module-content .katex,
+.module-node.shape-rectangle.custom-sized .module-content .katex-display,
+.module-node.shape-rectangle.custom-sized .module-content .katex-html,
+.module-node.shape-ellipse.custom-sized .module-content .katex,
+.module-node.shape-ellipse.custom-sized .module-content .katex-display,
+.module-node.shape-ellipse.custom-sized .module-content .katex-html {
+  max-width: none;
 }
 
 .module-node.shape-circle .module-content {
@@ -1016,6 +1048,60 @@ button {
 
 .move-gizmo-center:hover {
   background: #fff7cf;
+}
+
+.resize-handles {
+  position: absolute;
+  z-index: 46;
+  pointer-events: none;
+}
+
+.resize-handle {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  pointer-events: auto;
+}
+
+.resize-right {
+  right: -6px;
+  top: 50%;
+  width: 12px;
+  height: 36px;
+  transform: translateY(-50%);
+  cursor: ew-resize;
+}
+
+.resize-bottom {
+  bottom: -6px;
+  left: 50%;
+  width: 36px;
+  height: 12px;
+  transform: translateX(-50%);
+  cursor: ns-resize;
+}
+
+.resize-corner {
+  right: -6px;
+  bottom: -6px;
+  width: 12px;
+  height: 12px;
+  border: 1px solid #b89620;
+  border-radius: 2px;
+  background: #f2c94c;
+  cursor: nwse-resize;
+}
+
+.resize-right:hover,
+.resize-bottom:hover {
+  background: rgb(242 201 76 / 14%);
+}
+
+.resize-corner:hover {
+  background: #f6d75c;
 }
 
 .command-console {

@@ -24,6 +24,10 @@ struct FlowModuleData {
     status: String,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    #[serde(default)]
+    custom_width: Option<f64>,
+    #[serde(default)]
+    custom_height: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

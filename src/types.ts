@@ -21,6 +21,8 @@ export interface FlowModuleData extends Record<string, unknown> {
   note: string;
   status: ElementStatus;
   enabled: boolean;
+  customWidth?: number;
+  customHeight?: number;
 }
 
 export interface FlowModule {

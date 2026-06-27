@@ -224,6 +224,8 @@ export function normalizeProject(project: Project): Project {
         note: typeof module.data?.note === "string" ? module.data.note : "",
         status,
         enabled: status === "enabled",
+        customWidth: typeof module.data?.customWidth === "number" && module.data.customWidth > 0 ? module.data.customWidth : undefined,
+        customHeight: typeof module.data?.customHeight === "number" && module.data.customHeight > 0 ? module.data.customHeight : undefined,
       }),
     };
   });
