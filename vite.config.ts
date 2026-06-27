@@ -7,6 +7,16 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: false,
+    watch: {
+      ignored: [
+        "**/src-tauri/target",
+        "**/src-tauri/target/**",
+        "**/*.pdb",
+        "**/*.rlib",
+        "**/*.rmeta",
+        "**/*.dSYM/**",
+      ],
+    },
   },
   build: {
     target: "es2020",

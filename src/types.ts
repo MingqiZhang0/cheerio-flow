@@ -1,21 +1,25 @@
 import type { XYPosition } from "@xyflow/react";
 
-export const PROJECT_CATEGORIES = ["科研", "笔记"] as const;
-export const MODULE_TYPES = ["公式", "推导", "代码", "数据", "图像", "结论", "错误", "待解决问题"] as const;
-export const MODULE_SHAPES = ["长方形", "三角形", "菱形", "圆形", "椭圆形"] as const;
-export const ARROW_TYPES = ["推导", "输出", "证明", "可视化", "支持", "猜测", "修复"] as const;
+export const PROJECT_CATEGORIES = ["research", "note"] as const;
+export const MODULE_TYPES = ["formula", "derivation", "code", "data", "image", "conclusion", "error", "open-question"] as const;
+export const MODULE_SHAPES = ["rectangle", "triangle", "diamond", "circle", "ellipse"] as const;
+export const ARROW_TYPES = ["derivation", "output", "proof", "visualization", "support", "conjecture", "fix"] as const;
+export const ELEMENT_STATUSES = ["enabled", "disabled"] as const;
 
 export type ProjectCategory = (typeof PROJECT_CATEGORIES)[number];
 export type ModuleType = (typeof MODULE_TYPES)[number];
 export type ModuleShape = (typeof MODULE_SHAPES)[number];
 export type ArrowType = (typeof ARROW_TYPES)[number];
+export type ElementStatus = (typeof ELEMENT_STATUSES)[number];
 
 export interface FlowModuleData extends Record<string, unknown> {
+  shortId: string;
   moduleType: ModuleType;
   shape: ModuleShape;
   content: string;
   latexEnabled: boolean;
   note: string;
+  status: ElementStatus;
   enabled: boolean;
 }
 
@@ -27,6 +31,7 @@ export interface FlowModule {
 
 export interface FlowArrowData extends Record<string, unknown> {
   arrowType: ArrowType;
+  status: ElementStatus;
   enabled: boolean;
   note: string;
 }
@@ -65,11 +70,26 @@ export interface AppState {
   propertiesSidebarCollapsed: boolean;
 }
 
+export interface StorageReport {
+  storageRoot: string;
+  dataDir: string;
+  bootstrapPath: string;
+  projectsPath: string;
+  groupsPath: string;
+  appStatePath: string;
+  projectCount: number;
+  moduleCount: number;
+  arrowCount: number;
+}
+
 export interface PersistedData {
   dataDir: string;
+  storageRoot: string;
+  bootstrapPath: string;
   projects: Project[];
   groups: ProjectGroup[];
   appState: AppState;
+  report?: StorageReport;
 }
 
 export type SelectedElement =

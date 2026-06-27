@@ -1,11 +1,47 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppState, PersistedData, Project, ProjectGroup } from "./types";
-import { DEFAULT_APP_STATE, createEmptyProject, normalizeGroups } from "./utils";
+import type { AppState, PersistedData, Project, ProjectGroup, StorageReport } from "./types";
+import { DEFAULT_APP_STATE, createEmptyProject, normalizeGroups, normalizeProjects } from "./utils";
 
 const LOCAL_STORAGE_KEY = "cheerio-flow-browser-fallback";
 
-function isTauriRuntime() {
-  return Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+function isProbablyNotTauriError(reason: unknown) {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  return (
+    message.includes("__TAURI_INTERNALS__") ||
+    message.includes("__TAURI__") ||
+    message.includes("not available") ||
+    message.includes("is not a function")
+  );
+}
+
+function createBrowserReport(data: PersistedData): StorageReport {
+  return {
+    storageRoot: data.storageRoot,
+    dataDir: data.dataDir,
+    bootstrapPath: "browser-localStorage",
+    projectsPath: "browser-localStorage/projects",
+    groupsPath: "browser-localStorage/groups",
+    appStatePath: "browser-localStorage/app-state",
+    projectCount: data.projects.length,
+    moduleCount: data.projects.reduce((total, project) => total + project.modules.length, 0),
+    arrowCount: data.projects.reduce((total, project) => total + project.arrows.length, 0),
+  };
+}
+
+function normalizePersistedData(data: PersistedData): PersistedData {
+  const projects = normalizeProjects(data.projects);
+  const groups = normalizeGroups(data.groups ?? [], projects);
+  const normalized = {
+    ...data,
+    storageRoot: data.storageRoot ?? data.dataDir,
+    projects,
+    groups,
+    appState: { ...DEFAULT_APP_STATE, ...data.appState },
+  };
+  return {
+    ...normalized,
+    report: data.report ?? createBrowserReport(normalized),
+  };
 }
 
 function readBrowserFallback(): PersistedData {
@@ -13,15 +49,20 @@ function readBrowserFallback(): PersistedData {
   if (raw) {
     try {
       const data = JSON.parse(raw) as PersistedData;
-      if (Array.isArray(data.projects) && data.projects.length > 0) return data;
-    } catch {
+      if (Array.isArray(data.projects) && data.projects.length > 0) {
+        return normalizePersistedData(data);
+      }
+    } catch (error) {
+      console.error("Failed to read browser fallback storage", error);
       window.localStorage.removeItem(LOCAL_STORAGE_KEY);
     }
   }
 
   const firstProject = createEmptyProject();
   const data: PersistedData = {
-    dataDir: "browser-localStorage",
+    dataDir: "browser-localStorage/CheerioFlowData",
+    storageRoot: "browser-localStorage",
+    bootstrapPath: "browser-localStorage/bootstrap",
     projects: [firstProject],
     groups: [],
     appState: {
@@ -29,65 +70,101 @@ function readBrowserFallback(): PersistedData {
       currentProjectId: firstProject.id,
     },
   };
-  window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(data));
-  return data;
+  const withReport = { ...data, report: createBrowserReport(data) };
+  window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(withReport));
+  return withReport;
 }
 
-function writeBrowserFallback(patch: Partial<PersistedData>) {
-  const current = readBrowserFallback();
-  window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({ ...current, ...patch }));
+function writeBrowserFallback(data: PersistedData) {
+  const normalized = normalizePersistedData(data);
+  window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(normalized));
+  return createBrowserReport(normalized);
+}
+
+function buildPayload(projects: Project[], groups: ProjectGroup[], appState: AppState) {
+  return { projects, groups, appState };
 }
 
 export async function loadDatabase(): Promise<PersistedData> {
-  if (isTauriRuntime()) {
+  try {
     const data = await invoke<PersistedData>("load_database");
-    return {
-      ...data,
-      groups: normalizeGroups(data.groups, data.projects),
-    };
+    return normalizePersistedData(data);
+  } catch (reason: unknown) {
+    if (isProbablyNotTauriError(reason)) return readBrowserFallback();
+    console.error("Failed to load Tauri database", reason);
+    throw reason;
   }
-  return readBrowserFallback();
 }
 
-export async function persistProject(project: Project) {
-  if (isTauriRuntime()) {
-    await invoke("save_project", { project });
-    return;
+export async function persistDatabase(projects: Project[], groups: ProjectGroup[], appState: AppState): Promise<StorageReport> {
+  try {
+    const report = await invoke<StorageReport>("save_database", {
+      payload: buildPayload(projects, groups, appState),
+    });
+    return report;
+  } catch (reason: unknown) {
+    if (!isProbablyNotTauriError(reason)) {
+      console.error("Failed to save Tauri database", reason);
+      throw reason;
+    }
+    const current = readBrowserFallback();
+    return writeBrowserFallback({
+      ...current,
+      projects,
+      groups,
+      appState,
+    });
   }
-  const current = readBrowserFallback();
-  const projects = current.projects.some((item) => item.id === project.id)
-    ? current.projects.map((item) => (item.id === project.id ? project : item))
-    : [...current.projects, project];
-  writeBrowserFallback({ projects });
+}
+
+export async function chooseStorageRoot(
+  storageRoot: string,
+  projects: Project[],
+  groups: ProjectGroup[],
+  appState: AppState,
+): Promise<PersistedData> {
+  try {
+    const data = await invoke<PersistedData>("set_storage_root", {
+      storageRoot,
+      payload: buildPayload(projects, groups, appState),
+    });
+    return normalizePersistedData(data);
+  } catch (reason: unknown) {
+    if (!isProbablyNotTauriError(reason)) {
+      console.error("Failed to set Tauri storage root", reason);
+      throw reason;
+    }
+    const current = readBrowserFallback();
+    const data = normalizePersistedData({
+      ...current,
+      storageRoot: storageRoot.trim() || current.storageRoot,
+      dataDir: `${storageRoot.trim() || current.storageRoot}/CheerioFlowData`,
+      projects,
+      groups,
+      appState,
+    });
+    writeBrowserFallback(data);
+    return data;
+  }
 }
 
 export async function removeProject(projectId: string) {
-  if (isTauriRuntime()) {
+  try {
     await invoke("delete_project", { projectId });
     return;
+  } catch (reason: unknown) {
+    if (!isProbablyNotTauriError(reason)) {
+      console.error("Failed to delete Tauri project", reason);
+      throw reason;
+    }
+    const current = readBrowserFallback();
+    writeBrowserFallback({
+      ...current,
+      projects: current.projects.filter((project) => project.id !== projectId),
+      groups: current.groups.map((group) => ({
+        ...group,
+        projectIds: group.projectIds.filter((id) => id !== projectId),
+      })),
+    });
   }
-  const current = readBrowserFallback();
-  writeBrowserFallback({
-    projects: current.projects.filter((project) => project.id !== projectId),
-    groups: current.groups.map((group) => ({
-      ...group,
-      projectIds: group.projectIds.filter((id) => id !== projectId),
-    })),
-  });
-}
-
-export async function persistGroups(groups: ProjectGroup[]) {
-  if (isTauriRuntime()) {
-    await invoke("save_groups", { groups });
-    return;
-  }
-  writeBrowserFallback({ groups });
-}
-
-export async function persistAppState(appState: AppState) {
-  if (isTauriRuntime()) {
-    await invoke("save_app_state", { appState });
-    return;
-  }
-  writeBrowserFallback({ appState });
 }

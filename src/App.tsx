@@ -1,16 +1,13 @@
 import {
   Background,
-  ConnectionMode,
   Controls,
   Handle,
   MarkerType,
-  MiniMap,
   Position,
   ReactFlow,
   ReactFlowProvider,
   applyEdgeChanges,
   applyNodeChanges,
-  type Connection,
   type Edge,
   type EdgeChange,
   type Node,
@@ -37,7 +34,6 @@ import {
   PanelRightOpen,
   Pin,
   PinOff,
-  Plus,
   Save,
   Shapes,
   Square,
@@ -45,14 +41,15 @@ import {
   Triangle,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { loadDatabase, persistAppState, persistGroups, persistProject, removeProject } from "./storage";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { chooseStorageRoot, loadDatabase, persistDatabase, removeProject } from "./storage";
 import {
   ARROW_TYPES,
   MODULE_SHAPES,
   MODULE_TYPES,
   PROJECT_CATEGORIES,
   type AppState,
+  type ArrowType,
   type FlowArrow,
   type FlowArrowData,
   type FlowModule,
@@ -61,6 +58,7 @@ import {
   type Project,
   type ProjectGroup,
   type SelectedElement,
+  type StorageReport,
 } from "./types";
 import {
   applyGroupMembership,
@@ -68,54 +66,63 @@ import {
   createEmptyGroup,
   createEmptyProject,
   createModule,
+  getNextModuleShortId,
   normalizeGroups,
+  normalizeProjects,
   sortPinnedFirst,
 } from "./utils";
 
 type ModuleNodeType = Node<FlowModuleData, "module">;
 type ArrowEdgeType = Edge<FlowArrowData>;
+type SaveStatus = "saving" | "saved" | "error";
+type CtrlWheelState = { x: number; y: number } | null;
+type MoveMode = "x" | "y" | "free";
 
 const SHAPE_ICONS: Record<ModuleShape, typeof Square> = {
-  长方形: Square,
-  三角形: Triangle,
-  菱形: Diamond,
-  圆形: Circle,
-  椭圆形: Hexagon,
+  rectangle: Square,
+  triangle: Triangle,
+  diamond: Diamond,
+  circle: Circle,
+  ellipse: Hexagon,
 };
 
 const SHAPE_CLASS: Record<ModuleShape, string> = {
-  长方形: "rectangle",
-  三角形: "triangle",
-  菱形: "diamond",
-  圆形: "circle",
-  椭圆形: "ellipse",
+  rectangle: "rectangle",
+  triangle: "triangle",
+  diamond: "diamond",
+  circle: "circle",
+  ellipse: "ellipse",
 };
 
-function moduleToNode(module: FlowModule): ModuleNodeType {
+const COMMAND_KEYWORDS = ["arrow", "to", "type", ...ARROW_TYPES];
+
+function moduleToNode(module: FlowModule, selected: boolean): ModuleNodeType {
   return {
     id: module.id,
     type: "module",
     position: module.position,
+    sourcePosition: Position.Bottom,
+    targetPosition: Position.Top,
     data: module.data,
+    selected,
     draggable: true,
   };
 }
 
-function arrowToEdge(arrow: FlowArrow): ArrowEdgeType {
+function arrowToEdge(arrow: FlowArrow, selected: boolean): ArrowEdgeType {
   return {
     id: arrow.id,
     source: arrow.source,
     target: arrow.target,
-    sourceHandle: arrow.sourceHandle ?? undefined,
-    targetHandle: arrow.targetHandle ?? undefined,
     data: arrow.data,
     label: arrow.data.arrowType,
     type: "smoothstep",
+    selected,
+    reconnectable: false,
     markerEnd: {
       type: MarkerType.ArrowClosed,
       color: arrow.data.enabled ? "#355f63" : "#9da4a7",
     },
-    reconnectable: true,
     style: {
       stroke: arrow.data.enabled ? "#355f63" : "#a8adaf",
       strokeWidth: 2.4,
@@ -134,16 +141,18 @@ function arrowToEdge(arrow: FlowArrow): ArrowEdgeType {
 }
 
 function edgeToArrow(edge: ArrowEdgeType): FlowArrow {
+  const status = edge.data?.status ?? (edge.data?.enabled === false ? "disabled" : "enabled");
   return {
     id: edge.id,
     source: edge.source,
     target: edge.target,
-    sourceHandle: edge.sourceHandle ?? null,
-    targetHandle: edge.targetHandle ?? null,
-    data: edge.data ?? {
-      arrowType: "推导",
-      enabled: true,
-      note: "",
+    sourceHandle: edge.sourceHandle ?? "bottom",
+    targetHandle: edge.targetHandle ?? "top",
+    data: {
+      arrowType: edge.data?.arrowType ?? "derivation",
+      note: edge.data?.note ?? "",
+      status,
+      enabled: status === "enabled",
     },
   };
 }
@@ -157,7 +166,47 @@ function renderLatex(content: string) {
   });
 }
 
-function ModuleNode({ data, selected }: NodeProps<ModuleNodeType>) {
+function ShapeVisual({ shape }: { shape: ModuleShape }) {
+  if (shape === "triangle") {
+    return (
+      <svg className="module-shape-visual" viewBox="0 0 170 132" aria-hidden>
+        <polygon points="85,10 158,122 12,122" />
+      </svg>
+    );
+  }
+
+  if (shape === "diamond") {
+    return (
+      <svg className="module-shape-visual" viewBox="0 0 170 132" aria-hidden>
+        <polygon points="85,8 160,66 85,124 10,66" />
+      </svg>
+    );
+  }
+
+  if (shape === "circle") {
+    return (
+      <svg className="module-shape-visual" viewBox="0 0 170 132" aria-hidden>
+        <circle cx="85" cy="66" r="58" />
+      </svg>
+    );
+  }
+
+  if (shape === "ellipse") {
+    return (
+      <svg className="module-shape-visual" viewBox="0 0 170 132" aria-hidden>
+        <ellipse cx="85" cy="66" rx="76" ry="48" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg className="module-shape-visual" viewBox="0 0 170 132" aria-hidden>
+      <rect x="9" y="18" width="152" height="96" rx="7" />
+    </svg>
+  );
+}
+
+const ModuleNode = memo(function ModuleNode({ data, selected }: NodeProps<ModuleNodeType>) {
   const html = useMemo(() => {
     if (!data.latexEnabled) return "";
     try {
@@ -169,25 +218,95 @@ function ModuleNode({ data, selected }: NodeProps<ModuleNodeType>) {
 
   return (
     <div className={`module-node ${selected ? "selected" : ""} ${data.enabled ? "" : "disabled"}`}>
-      <Handle type="source" position={Position.Top} id="top" className="module-handle module-handle-top" />
+      <Handle type="target" position={Position.Top} id="top" className="module-handle module-handle-top" />
       <div className={`module-body shape-${SHAPE_CLASS[data.shape]}`}>
+        <ShapeVisual shape={data.shape} />
+        <div className="module-short-id">{data.shortId}</div>
         <div className="module-meta">{data.moduleType}</div>
         <div className="module-content">
-          {data.latexEnabled && html ? (
-            <span dangerouslySetInnerHTML={{ __html: html }} />
-          ) : (
-            <span>{data.content || "空模块"}</span>
-          )}
+          {data.latexEnabled && html ? <span dangerouslySetInnerHTML={{ __html: html }} /> : <span>{data.content || "Empty module"}</span>}
         </div>
       </div>
       <Handle type="source" position={Position.Bottom} id="bottom" className="module-handle module-handle-bottom" />
     </div>
   );
-}
+});
 
 const nodeTypes = {
   module: ModuleNode,
 };
+
+function isEditableTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+}
+
+function isConsoleToggle(event: KeyboardEvent) {
+  return event.key === "~" || event.key === "`" || event.code === "Backquote";
+}
+
+function normalizeHandle(value: string | undefined, fallback: "top" | "bottom") {
+  if (!value) return fallback;
+  const normalized = value.toLowerCase();
+  if (normalized === "top" || normalized === "up") return "top";
+  if (normalized === "bottom" || normalized === "down") return "bottom";
+  return null;
+}
+
+function parseEndpoint(text: string, fallbackHandle: "top" | "bottom") {
+  const match = /^(m\d+)(?:\.(top|up|bottom|down))?$/i.exec(text);
+  if (!match) return null;
+  const handle = normalizeHandle(match[2], fallbackHandle);
+  if (!handle) return null;
+  return { shortId: match[1].toUpperCase(), handle };
+}
+
+function parseArrowCommand(input: string, project: Project | null): { arrow?: FlowArrow; message?: string; error?: string } {
+  if (!project) return { error: "No current project" };
+
+  const tokens = input.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length !== 4 && tokens.length !== 6) return { error: "Use: arrow m1 to m2 [type support]" };
+  if (tokens[0].toLowerCase() !== "arrow" || tokens[2].toLowerCase() !== "to") return { error: "Use: arrow m1 to m2" };
+  if (tokens.length === 6 && tokens[4].toLowerCase() !== "type") return { error: "Use: type derivation/output/support/..." };
+
+  const sourceEndpoint = parseEndpoint(tokens[1], "bottom");
+  const targetEndpoint = parseEndpoint(tokens[3], "top");
+  if (!sourceEndpoint || !targetEndpoint) return { error: "Unknown endpoint. Try m1.bottom to m2.top" };
+
+  const arrowType = (tokens.length === 6 ? tokens[5].toLowerCase() : "derivation") as ArrowType;
+  if (!ARROW_TYPES.includes(arrowType)) return { error: `Unknown arrow type: ${tokens[5]}` };
+
+  const source = project.modules.find((module) => module.data.shortId.toUpperCase() === sourceEndpoint.shortId);
+  const target = project.modules.find((module) => module.data.shortId.toUpperCase() === targetEndpoint.shortId);
+  if (!source) return { error: `Module not found: ${sourceEndpoint.shortId}` };
+  if (!target) return { error: `Module not found: ${targetEndpoint.shortId}` };
+  if (source.id === target.id) return { error: "Arrow needs two different modules" };
+
+  const arrow = createArrow(source.id, target.id, sourceEndpoint.handle, targetEndpoint.handle, arrowType);
+  return { arrow, message: `Created arrow ${source.data.shortId} -> ${target.data.shortId}` };
+}
+
+function getCommandSuggestion(input: string, project: Project | null) {
+  const lower = input.toLowerCase();
+  if (lower === "ar") return "row";
+
+  const sourceOnly = /^arrow\s+(m\d+)$/i.exec(input.trim());
+  if (sourceOnly && project) {
+    const source = sourceOnly[1].toUpperCase();
+    const target = project.modules.find((module) => module.data.shortId.toUpperCase() !== source);
+    if (target) return ` to ${target.data.shortId.toLowerCase()}`;
+  }
+
+  if (/^arrow\s+m\d+(?:\.(?:top|up|bottom|down))?\s+to\s+m\d+(?:\.(?:top|up|bottom|down))?\s+type\s+$/i.test(input)) {
+    return "derivation";
+  }
+
+  const tokenMatch = /(^|\s)(\S*)$/.exec(input);
+  const token = tokenMatch?.[2]?.toLowerCase() ?? "";
+  if (!token) return "";
+  const keyword = COMMAND_KEYWORDS.find((item) => item.startsWith(token) && item !== token);
+  return keyword ? keyword.slice(token.length) : "";
+}
 
 function SidebarButton({
   title,
@@ -222,47 +341,42 @@ function AppShell() {
   const [pendingShape, setPendingShape] = useState<ModuleShape | null>(null);
   const [ghostPoint, setGhostPoint] = useState<{ x: number; y: number } | null>(null);
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance<ModuleNodeType, ArrowEdgeType> | null>(null);
+  const [flowNodes, setFlowNodes] = useState<ModuleNodeType[]>([]);
+  const [flowEdges, setFlowEdges] = useState<ArrowEdgeType[]>([]);
+  const [viewport, setViewportState] = useState({ x: 0, y: 0, zoom: 1 });
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
+  const [storageReport, setStorageReport] = useState<StorageReport | null>(null);
+  const [storageRootInput, setStorageRootInput] = useState("");
+  const [consoleOpen, setConsoleOpen] = useState(false);
+  const [consoleInput, setConsoleInput] = useState("");
+  const [consoleMessage, setConsoleMessage] = useState("");
+  const [consoleError, setConsoleError] = useState("");
+  const [ctrlWheel, setCtrlWheel] = useState<CtrlWheelState>(null);
+  const consoleInputRef = useRef<HTMLInputElement | null>(null);
   const saveTimerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    loadDatabase()
-      .then((data) => {
-        if (cancelled) return;
-        const normalized = normalizeGroups(data.groups, data.projects);
-        const hydratedProjects = applyGroupMembership(data.projects, normalized);
-        const firstProject = hydratedProjects[0] ?? createEmptyProject();
-        setDataDir(data.dataDir);
-        setGroups(normalized);
-        setProjects(hydratedProjects.length > 0 ? hydratedProjects : [firstProject]);
-        setCurrentProjectId(data.appState.currentProjectId ?? firstProject.id);
-        setProjectSidebarCollapsed(data.appState.projectSidebarCollapsed);
-        setPropertiesSidebarCollapsed(data.appState.propertiesSidebarCollapsed);
-        setLoaded(true);
-      })
-      .catch((reason: unknown) => {
-        setError(reason instanceof Error ? reason.message : String(reason));
-        const firstProject = createEmptyProject();
-        setProjects([firstProject]);
-        setCurrentProjectId(firstProject.id);
-        setLoaded(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const isVisualDraggingRef = useRef(false);
+  const gizmoDragRef = useRef<{
+    nodeId: string;
+    mode: MoveMode;
+    startPointer: { x: number; y: number };
+    startPosition: { x: number; y: number };
+    frame: number | null;
+    lastPointer: { x: number; y: number };
+  } | null>(null);
+  const loadedRef = useRef(false);
+  const projectsRef = useRef<Project[]>([]);
+  const groupsRef = useRef<ProjectGroup[]>([]);
+  const appStateRef = useRef<AppState>({
+    currentProjectId: null,
+    projectSidebarCollapsed: false,
+    propertiesSidebarCollapsed: true,
+  });
+  const lastPointerRef = useRef({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
 
   const currentProject = useMemo(
     () => projects.find((project) => project.id === currentProjectId) ?? projects[0] ?? null,
     [currentProjectId, projects],
   );
-
-  useEffect(() => {
-    if (!loaded || projects.length === 0) return;
-    if (!currentProjectId || !projects.some((project) => project.id === currentProjectId)) {
-      setCurrentProjectId(projects[0].id);
-    }
-  }, [currentProjectId, loaded, projects]);
 
   const appState = useMemo<AppState>(
     () => ({
@@ -274,34 +388,142 @@ function AppShell() {
   );
 
   useEffect(() => {
+    projectsRef.current = projects;
+  }, [projects]);
+
+  useEffect(() => {
+    groupsRef.current = groups;
+  }, [groups]);
+
+  useEffect(() => {
+    appStateRef.current = appState;
+  }, [appState]);
+
+  const saveAllNow = useCallback(async () => {
+    if (!loadedRef.current) return;
+    setSaveStatus("saving");
+    try {
+      const currentProjects = projectsRef.current;
+      const currentGroups = groupsRef.current;
+      const currentAppState = appStateRef.current;
+      const report = await persistDatabase(currentProjects, currentGroups, currentAppState);
+      setStorageReport(report);
+      setDataDir(report.dataDir);
+      setStorageRootInput(report.storageRoot);
+      console.info("Cheerio Flow saved to", report);
+      setSaveStatus("saved");
+    } catch (reason: unknown) {
+      console.error("Failed to save Cheerio Flow data", reason);
+      setSaveStatus("error");
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadDatabase()
+      .then((data) => {
+        if (cancelled) return;
+        const normalizedProjects = normalizeProjects(data.projects);
+        const normalizedGroups = normalizeGroups(data.groups, normalizedProjects);
+        const hydratedProjects = applyGroupMembership(normalizedProjects, normalizedGroups);
+        const firstProject = hydratedProjects[0] ?? createEmptyProject();
+        setDataDir(data.dataDir);
+        setStorageReport(data.report ?? null);
+        setStorageRootInput(data.storageRoot ?? "");
+        setGroups(normalizedGroups);
+        setProjects(hydratedProjects.length > 0 ? hydratedProjects : [firstProject]);
+        setCurrentProjectId(data.appState.currentProjectId ?? firstProject.id);
+        setProjectSidebarCollapsed(data.appState.projectSidebarCollapsed);
+        setPropertiesSidebarCollapsed(data.appState.propertiesSidebarCollapsed);
+        setLoaded(true);
+        loadedRef.current = true;
+      })
+      .catch((reason: unknown) => {
+        console.error("Failed to load Cheerio Flow data", reason);
+        setError(reason instanceof Error ? reason.message : String(reason));
+        setProjects([]);
+        setCurrentProjectId(null);
+        setLoaded(true);
+        loadedRef.current = true;
+        setSaveStatus("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!loaded) return;
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = window.setTimeout(() => {
-      Promise.all([
-        ...projects.map((project) => persistProject(project)),
-        persistGroups(groups),
-        persistAppState(appState),
-      ]).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)));
+      void saveAllNow();
     }, 350);
     return () => {
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     };
-  }, [appState, groups, loaded, projects]);
+  }, [appState, groups, loaded, projects, saveAllNow]);
 
   useEffect(() => {
+    const onBeforeUnload = () => {
+      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+      void saveAllNow();
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [saveAllNow]);
+
+  useEffect(() => {
+    if (consoleOpen) {
+      window.setTimeout(() => consoleInputRef.current?.focus(), 0);
+    }
+  }, [consoleOpen]);
+
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      lastPointerRef.current = { x: event.clientX, y: event.clientY };
+    };
     const onKeyDown = (event: KeyboardEvent) => {
+      if (gizmoDragRef.current) return;
+      if (isConsoleToggle(event)) {
+        event.preventDefault();
+        setConsoleOpen((open) => !open);
+        return;
+      }
+
       if (event.key === "Escape") {
         setPendingShape(null);
         setShapeMenuOpen(false);
         setGhostPoint(null);
+        setCtrlWheel(null);
+        setPropertiesSidebarCollapsed(true);
+        return;
+      }
+
+      if (event.key === "Control" && !event.repeat && !consoleOpen && !isEditableTarget(event.target)) {
+        setCtrlWheel({ ...lastPointerRef.current });
       }
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "Control") setCtrlWheel(null);
+    };
 
-  const nodes = useMemo(() => currentProject?.modules.map(moduleToNode) ?? [], [currentProject?.modules]);
-  const edges = useMemo(() => currentProject?.arrows.map(arrowToEdge) ?? [], [currentProject?.arrows]);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [consoleOpen]);
+
+  useEffect(() => {
+    if (!loaded || projects.length === 0) return;
+    if (!currentProjectId || !projects.some((project) => project.id === currentProjectId)) {
+      setCurrentProjectId(projects[0].id);
+    }
+  }, [currentProjectId, loaded, projects]);
 
   const updateProject = useCallback((projectId: string, updater: (project: Project) => Project) => {
     setProjects((previous) => previous.map((project) => (project.id === projectId ? updater(project) : project)));
@@ -317,16 +539,48 @@ function AppShell() {
 
   const selectElement = useCallback((element: SelectedElement) => {
     setSelectedElement(element);
-    setPropertiesSidebarCollapsed(false);
   }, []);
 
+  const openElementProperties = useCallback((element: SelectedElement) => {
+    setSelectedElement(element);
+    if (element) setPropertiesSidebarCollapsed(false);
+  }, []);
+
+  const projectNodes = useMemo(
+    () => currentProject?.modules.map((module) => moduleToNode(module, selectedElement?.kind === "module" && selectedElement.id === module.id)) ?? [],
+    [currentProject?.modules, selectedElement],
+  );
+  const projectEdges = useMemo(
+    () => currentProject?.arrows.map((arrow) => arrowToEdge(arrow, selectedElement?.kind === "arrow" && selectedElement.id === arrow.id)) ?? [],
+    [currentProject?.arrows, selectedElement],
+  );
+
+  useEffect(() => {
+    if (!isVisualDraggingRef.current) setFlowNodes(projectNodes);
+  }, [projectNodes]);
+
+  useEffect(() => {
+    setFlowEdges(projectEdges);
+  }, [projectEdges]);
+
   const createProject = useCallback(() => {
-    const project = createEmptyProject(`新项目 ${projects.length + 1}`);
+    const project = createEmptyProject(`Project ${projects.length + 1}`);
     setProjects((previous) => [...previous, project]);
     setCurrentProjectId(project.id);
     setSelectedElement(null);
     setPropertiesSidebarCollapsed(true);
   }, [projects.length]);
+
+  const selectProject = useCallback(
+    async (projectId: string) => {
+      if (projectId === currentProject?.id) return;
+      await saveAllNow();
+      setCurrentProjectId(projectId);
+      setSelectedElement(null);
+      setPropertiesSidebarCollapsed(true);
+    },
+    [currentProject?.id, saveAllNow],
+  );
 
   const deleteCurrentProject = useCallback(() => {
     if (!currentProject) return;
@@ -343,11 +597,15 @@ function AppShell() {
     );
     setCurrentProjectId(nextProjects[0]?.id ?? null);
     setSelectedElement(null);
-    removeProject(projectId).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)));
+    removeProject(projectId).catch((reason: unknown) => {
+      console.error("Failed to delete project", reason);
+      setSaveStatus("error");
+      setError(reason instanceof Error ? reason.message : String(reason));
+    });
   }, [currentProject, projects]);
 
   const createGroup = useCallback(() => {
-    const group = createEmptyGroup(`新分组 ${groups.length + 1}`);
+    const group = createEmptyGroup(`Group ${groups.length + 1}`);
     setGroups((previous) => [...previous, group]);
   }, [groups.length]);
 
@@ -373,89 +631,202 @@ function AppShell() {
     );
   }, []);
 
-  const onNodesChange = useCallback(
-    (changes: NodeChange<ModuleNodeType>[]) => {
-      if (!currentProject) return;
-      const nextNodes = applyNodeChanges(changes, nodes);
-      const keptNodeIds = new Set(nextNodes.map((node) => node.id));
-      updateCurrentProject((project) => ({
-        ...project,
-        modules: nextNodes.map((node) => ({
-          id: node.id,
-          position: node.position,
-          data: node.data,
-        })),
-        arrows: project.arrows.filter((arrow) => keptNodeIds.has(arrow.source) && keptNodeIds.has(arrow.target)),
-      }));
-      if (selectedElement?.kind === "module" && !keptNodeIds.has(selectedElement.id)) setSelectedElement(null);
-    },
-    [currentProject, nodes, selectedElement, updateCurrentProject],
-  );
+  const applyStorageRoot = useCallback(async () => {
+    setSaveStatus("saving");
+    try {
+      const data = await chooseStorageRoot(storageRootInput, projectsRef.current, groupsRef.current, appStateRef.current);
+      const normalizedProjects = normalizeProjects(data.projects);
+      const normalizedGroups = normalizeGroups(data.groups, normalizedProjects);
+      const hydratedProjects = applyGroupMembership(normalizedProjects, normalizedGroups);
+      setProjects(hydratedProjects);
+      setGroups(normalizedGroups);
+      setCurrentProjectId(data.appState.currentProjectId ?? hydratedProjects[0]?.id ?? null);
+      setDataDir(data.dataDir);
+      setStorageRootInput(data.storageRoot ?? "");
+      setStorageReport(data.report ?? null);
+      setSaveStatus("saved");
+      setError(null);
+      console.info("Cheerio Flow storage root set", data.report);
+    } catch (reason: unknown) {
+      console.error("Failed to apply storage root", reason);
+      setSaveStatus("error");
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, [storageRootInput]);
 
-  const onEdgesChange = useCallback(
-    (changes: EdgeChange<ArrowEdgeType>[]) => {
-      if (!currentProject) return;
-      const nextEdges = applyEdgeChanges(changes, edges);
-      const keptEdgeIds = new Set(nextEdges.map((edge) => edge.id));
-      updateCurrentProject((project) => ({
-        ...project,
-        arrows: nextEdges.map(edgeToArrow),
-      }));
-      if (selectedElement?.kind === "arrow" && !keptEdgeIds.has(selectedElement.id)) setSelectedElement(null);
-    },
-    [currentProject, edges, selectedElement, updateCurrentProject],
-  );
-
-  const onConnect = useCallback(
-    (connection: Connection) => {
-      if (!connection.source || !connection.target) return;
-      const arrow = createArrow(connection.source, connection.target, connection.sourceHandle, connection.targetHandle);
-      updateCurrentProject((project) => ({
-        ...project,
-        arrows: [...project.arrows, arrow],
-      }));
-      selectElement({ kind: "arrow", id: arrow.id });
-    },
-    [selectElement, updateCurrentProject],
-  );
-
-  const onReconnect = useCallback(
-    (oldEdge: ArrowEdgeType, connection: Connection) => {
-      if (!connection.source || !connection.target) return;
-      updateCurrentProject((project) => ({
-        ...project,
-        arrows: project.arrows.map((arrow) =>
-          arrow.id === oldEdge.id
-            ? {
-                ...arrow,
-                source: connection.source ?? arrow.source,
-                target: connection.target ?? arrow.target,
-                sourceHandle: connection.sourceHandle ?? null,
-                targetHandle: connection.targetHandle ?? null,
-              }
-            : arrow,
-        ),
-      }));
-      selectElement({ kind: "arrow", id: oldEdge.id });
-    },
-    [selectElement, updateCurrentProject],
-  );
-
-  const onPaneClick = useCallback(
-    (event: React.MouseEvent) => {
-      if (!pendingShape || !flowInstance) return;
-      const position = flowInstance.screenToFlowPosition({ x: event.clientX, y: event.clientY });
-      const module = createModule(pendingShape, position.x - 85, position.y - 48);
+  const createModuleAt = useCallback(
+    (shape: ModuleShape, clientX: number, clientY: number) => {
+      if (!currentProject || !flowInstance) return;
+      const position = flowInstance.screenToFlowPosition({ x: clientX, y: clientY });
+      const module = createModule(shape, position.x - 85, position.y - 66, getNextModuleShortId(currentProject.modules));
       updateCurrentProject((project) => ({
         ...project,
         modules: [...project.modules, module],
       }));
       setPendingShape(null);
       setGhostPoint(null);
+      setCtrlWheel(null);
       selectElement({ kind: "module", id: module.id });
     },
-    [flowInstance, pendingShape, selectElement, updateCurrentProject],
+    [currentProject, flowInstance, selectElement, updateCurrentProject],
   );
+
+  const onNodesChange = useCallback(
+    (changes: NodeChange<ModuleNodeType>[]) => {
+      setFlowNodes((previous) => {
+        const nextNodes = applyNodeChanges(changes, previous);
+        const removedIds = new Set(
+          changes
+            .filter((change) => change.type === "remove")
+            .map((change) => ("id" in change ? change.id : null))
+            .filter((id): id is string => Boolean(id)),
+        );
+        if (removedIds.size > 0) {
+          updateCurrentProject((project) => ({
+            ...project,
+            modules: project.modules.filter((module) => !removedIds.has(module.id)),
+            arrows: project.arrows.filter((arrow) => !removedIds.has(arrow.source) && !removedIds.has(arrow.target)),
+          }));
+          if (selectedElement?.kind === "module" && removedIds.has(selectedElement.id)) setSelectedElement(null);
+        }
+        return nextNodes;
+      });
+    },
+    [selectedElement, updateCurrentProject],
+  );
+
+  const onEdgesChange = useCallback(
+    (changes: EdgeChange<ArrowEdgeType>[]) => {
+      const nextEdges = applyEdgeChanges(changes, flowEdges);
+      const keptEdgeIds = new Set(nextEdges.map((edge) => edge.id));
+      setFlowEdges(nextEdges);
+      if (changes.some((change) => change.type === "remove")) {
+        updateCurrentProject((project) => ({
+          ...project,
+          arrows: project.arrows.filter((arrow) => keptEdgeIds.has(arrow.id)),
+        }));
+      }
+      if (selectedElement?.kind === "arrow" && !keptEdgeIds.has(selectedElement.id)) setSelectedElement(null);
+    },
+    [flowEdges, selectedElement, updateCurrentProject],
+  );
+
+  const onPaneClick = useCallback(
+    (event: React.MouseEvent) => {
+      if (pendingShape) {
+        createModuleAt(pendingShape, event.clientX, event.clientY);
+        return;
+      }
+      if (!isEditableTarget(event.target)) setSelectedElement(null);
+    },
+    [createModuleAt, pendingShape],
+  );
+
+  const commitNodePosition = useCallback(
+    (nodeId: string, position: { x: number; y: number }) => {
+      updateCurrentProject((project) => ({
+        ...project,
+        modules: project.modules.map((module) => (module.id === nodeId ? { ...module, position } : module)),
+      }));
+    },
+    [updateCurrentProject],
+  );
+
+  const startGizmoDrag = useCallback(
+    (event: React.PointerEvent, mode: MoveMode) => {
+      if (!flowInstance || selectedElement?.kind !== "module") return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      const selectedNode = flowNodes.find((node) => node.id === selectedElement.id);
+      if (!selectedNode) return;
+
+      const dragState = {
+        nodeId: selectedNode.id,
+        mode,
+        startPointer: { x: event.clientX, y: event.clientY },
+        startPosition: { ...selectedNode.position },
+        frame: null,
+        lastPointer: { x: event.clientX, y: event.clientY },
+      };
+      gizmoDragRef.current = dragState;
+      isVisualDraggingRef.current = true;
+      (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+
+      const applyDrag = () => {
+        const active = gizmoDragRef.current;
+        if (!active) return;
+        active.frame = null;
+        const startFlow = flowInstance.screenToFlowPosition(active.startPointer);
+        const currentFlow = flowInstance.screenToFlowPosition(active.lastPointer);
+        const dx = currentFlow.x - startFlow.x;
+        const dy = currentFlow.y - startFlow.y;
+        const nextPosition = {
+          x: active.mode === "y" ? active.startPosition.x : active.startPosition.x + dx,
+          y: active.mode === "x" ? active.startPosition.y : active.startPosition.y + dy,
+        };
+        setFlowNodes((previous) =>
+          previous.map((node) => (node.id === active.nodeId ? { ...node, position: nextPosition } : node)),
+        );
+      };
+
+      const onPointerMove = (moveEvent: PointerEvent) => {
+        const active = gizmoDragRef.current;
+        if (!active) return;
+        active.lastPointer = { x: moveEvent.clientX, y: moveEvent.clientY };
+        if (active.frame === null) active.frame = window.requestAnimationFrame(applyDrag);
+      };
+
+      const onPointerUp = () => {
+        const active = gizmoDragRef.current;
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+        if (!active) return;
+        if (active.frame !== null) window.cancelAnimationFrame(active.frame);
+        const startFlow = flowInstance.screenToFlowPosition(active.startPointer);
+        const currentFlow = flowInstance.screenToFlowPosition(active.lastPointer);
+        const dx = currentFlow.x - startFlow.x;
+        const dy = currentFlow.y - startFlow.y;
+        const finalPosition = {
+          x: active.mode === "y" ? active.startPosition.x : active.startPosition.x + dx,
+          y: active.mode === "x" ? active.startPosition.y : active.startPosition.y + dy,
+        };
+        setFlowNodes((previous) =>
+          previous.map((node) => (node.id === active.nodeId ? { ...node, position: finalPosition } : node)),
+        );
+        commitNodePosition(active.nodeId, finalPosition);
+        gizmoDragRef.current = null;
+        isVisualDraggingRef.current = false;
+      };
+
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerUp);
+    },
+    [commitNodePosition, flowInstance, flowNodes, selectedElement],
+  );
+
+  const commandSuggestion = useMemo(() => getCommandSuggestion(consoleInput, currentProject), [consoleInput, currentProject]);
+
+  const executeConsoleCommand = useCallback(() => {
+    const parsed = parseArrowCommand(consoleInput, currentProject);
+    if (parsed.error || !parsed.arrow) {
+      setConsoleError(parsed.error ?? "Command failed");
+      setConsoleMessage("");
+      return;
+    }
+
+    const arrow = parsed.arrow;
+    updateCurrentProject((project) => ({
+      ...project,
+      arrows: [...project.arrows, arrow],
+    }));
+    openElementProperties({ kind: "arrow", id: arrow.id });
+    setConsoleMessage(parsed.message ?? "Created arrow");
+    setConsoleError("");
+    setConsoleInput("");
+  }, [consoleInput, currentProject, openElementProperties, updateCurrentProject]);
 
   const selectedModule = useMemo(() => {
     if (selectedElement?.kind !== "module" || !currentProject) return null;
@@ -467,6 +838,11 @@ function AppShell() {
     return currentProject.arrows.find((arrow) => arrow.id === selectedElement.id) ?? null;
   }, [currentProject, selectedElement]);
 
+  const selectedGizmoNode = useMemo(() => {
+    if (selectedElement?.kind !== "module") return null;
+    return flowNodes.find((node) => node.id === selectedElement.id) ?? null;
+  }, [flowNodes, selectedElement]);
+
   const currentProjectGroups = useMemo(() => sortPinnedFirst(groups), [groups]);
   const ungroupedProjects = useMemo(
     () => sortPinnedFirst(projects.filter((project) => !project.groupId || !groups.some((group) => group.id === project.groupId))),
@@ -477,7 +853,7 @@ function AppShell() {
     return (
       <main className="boot-screen">
         <Layers3 size={32} />
-        <span>Cheerio Flow 正在读取本地存档...</span>
+        <span>Cheerio Flow is loading local data...</span>
       </main>
     );
   }
@@ -486,7 +862,7 @@ function AppShell() {
     <main className="app-shell">
       <aside className={`project-sidebar ${projectSidebarCollapsed ? "collapsed" : ""}`}>
         {projectSidebarCollapsed ? (
-          <SidebarButton title="显示项目栏" onClick={() => setProjectSidebarCollapsed(false)}>
+          <SidebarButton title="Show projects" onClick={() => setProjectSidebarCollapsed(false)}>
             <ChevronsRight size={18} />
           </SidebarButton>
         ) : (
@@ -494,9 +870,9 @@ function AppShell() {
             <div className="sidebar-header">
               <div>
                 <div className="app-name">Cheerio Flow</div>
-                <div className="app-subtitle">科研流程工作台</div>
+                <div className="app-subtitle">Research flow workspace</div>
               </div>
-              <SidebarButton title="隐藏项目栏" onClick={() => setProjectSidebarCollapsed(true)}>
+              <SidebarButton title="Hide projects" onClick={() => setProjectSidebarCollapsed(true)}>
                 <ChevronsLeft size={18} />
               </SidebarButton>
             </div>
@@ -504,11 +880,11 @@ function AppShell() {
             <div className="sidebar-actions">
               <button type="button" className="action-button" onClick={createProject}>
                 <FilePlus2 size={16} />
-                新项目
+                New Project
               </button>
               <button type="button" className="action-button" onClick={createGroup}>
                 <FolderPlus size={16} />
-                新组
+                New Group
               </button>
             </div>
 
@@ -534,35 +910,26 @@ function AppShell() {
                       >
                         {collapsed ? <EyeOff size={14} /> : <Eye size={14} />}
                       </button>
-                      <input
-                        value={group.title}
-                        onChange={(event) => updateGroup(group.id, (item) => ({ ...item, title: event.target.value }))}
-                        aria-label="分组标题"
-                      />
-                      <button
-                        className="tiny-button"
-                        type="button"
-                        title={group.pinned ? "取消置顶分组" : "置顶分组"}
-                        onClick={() => updateGroup(group.id, (item) => ({ ...item, pinned: !item.pinned }))}
-                      >
+                      <input value={group.title} onChange={(event) => updateGroup(group.id, (item) => ({ ...item, title: event.target.value }))} />
+                      <button className="tiny-button" type="button" onClick={() => updateGroup(group.id, (item) => ({ ...item, pinned: !item.pinned }))}>
                         <GroupIcon size={14} />
                       </button>
-                      <button className="tiny-button danger" type="button" title="删除分组" onClick={() => deleteGroup(group.id)}>
+                      <button className="tiny-button danger" type="button" onClick={() => deleteGroup(group.id)}>
                         <Trash2 size={14} />
                       </button>
                     </div>
-                    <div className="group-meta">创建于 {group.createdAt}</div>
+                    <div className="group-meta">Created {group.createdAt}</div>
                     {!collapsed && (
                       <div className="project-stack">
                         {groupProjects.length === 0 ? (
-                          <div className="empty-hint">空组</div>
+                          <div className="empty-hint">Empty group</div>
                         ) : (
                           groupProjects.map((project) => (
                             <ProjectListItem
                               key={project.id}
                               project={project}
                               active={project.id === currentProject?.id}
-                              onSelect={() => setCurrentProjectId(project.id)}
+                              onSelect={() => selectProject(project.id)}
                               onTogglePin={() => updateProject(project.id, (item) => ({ ...item, pinned: !item.pinned }))}
                             />
                           ))
@@ -576,7 +943,7 @@ function AppShell() {
               <section className="project-group">
                 <div className="group-header simple">
                   <GripVertical size={15} />
-                  <span>未分组</span>
+                  <span>Ungrouped</span>
                 </div>
                 <div className="project-stack">
                   {ungroupedProjects.map((project) => (
@@ -584,7 +951,7 @@ function AppShell() {
                       key={project.id}
                       project={project}
                       active={project.id === currentProject?.id}
-                      onSelect={() => setCurrentProjectId(project.id)}
+                      onSelect={() => selectProject(project.id)}
                       onTogglePin={() => updateProject(project.id, (item) => ({ ...item, pinned: !item.pinned }))}
                     />
                   ))}
@@ -594,24 +961,16 @@ function AppShell() {
 
             {currentProject && (
               <section className="project-editor">
-                <div className="editor-title">当前项目</div>
+                <div className="editor-title">Current Project</div>
                 <label>
-                  标题
-                  <input
-                    value={currentProject.title}
-                    onChange={(event) => updateCurrentProject((project) => ({ ...project, title: event.target.value }))}
-                  />
+                  Title
+                  <input value={currentProject.title} onChange={(event) => updateCurrentProject((project) => ({ ...project, title: event.target.value }))} />
                 </label>
                 <label>
-                  类别
+                  Category
                   <select
                     value={currentProject.category}
-                    onChange={(event) =>
-                      updateCurrentProject((project) => ({
-                        ...project,
-                        category: event.target.value as Project["category"],
-                      }))
-                    }
+                    onChange={(event) => updateCurrentProject((project) => ({ ...project, category: event.target.value as Project["category"] }))}
                   >
                     {PROJECT_CATEGORIES.map((category) => (
                       <option key={category} value={category}>
@@ -621,9 +980,9 @@ function AppShell() {
                   </select>
                 </label>
                 <label>
-                  分组
+                  Group
                   <select value={currentProject.groupId ?? ""} onChange={(event) => moveProjectToGroup(currentProject.id, event.target.value || null)}>
-                    <option value="">未分组</option>
+                    <option value="">Ungrouped</option>
                     {groups.map((group) => (
                       <option key={group.id} value={group.id}>
                         {group.title}
@@ -632,7 +991,7 @@ function AppShell() {
                   </select>
                 </label>
                 <div className="readonly-row">
-                  <span>创建时间</span>
+                  <span>Created</span>
                   <strong>{currentProject.createdAt}</strong>
                 </div>
                 <label className="check-row">
@@ -641,12 +1000,24 @@ function AppShell() {
                     checked={currentProject.pinned}
                     onChange={(event) => updateCurrentProject((project) => ({ ...project, pinned: event.target.checked }))}
                   />
-                  置顶项目
+                  Pinned
                 </label>
                 <button className="delete-button" type="button" onClick={deleteCurrentProject}>
                   <Trash2 size={16} />
-                  删除当前项目
+                  Delete Current Project
                 </button>
+                <label>
+                  Storage root
+                  <input value={storageRootInput} onChange={(event) => setStorageRootInput(event.target.value)} />
+                </label>
+                <button className="action-button" type="button" onClick={() => void applyStorageRoot()}>
+                  <Save size={15} />
+                  Apply Storage Path
+                </button>
+                <div className="readonly-row">
+                  <span>Active data directory</span>
+                  <strong>{dataDir || "unavailable"}</strong>
+                </div>
               </section>
             )}
           </>
@@ -660,19 +1031,19 @@ function AppShell() {
               className="project-title-input"
               value={currentProject?.title ?? ""}
               onChange={(event) => updateCurrentProject((project) => ({ ...project, title: event.target.value }))}
-              aria-label="项目标题"
+              aria-label="Project title"
             />
             <span className="project-context">
-              {currentProject?.category ?? "科研"} · {currentProject?.createdAt ?? ""}
+              {currentProject?.category ?? "research"} / {currentProject?.createdAt ?? ""}
             </span>
           </div>
           <div className="topbar-actions">
             <button className="toolbar-button" type="button" onClick={() => setShapeMenuOpen((open) => !open)}>
               <Shapes size={17} />
-              模块
+              Module
             </button>
             <SidebarButton
-              title={propertiesSidebarCollapsed ? "显示属性栏" : "隐藏属性栏"}
+              title={propertiesSidebarCollapsed ? "Show properties" : "Hide properties"}
               onClick={() => setPropertiesSidebarCollapsed((collapsed) => !collapsed)}
             >
               {propertiesSidebarCollapsed ? <PanelRightOpen size={18} /> : <PanelRightClose size={18} />}
@@ -707,44 +1078,78 @@ function AppShell() {
               {pendingShape}
             </div>
           )}
+          {ctrlWheel && (
+            <CtrlWheel
+              center={ctrlWheel}
+              onPick={(shape) => createModuleAt(shape, ctrlWheel.x, ctrlWheel.y)}
+            />
+          )}
+          {consoleOpen && (
+            <CommandConsole
+              inputRef={consoleInputRef}
+              value={consoleInput}
+              suggestion={commandSuggestion}
+              message={consoleMessage}
+              error={consoleError}
+              onChange={(value) => {
+                setConsoleInput(value);
+                setConsoleError("");
+                setConsoleMessage("");
+              }}
+              onComplete={() => {
+                if (commandSuggestion) setConsoleInput((value) => value + commandSuggestion);
+              }}
+              onExecute={executeConsoleCommand}
+            />
+          )}
           <ReactFlow
-            nodes={nodes}
-            edges={edges}
+            nodes={flowNodes}
+            edges={flowEdges}
             nodeTypes={nodeTypes}
             onInit={setFlowInstance}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            onReconnect={onReconnect}
             onPaneClick={onPaneClick}
+            onMove={(_, nextViewport) => setViewportState(nextViewport)}
             onPaneMouseMove={(event) => {
               if (pendingShape) setGhostPoint({ x: event.clientX, y: event.clientY });
             }}
             onPaneMouseLeave={() => setGhostPoint(null)}
             onNodeClick={(_, node) => selectElement({ kind: "module", id: node.id })}
-            onNodeDoubleClick={(_, node) => selectElement({ kind: "module", id: node.id })}
+            onNodeDoubleClick={(_, node) => openElementProperties({ kind: "module", id: node.id })}
             onEdgeClick={(_, edge) => selectElement({ kind: "arrow", id: edge.id })}
-            onEdgeDoubleClick={(_, edge) => selectElement({ kind: "arrow", id: edge.id })}
-            connectionMode={ConnectionMode.Loose}
-            fitView
-            nodesDraggable
-            nodesConnectable
+            onEdgeDoubleClick={(_, edge) => openElementProperties({ kind: "arrow", id: edge.id })}
+            zoomOnDoubleClick={false}
+            nodesDraggable={false}
+            nodesConnectable={false}
             edgesFocusable
-            edgesReconnectable
+            edgesReconnectable={false}
             deleteKeyCode={["Backspace", "Delete"]}
           >
             <Background color="#d7dfdc" gap={24} size={1} />
-            <MiniMap pannable zoomable nodeColor={(node) => ((node.data as FlowModuleData).enabled ? "#8ab8a8" : "#b8bec0")} />
             <Controls />
           </ReactFlow>
+          {selectedGizmoNode && (
+            <MoveGizmo
+              node={selectedGizmoNode}
+              viewport={viewport}
+              onPointerDown={startGizmoDrag}
+            />
+          )}
         </div>
 
         <footer className="statusbar">
           <span>
             <Save size={14} />
-            本地存档: {dataDir || "未获取"}
+            Local data: {dataDir || "unavailable"}
           </span>
-          {pendingShape ? <strong>选择画布位置以创建「{pendingShape}」模块，Esc 取消</strong> : <span>模块 {nodes.length} · 箭头 {edges.length}</span>}
+          {storageReport && (
+            <span>
+              Disk {storageReport.projectCount}/{storageReport.moduleCount}/{storageReport.arrowCount}
+            </span>
+          )}
+          {pendingShape ? <strong>Click the canvas to create a {pendingShape} module. Esc cancels.</strong> : <span>Modules {flowNodes.length} / Arrows {flowEdges.length}</span>}
+          <span className={`save-status save-status-${saveStatus}`}>{saveStatus === "saving" ? "Saving..." : saveStatus === "saved" ? "Saved" : "Save failed"}</span>
           {error && <span className="error-text">{error}</span>}
         </footer>
       </section>
@@ -772,6 +1177,121 @@ function AppShell() {
   );
 }
 
+function CtrlWheel({ center, onPick }: { center: { x: number; y: number }; onPick: (shape: ModuleShape) => void }) {
+  const radius = 82;
+  return (
+    <div className="ctrl-wheel" style={{ left: center.x, top: center.y }}>
+      {MODULE_SHAPES.map((shape, index) => {
+        const angle = -Math.PI / 2 + (index / MODULE_SHAPES.length) * Math.PI * 2;
+        const ShapeIcon = SHAPE_ICONS[shape];
+        return (
+          <button
+            type="button"
+            key={shape}
+            className="ctrl-wheel-option"
+            style={{
+              transform: `translate(${Math.cos(angle) * radius}px, ${Math.sin(angle) * radius}px) translate(-50%, -50%)`,
+            }}
+            onClick={(event) => {
+              event.stopPropagation();
+              onPick(shape);
+            }}
+            title={shape}
+          >
+            <ShapeIcon size={18} />
+            <span>{shape}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function MoveGizmo({
+  node,
+  viewport,
+  onPointerDown,
+}: {
+  node: ModuleNodeType;
+  viewport: { x: number; y: number; zoom: number };
+  onPointerDown: (event: React.PointerEvent, mode: MoveMode) => void;
+}) {
+  const left = viewport.x + (node.position.x + 85) * viewport.zoom;
+  const top = viewport.y + (node.position.y + 66) * viewport.zoom;
+
+  return (
+    <div className="move-gizmo" style={{ left, top }}>
+      <button
+        type="button"
+        className="move-gizmo-axis move-gizmo-x"
+        aria-label="Move on X axis"
+        onPointerDown={(event) => onPointerDown(event, "x")}
+      />
+      <button
+        type="button"
+        className="move-gizmo-axis move-gizmo-y"
+        aria-label="Move on Y axis"
+        onPointerDown={(event) => onPointerDown(event, "y")}
+      />
+      <button
+        type="button"
+        className="move-gizmo-center"
+        aria-label="Move freely"
+        onPointerDown={(event) => onPointerDown(event, "free")}
+      />
+    </div>
+  );
+}
+
+function CommandConsole({
+  inputRef,
+  value,
+  suggestion,
+  message,
+  error,
+  onChange,
+  onComplete,
+  onExecute,
+}: {
+  inputRef: React.RefObject<HTMLInputElement>;
+  value: string;
+  suggestion: string;
+  message: string;
+  error: string;
+  onChange: (value: string) => void;
+  onComplete: () => void;
+  onExecute: () => void;
+}) {
+  return (
+    <div className="command-console">
+      <div className="command-input-frame">
+        <span className="command-ghost-line" aria-hidden>
+          <span className="command-typed">{value}</span>
+          <span className="command-ghost">{suggestion}</span>
+        </span>
+        <input
+          ref={inputRef}
+          value={value}
+          spellCheck={false}
+          placeholder="arrow m1 to m2 type support"
+          onChange={(event) => onChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              onExecute();
+            }
+            if (event.key === "Tab") {
+              event.preventDefault();
+              onComplete();
+            }
+          }}
+        />
+      </div>
+      <div className="command-feedback">{error ? <span className="command-error">{error}</span> : message ? <span>{message}</span> : <span>~ toggles console. Enter runs. Tab completes.</span>}</div>
+    </div>
+  );
+}
+
 function ProjectListItem({
   project,
   active,
@@ -787,12 +1307,12 @@ function ProjectListItem({
   return (
     <div className={`project-item ${active ? "active" : ""}`}>
       <button type="button" className="project-pick" onClick={onSelect}>
-        <span>{project.title || "未命名项目"}</span>
+        <span>{project.title || "Untitled Project"}</span>
         <small>
-          {project.category} · {project.createdAt}
+          {project.category} / {project.createdAt}
         </small>
       </button>
-      <button type="button" className="tiny-button" title={project.pinned ? "取消置顶项目" : "置顶项目"} onClick={onTogglePin}>
+      <button type="button" className="tiny-button" title={project.pinned ? "Unpin project" : "Pin project"} onClick={onTogglePin}>
         <PinIcon size={14} />
       </button>
     </div>
@@ -823,7 +1343,7 @@ function PropertiesPanel({
       .map((arrow) => {
         const otherId = arrow.source === selectedModule.id ? arrow.target : arrow.source;
         const other = currentProject.modules.find((module) => module.id === otherId);
-        return { arrow, other, direction: arrow.source === selectedModule.id ? "输出" : "输入" };
+        return { arrow, other, direction: arrow.source === selectedModule.id ? "out" : "in" };
       });
   }, [currentProject, selectedModule]);
 
@@ -842,10 +1362,10 @@ function PropertiesPanel({
     <aside className="properties-sidebar">
       <div className="properties-header">
         <div>
-          <div className="editor-title">属性栏</div>
-          <span>{selectedModule ? "模块属性" : selectedArrow ? "箭头属性" : "未选择对象"}</span>
+          <div className="editor-title">Properties</div>
+          <span>{selectedModule ? `Module ${selectedModule.data.shortId}` : selectedArrow ? "Arrow" : "No selection"}</span>
         </div>
-        <button type="button" className="icon-button" title="关闭属性栏" onClick={onClose}>
+        <button type="button" className="icon-button" title="Close properties" onClick={onClose}>
           <X size={18} />
         </button>
       </div>
@@ -853,14 +1373,19 @@ function PropertiesPanel({
       {!selectedModule && !selectedArrow && (
         <div className="empty-panel">
           <Box size={24} />
-          <p>单击或双击画布中的模块、箭头后可编辑属性。</p>
+          <p>Click or double-click a module or arrow to edit its properties.</p>
         </div>
       )}
 
       {selectedModule && (
         <div className="property-form">
           <label>
-            类型
+            Short ID
+            <input value={selectedModule.data.shortId} readOnly />
+          </label>
+
+          <label>
+            Type
             <select
               value={selectedModule.data.moduleType}
               onChange={(event) =>
@@ -879,7 +1404,7 @@ function PropertiesPanel({
           </label>
 
           <label>
-            形状
+            Shape
             <select
               value={selectedModule.data.shape}
               onChange={(event) =>
@@ -898,7 +1423,7 @@ function PropertiesPanel({
           </label>
 
           <label>
-            内容
+            Content
             <textarea
               rows={7}
               value={selectedModule.data.content}
@@ -922,25 +1447,27 @@ function PropertiesPanel({
                 }))
               }
             />
-            启用 LaTeX 渲染
-          </label>
-
-          <label className="check-row">
-            <input
-              type="checkbox"
-              checked={selectedModule.data.enabled}
-              onChange={(event) =>
-                onUpdateModule(selectedModule.id, (module) => ({
-                  ...module,
-                  data: { ...module.data, enabled: event.target.checked },
-                }))
-              }
-            />
-            启用模块
+            Render LaTeX
           </label>
 
           <label>
-            备注
+            Status
+            <select
+              value={selectedModule.data.status}
+              onChange={(event) =>
+                onUpdateModule(selectedModule.id, (module) => {
+                  const status = event.target.value as FlowModuleData["status"];
+                  return { ...module, data: { ...module.data, status, enabled: status === "enabled" } };
+                })
+              }
+            >
+              <option value="enabled">enabled</option>
+              <option value="disabled">disabled</option>
+            </select>
+          </label>
+
+          <label>
+            Note
             <textarea
               rows={5}
               value={selectedModule.data.note}
@@ -954,16 +1481,16 @@ function PropertiesPanel({
           </label>
 
           <section className="related-section">
-            <div className="editor-title">关联模块</div>
+            <div className="editor-title">Related Arrows</div>
             {relatedForModule.length === 0 ? (
-              <div className="empty-hint">暂无连接</div>
+              <div className="empty-hint">No arrows</div>
             ) : (
               relatedForModule.map(({ arrow, other, direction }) => (
                 <div className="related-item" key={arrow.id}>
                   <GitBranch size={14} />
                   <span>
-                    {direction} · {arrow.data.arrowType} · {arrow.data.enabled ? "启用" : "停用"}
-                    <small>{other ? `关联 ${other.data.moduleType} / ${other.data.enabled ? "启用" : "停用"}` : "关联模块缺失"}</small>
+                    {direction} / {arrow.data.arrowType} / {arrow.data.status}
+                    <small>{other ? `${other.data.shortId} / ${other.data.moduleType}` : "Missing module"}</small>
                   </span>
                 </div>
               ))
@@ -975,7 +1502,7 @@ function PropertiesPanel({
       {selectedArrow && (
         <div className="property-form">
           <label>
-            类型
+            Type
             <select
               value={selectedArrow.data.arrowType}
               onChange={(event) =>
@@ -993,25 +1520,27 @@ function PropertiesPanel({
             </select>
           </label>
 
-          <label className="check-row">
-            <input
-              type="checkbox"
-              checked={selectedArrow.data.enabled}
+          <label>
+            Status
+            <select
+              value={selectedArrow.data.status}
               onChange={(event) =>
-                onUpdateArrow(selectedArrow.id, (arrow) => ({
-                  ...arrow,
-                  data: { ...arrow.data, enabled: event.target.checked },
-                }))
+                onUpdateArrow(selectedArrow.id, (arrow) => {
+                  const status = event.target.value as FlowArrowData["status"];
+                  return { ...arrow, data: { ...arrow.data, status, enabled: status === "enabled" } };
+                })
               }
-            />
-            启用箭头
+            >
+              <option value="enabled">enabled</option>
+              <option value="disabled">disabled</option>
+            </select>
           </label>
 
           <div className="direction-box">
             <div>
-              <span>方向</span>
+              <span>Direction</span>
               <strong>
-                {sourceModule?.data.moduleType ?? "未知模块"} → {targetModule?.data.moduleType ?? "未知模块"}
+                {sourceModule?.data.shortId ?? "missing"} {"->"} {targetModule?.data.shortId ?? "missing"}
               </strong>
             </div>
             <button
@@ -1028,12 +1557,12 @@ function PropertiesPanel({
               }
             >
               <GitBranch size={15} />
-              反转方向
+              Reverse
             </button>
           </div>
 
           <label>
-            备注
+            Note
             <textarea
               rows={6}
               value={selectedArrow.data.note}
@@ -1045,24 +1574,6 @@ function PropertiesPanel({
               }
             />
           </label>
-
-          <section className="related-section">
-            <div className="editor-title">关联模块</div>
-            <div className="related-item">
-              <GitBranch size={14} />
-              <span>
-                Source
-                <small>{sourceModule ? `${sourceModule.data.moduleType} / ${sourceModule.data.enabled ? "启用" : "停用"}` : "缺失"}</small>
-              </span>
-            </div>
-            <div className="related-item">
-              <GitBranch size={14} />
-              <span>
-                Target
-                <small>{targetModule ? `${targetModule.data.moduleType} / ${targetModule.data.enabled ? "启用" : "停用"}` : "缺失"}</small>
-              </span>
-            </div>
-          </section>
         </div>
       )}
     </aside>
