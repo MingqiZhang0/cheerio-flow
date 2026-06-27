@@ -153,7 +153,7 @@ fn default_enabled() -> bool {
 }
 
 fn now_string() -> String {
-    let format = format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
+    let format = format_description::parse_borrowed::<3>("[year]-[month]-[day] [hour]:[minute]:[second]")
         .expect("valid time format");
     OffsetDateTime::now_local()
         .unwrap_or_else(|_| OffsetDateTime::now_utc())

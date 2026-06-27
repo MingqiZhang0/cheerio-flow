@@ -341,7 +341,7 @@ function AppShell() {
   const [pendingShape, setPendingShape] = useState<ModuleShape | null>(null);
   const [ghostPoint, setGhostPoint] = useState<{ x: number; y: number } | null>(null);
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance<ModuleNodeType, ArrowEdgeType> | null>(null);
-  const [flowNodes, setFlowNodes] = useState<ModuleNodeType[]>([]);
+  const [flowNodes, setFlowNodesState] = useState<ModuleNodeType[]>([]);
   const [flowEdges, setFlowEdges] = useState<ArrowEdgeType[]>([]);
   const [viewport, setViewportState] = useState({ x: 0, y: 0, zoom: 1 });
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
@@ -355,6 +355,10 @@ function AppShell() {
   const consoleInputRef = useRef<HTMLInputElement | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const isVisualDraggingRef = useRef(false);
+  const flowNodesRef = useRef<ModuleNodeType[]>([]);
+  const hydratedProjectIdRef = useRef<string | null>(null);
+  const capturedPointerRef = useRef<{ element: HTMLElement; pointerId: number } | null>(null);
+  const resetInteractionStateRef = useRef<(options?: { clearPlacement?: boolean; clearSelection?: boolean }) => void>(() => undefined);
   const gizmoDragRef = useRef<{
     nodeId: string;
     mode: MoveMode;
@@ -387,9 +391,29 @@ function AppShell() {
     [currentProject?.id, projectSidebarCollapsed, propertiesSidebarCollapsed],
   );
 
-  useEffect(() => {
-    projectsRef.current = projects;
-  }, [projects]);
+  const setFlowNodes = useCallback((nextOrUpdater: ModuleNodeType[] | ((previous: ModuleNodeType[]) => ModuleNodeType[])) => {
+    setFlowNodesState((previous) => {
+      const next = typeof nextOrUpdater === "function" ? nextOrUpdater(previous) : nextOrUpdater;
+      flowNodesRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const mergeLatestFlowPositions = useCallback((modules: FlowModule[]) => {
+    const positions = new Map(flowNodesRef.current.map((node) => [node.id, node.position]));
+    return modules.map((module) => {
+      const position = positions.get(module.id);
+      return position ? { ...module, position: { x: position.x, y: position.y } } : module;
+    });
+  }, []);
+
+  const updateProjects = useCallback((updater: (previous: Project[]) => Project[]) => {
+    setProjects((previous) => {
+      const next = updater(previous);
+      projectsRef.current = next;
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     groupsRef.current = groups;
@@ -399,11 +423,11 @@ function AppShell() {
     appStateRef.current = appState;
   }, [appState]);
 
-  const saveAllNow = useCallback(async () => {
+  const saveAllNow = useCallback(async (projectsOverride?: Project[]) => {
     if (!loadedRef.current) return;
     setSaveStatus("saving");
     try {
-      const currentProjects = projectsRef.current;
+      const currentProjects = projectsOverride ?? projectsRef.current;
       const currentGroups = groupsRef.current;
       const currentAppState = appStateRef.current;
       const report = await persistDatabase(currentProjects, currentGroups, currentAppState);
@@ -428,11 +452,13 @@ function AppShell() {
         const normalizedGroups = normalizeGroups(data.groups, normalizedProjects);
         const hydratedProjects = applyGroupMembership(normalizedProjects, normalizedGroups);
         const firstProject = hydratedProjects[0] ?? createEmptyProject();
+        const nextProjects = hydratedProjects.length > 0 ? hydratedProjects : [firstProject];
+        groupsRef.current = normalizedGroups;
         setDataDir(data.dataDir);
         setStorageReport(data.report ?? null);
         setStorageRootInput(data.storageRoot ?? "");
         setGroups(normalizedGroups);
-        setProjects(hydratedProjects.length > 0 ? hydratedProjects : [firstProject]);
+        updateProjects(() => nextProjects);
         setCurrentProjectId(data.appState.currentProjectId ?? firstProject.id);
         setProjectSidebarCollapsed(data.appState.projectSidebarCollapsed);
         setPropertiesSidebarCollapsed(data.appState.propertiesSidebarCollapsed);
@@ -442,7 +468,7 @@ function AppShell() {
       .catch((reason: unknown) => {
         console.error("Failed to load Cheerio Flow data", reason);
         setError(reason instanceof Error ? reason.message : String(reason));
-        setProjects([]);
+        updateProjects(() => []);
         setCurrentProjectId(null);
         setLoaded(true);
         loadedRef.current = true;
@@ -451,7 +477,7 @@ function AppShell() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [updateProjects]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -484,6 +510,9 @@ function AppShell() {
       lastPointerRef.current = { x: event.clientX, y: event.clientY };
     };
     const onKeyDown = (event: KeyboardEvent) => {
+      if (gizmoDragRef.current && !capturedPointerRef.current) {
+        resetInteractionStateRef.current();
+      }
       if (gizmoDragRef.current) return;
       if (isConsoleToggle(event)) {
         event.preventDefault();
@@ -492,10 +521,7 @@ function AppShell() {
       }
 
       if (event.key === "Escape") {
-        setPendingShape(null);
-        setShapeMenuOpen(false);
-        setGhostPoint(null);
-        setCtrlWheel(null);
+        resetInteractionStateRef.current({ clearPlacement: true });
         setPropertiesSidebarCollapsed(true);
         return;
       }
@@ -526,15 +552,16 @@ function AppShell() {
   }, [currentProjectId, loaded, projects]);
 
   const updateProject = useCallback((projectId: string, updater: (project: Project) => Project) => {
-    setProjects((previous) => previous.map((project) => (project.id === projectId ? updater(project) : project)));
-  }, []);
+    const applyProject = (previous: Project[]) => previous.map((project) => (project.id === projectId ? updater(project) : project));
+    updateProjects(applyProject);
+  }, [updateProjects]);
 
   const updateCurrentProject = useCallback(
     (updater: (project: Project) => Project) => {
-      if (!currentProject) return;
-      updateProject(currentProject.id, updater);
+      if (!currentProjectId) return;
+      updateProject(currentProjectId, updater);
     },
-    [currentProject, updateProject],
+    [currentProjectId, updateProject],
   );
 
   const selectElement = useCallback((element: SelectedElement) => {
@@ -546,49 +573,152 @@ function AppShell() {
     if (element) setPropertiesSidebarCollapsed(false);
   }, []);
 
-  const projectNodes = useMemo(
-    () => currentProject?.modules.map((module) => moduleToNode(module, selectedElement?.kind === "module" && selectedElement.id === module.id)) ?? [],
-    [currentProject?.modules, selectedElement],
+  const resetInteractionState = useCallback(
+    (options: { clearPlacement?: boolean; clearSelection?: boolean } = {}) => {
+      const activeGizmo = gizmoDragRef.current;
+      if (activeGizmo?.frame !== null && activeGizmo?.frame !== undefined) {
+        window.cancelAnimationFrame(activeGizmo.frame);
+      }
+      const captured = capturedPointerRef.current;
+      if (captured?.element.hasPointerCapture?.(captured.pointerId)) {
+        captured.element.releasePointerCapture(captured.pointerId);
+      }
+      capturedPointerRef.current = null;
+      gizmoDragRef.current = null;
+      isVisualDraggingRef.current = false;
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      document.body.style.overflow = "";
+      document.body.style.pointerEvents = "";
+      setCtrlWheel(null);
+      setGhostPoint(null);
+      if (options.clearPlacement) {
+        setPendingShape(null);
+        setShapeMenuOpen(false);
+      }
+      if (options.clearSelection) setSelectedElement(null);
+    },
+    [],
   );
+
+  resetInteractionStateRef.current = resetInteractionState;
+
+  useEffect(() => {
+    const resetStaleDrag = () => {
+      if (!gizmoDragRef.current && isVisualDraggingRef.current) resetInteractionState();
+    };
+    window.addEventListener("pointerup", resetStaleDrag);
+    window.addEventListener("pointercancel", resetStaleDrag);
+    window.addEventListener("blur", resetStaleDrag);
+    document.addEventListener("mouseup", resetStaleDrag);
+    document.addEventListener("pointerup", resetStaleDrag);
+    return () => {
+      window.removeEventListener("pointerup", resetStaleDrag);
+      window.removeEventListener("pointercancel", resetStaleDrag);
+      window.removeEventListener("blur", resetStaleDrag);
+      document.removeEventListener("mouseup", resetStaleDrag);
+      document.removeEventListener("pointerup", resetStaleDrag);
+    };
+  }, [resetInteractionState]);
+
+  const commitNodePosition = useCallback(
+    (nodeId: string, position: { x: number; y: number }) => {
+      const finalPosition = { x: position.x, y: position.y };
+      setFlowNodes((previous) =>
+        previous.map((node) => (node.id === nodeId ? { ...node, position: finalPosition } : node)),
+      );
+      const applyPosition = (previous: Project[]) =>
+        previous.map((project) =>
+          project.id === currentProjectId
+            ? {
+                ...project,
+                modules: project.modules.map((module) =>
+                  module.id === nodeId ? { ...module, position: finalPosition } : module,
+                ),
+              }
+            : project,
+        );
+      updateProjects(applyPosition);
+    },
+    [currentProjectId, setFlowNodes, updateProjects],
+  );
+
+  const commitFlowNodePositionsToProject = useCallback(() => {
+    const applyPositions = (previous: Project[]) =>
+      previous.map((project) =>
+        project.id === currentProjectId ? { ...project, modules: mergeLatestFlowPositions(project.modules) } : project,
+      );
+    const nextProjects = applyPositions(projectsRef.current);
+    updateProjects(applyPositions);
+    return nextProjects;
+  }, [currentProjectId, mergeLatestFlowPositions, updateProjects]);
+
   const projectEdges = useMemo(
     () => currentProject?.arrows.map((arrow) => arrowToEdge(arrow, selectedElement?.kind === "arrow" && selectedElement.id === arrow.id)) ?? [],
     [currentProject?.arrows, selectedElement],
   );
 
   useEffect(() => {
-    if (!isVisualDraggingRef.current) setFlowNodes(projectNodes);
-  }, [projectNodes]);
+    if (!loaded) return;
+    const projectId = currentProjectId ?? projectsRef.current[0]?.id ?? null;
+    if (!projectId) {
+      hydratedProjectIdRef.current = null;
+      setFlowNodes([]);
+      return;
+    }
+
+    if (hydratedProjectIdRef.current === projectId) return;
+    const project = projectsRef.current.find((item) => item.id === projectId);
+    if (!project) return;
+    resetInteractionState({ clearPlacement: true });
+    hydratedProjectIdRef.current = projectId;
+    setFlowNodes(project.modules.map((module) => moduleToNode(module, false)));
+  }, [currentProjectId, loaded, resetInteractionState, setFlowNodes]);
+
+  useEffect(() => {
+    setFlowNodes((previous) =>
+      previous.map((node) => {
+        const selected = selectedElement?.kind === "module" && selectedElement.id === node.id;
+        return node.selected === selected ? node : { ...node, selected };
+      }),
+    );
+  }, [selectedElement, setFlowNodes]);
 
   useEffect(() => {
     setFlowEdges(projectEdges);
   }, [projectEdges]);
 
   const createProject = useCallback(() => {
+    resetInteractionState({ clearPlacement: true, clearSelection: true });
     const project = createEmptyProject(`Project ${projects.length + 1}`);
-    setProjects((previous) => [...previous, project]);
+    const applyProject = (previous: Project[]) => [...previous, project];
+    updateProjects(applyProject);
     setCurrentProjectId(project.id);
     setSelectedElement(null);
     setPropertiesSidebarCollapsed(true);
-  }, [projects.length]);
+  }, [projects.length, resetInteractionState, updateProjects]);
 
   const selectProject = useCallback(
     async (projectId: string) => {
       if (projectId === currentProject?.id) return;
-      await saveAllNow();
+      resetInteractionState({ clearPlacement: true });
+      const projectsForSave = commitFlowNodePositionsToProject();
+      await saveAllNow(projectsForSave);
       setCurrentProjectId(projectId);
       setSelectedElement(null);
       setPropertiesSidebarCollapsed(true);
     },
-    [currentProject?.id, saveAllNow],
+    [commitFlowNodePositionsToProject, currentProject?.id, resetInteractionState, saveAllNow],
   );
 
   const deleteCurrentProject = useCallback(() => {
     if (!currentProject) return;
+    resetInteractionState({ clearPlacement: true, clearSelection: true });
     const projectId = currentProject.id;
     const remaining = projects.filter((project) => project.id !== projectId);
     const fallback = remaining.length === 0 ? createEmptyProject() : null;
     const nextProjects = fallback ? [fallback] : remaining;
-    setProjects(nextProjects);
+    updateProjects(() => nextProjects);
     setGroups((previous) =>
       previous.map((group) => ({
         ...group,
@@ -602,7 +732,7 @@ function AppShell() {
       setSaveStatus("error");
       setError(reason instanceof Error ? reason.message : String(reason));
     });
-  }, [currentProject, projects]);
+  }, [currentProject, projects, resetInteractionState, updateProjects]);
 
   const createGroup = useCallback(() => {
     const group = createEmptyGroup(`Group ${groups.length + 1}`);
@@ -611,15 +741,15 @@ function AppShell() {
 
   const deleteGroup = useCallback((groupId: string) => {
     setGroups((previous) => previous.filter((group) => group.id !== groupId));
-    setProjects((previous) => previous.map((project) => (project.groupId === groupId ? { ...project, groupId: null } : project)));
-  }, []);
+    updateProjects((previous) => previous.map((project) => (project.groupId === groupId ? { ...project, groupId: null } : project)));
+  }, [updateProjects]);
 
   const updateGroup = useCallback((groupId: string, updater: (group: ProjectGroup) => ProjectGroup) => {
     setGroups((previous) => previous.map((group) => (group.id === groupId ? updater(group) : group)));
   }, []);
 
   const moveProjectToGroup = useCallback((projectId: string, groupId: string | null) => {
-    setProjects((previous) => previous.map((project) => (project.id === projectId ? { ...project, groupId } : project)));
+    updateProjects((previous) => previous.map((project) => (project.id === projectId ? { ...project, groupId } : project)));
     setGroups((previous) =>
       previous.map((group) => {
         const withoutProject = group.projectIds.filter((id) => id !== projectId);
@@ -629,7 +759,7 @@ function AppShell() {
         };
       }),
     );
-  }, []);
+  }, [updateProjects]);
 
   const applyStorageRoot = useCallback(async () => {
     setSaveStatus("saving");
@@ -638,7 +768,9 @@ function AppShell() {
       const normalizedProjects = normalizeProjects(data.projects);
       const normalizedGroups = normalizeGroups(data.groups, normalizedProjects);
       const hydratedProjects = applyGroupMembership(normalizedProjects, normalizedGroups);
-      setProjects(hydratedProjects);
+      groupsRef.current = normalizedGroups;
+      hydratedProjectIdRef.current = null;
+      updateProjects(() => hydratedProjects);
       setGroups(normalizedGroups);
       setCurrentProjectId(data.appState.currentProjectId ?? hydratedProjects[0]?.id ?? null);
       setDataDir(data.dataDir);
@@ -652,47 +784,89 @@ function AppShell() {
       setSaveStatus("error");
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, [storageRootInput]);
+  }, [storageRootInput, updateProjects]);
 
   const createModuleAt = useCallback(
     (shape: ModuleShape, clientX: number, clientY: number) => {
-      if (!currentProject || !flowInstance) return;
+      if (!currentProjectId || !flowInstance) {
+        resetInteractionState({ clearPlacement: true });
+        return;
+      }
+      const project = projectsRef.current.find((item) => item.id === currentProjectId);
+      if (!project) {
+        resetInteractionState({ clearPlacement: true });
+        return;
+      }
       const position = flowInstance.screenToFlowPosition({ x: clientX, y: clientY });
-      const module = createModule(shape, position.x - 85, position.y - 66, getNextModuleShortId(currentProject.modules));
-      updateCurrentProject((project) => ({
-        ...project,
-        modules: [...project.modules, module],
-      }));
-      setPendingShape(null);
-      setGhostPoint(null);
-      setCtrlWheel(null);
+      const modulesWithLatestPositions = mergeLatestFlowPositions(project.modules);
+      const module = createModule(shape, position.x - 85, position.y - 66, getNextModuleShortId(modulesWithLatestPositions));
+      const applyModule = (previous: Project[]) =>
+        previous.map((item) =>
+          item.id === currentProjectId
+            ? {
+                ...item,
+                modules: [...mergeLatestFlowPositions(item.modules), module],
+              }
+            : item,
+        );
+      updateProjects(applyModule);
+      setFlowNodes((previous) => {
+        const previousById = new Map(previous.map((node) => [node.id, node]));
+        return [
+          ...modulesWithLatestPositions.map((item) => {
+            const existing = previousById.get(item.id);
+            return existing ? { ...existing, position: item.position, selected: false } : moduleToNode(item, false);
+          }),
+          moduleToNode(module, true),
+        ];
+      });
+      resetInteractionState({ clearPlacement: true });
       selectElement({ kind: "module", id: module.id });
     },
-    [currentProject, flowInstance, selectElement, updateCurrentProject],
+    [currentProjectId, flowInstance, mergeLatestFlowPositions, resetInteractionState, selectElement, setFlowNodes, updateProjects],
   );
 
   const onNodesChange = useCallback(
     (changes: NodeChange<ModuleNodeType>[]) => {
-      setFlowNodes((previous) => {
-        const nextNodes = applyNodeChanges(changes, previous);
-        const removedIds = new Set(
-          changes
-            .filter((change) => change.type === "remove")
-            .map((change) => ("id" in change ? change.id : null))
-            .filter((id): id is string => Boolean(id)),
-        );
-        if (removedIds.size > 0) {
-          updateCurrentProject((project) => ({
-            ...project,
-            modules: project.modules.filter((module) => !removedIds.has(module.id)),
-            arrows: project.arrows.filter((arrow) => !removedIds.has(arrow.source) && !removedIds.has(arrow.target)),
-          }));
-          if (selectedElement?.kind === "module" && removedIds.has(selectedElement.id)) setSelectedElement(null);
-        }
-        return nextNodes;
+      const nextNodes = applyNodeChanges(changes, flowNodesRef.current);
+      setFlowNodes(nextNodes);
+      const nextById = new Map(nextNodes.map((node) => [node.id, node]));
+      const removedIds = new Set(
+        changes
+          .filter((change) => change.type === "remove")
+          .map((change) => ("id" in change ? change.id : null))
+          .filter((id): id is string => Boolean(id)),
+      );
+
+      changes.forEach((change) => {
+        if (change.type !== "position" || change.dragging !== false) return;
+        const finalPosition = change.position ?? nextById.get(change.id)?.position;
+        if (finalPosition) commitNodePosition(change.id, finalPosition);
       });
+
+      if (removedIds.size > 0) {
+        updateCurrentProject((project) => ({
+          ...project,
+          modules: project.modules.filter((module) => !removedIds.has(module.id)),
+          arrows: project.arrows.filter((arrow) => !removedIds.has(arrow.source) && !removedIds.has(arrow.target)),
+        }));
+        if (selectedElement?.kind === "module" && removedIds.has(selectedElement.id)) setSelectedElement(null);
+      }
     },
-    [selectedElement, updateCurrentProject],
+    [commitNodePosition, selectedElement, setFlowNodes, updateCurrentProject],
+  );
+
+  const onNodeDragStart = useCallback(() => {
+    isVisualDraggingRef.current = true;
+    setCtrlWheel(null);
+  }, []);
+
+  const onNodeDragStop = useCallback(
+    (_event: MouseEvent | TouchEvent, node: ModuleNodeType) => {
+      commitNodePosition(node.id, node.position);
+      resetInteractionState();
+    },
+    [commitNodePosition, resetInteractionState],
   );
 
   const onEdgesChange = useCallback(
@@ -722,16 +896,6 @@ function AppShell() {
     [createModuleAt, pendingShape],
   );
 
-  const commitNodePosition = useCallback(
-    (nodeId: string, position: { x: number; y: number }) => {
-      updateCurrentProject((project) => ({
-        ...project,
-        modules: project.modules.map((module) => (module.id === nodeId ? { ...module, position } : module)),
-      }));
-    },
-    [updateCurrentProject],
-  );
-
   const startGizmoDrag = useCallback(
     (event: React.PointerEvent, mode: MoveMode) => {
       if (!flowInstance || selectedElement?.kind !== "module") return;
@@ -751,7 +915,11 @@ function AppShell() {
       };
       gizmoDragRef.current = dragState;
       isVisualDraggingRef.current = true;
-      (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = mode === "x" ? "ew-resize" : mode === "y" ? "ns-resize" : "move";
+      const pointerTarget = event.currentTarget as HTMLElement;
+      pointerTarget.setPointerCapture?.(event.pointerId);
+      capturedPointerRef.current = { element: pointerTarget, pointerId: event.pointerId };
 
       const applyDrag = () => {
         const active = gizmoDragRef.current;
@@ -777,12 +945,18 @@ function AppShell() {
         if (active.frame === null) active.frame = window.requestAnimationFrame(applyDrag);
       };
 
-      const onPointerUp = () => {
+      const finishDrag = () => {
         const active = gizmoDragRef.current;
         window.removeEventListener("pointermove", onPointerMove);
-        window.removeEventListener("pointerup", onPointerUp);
-        window.removeEventListener("pointercancel", onPointerUp);
-        if (!active) return;
+        window.removeEventListener("pointerup", finishDrag);
+        window.removeEventListener("pointercancel", finishDrag);
+        window.removeEventListener("blur", finishDrag);
+        document.removeEventListener("mouseup", finishDrag);
+        document.removeEventListener("pointerup", finishDrag);
+        if (!active) {
+          resetInteractionState();
+          return;
+        }
         if (active.frame !== null) window.cancelAnimationFrame(active.frame);
         const startFlow = flowInstance.screenToFlowPosition(active.startPointer);
         const currentFlow = flowInstance.screenToFlowPosition(active.lastPointer);
@@ -796,15 +970,17 @@ function AppShell() {
           previous.map((node) => (node.id === active.nodeId ? { ...node, position: finalPosition } : node)),
         );
         commitNodePosition(active.nodeId, finalPosition);
-        gizmoDragRef.current = null;
-        isVisualDraggingRef.current = false;
+        resetInteractionState();
       };
 
       window.addEventListener("pointermove", onPointerMove);
-      window.addEventListener("pointerup", onPointerUp);
-      window.addEventListener("pointercancel", onPointerUp);
+      window.addEventListener("pointerup", finishDrag);
+      window.addEventListener("pointercancel", finishDrag);
+      window.addEventListener("blur", finishDrag);
+      document.addEventListener("mouseup", finishDrag);
+      document.addEventListener("pointerup", finishDrag);
     },
-    [commitNodePosition, flowInstance, flowNodes, selectedElement],
+    [commitNodePosition, flowInstance, flowNodes, resetInteractionState, selectedElement, setFlowNodes],
   );
 
   const commandSuggestion = useMemo(() => getCommandSuggestion(consoleInput, currentProject), [consoleInput, currentProject]);
@@ -842,6 +1018,29 @@ function AppShell() {
     if (selectedElement?.kind !== "module") return null;
     return flowNodes.find((node) => node.id === selectedElement.id) ?? null;
   }, [flowNodes, selectedElement]);
+
+  const updateModuleInCurrentProject = useCallback(
+    (moduleId: string, updater: (module: FlowModule) => FlowModule) => {
+      const project = projectsRef.current.find((item) => item.id === currentProjectId);
+      const currentModule = project?.modules.find((module) => module.id === moduleId);
+      if (!project || !currentModule) return;
+      const nextModule = updater(currentModule);
+      updateProjects((previous) =>
+        previous.map((item) =>
+          item.id === project.id
+            ? {
+                ...item,
+                modules: item.modules.map((module) => (module.id === moduleId ? nextModule : module)),
+              }
+            : item,
+        ),
+      );
+      setFlowNodes((previous) =>
+        previous.map((node) => (node.id === moduleId ? { ...node, data: nextModule.data } : node)),
+      );
+    },
+    [currentProjectId, setFlowNodes, updateProjects],
+  );
 
   const currentProjectGroups = useMemo(() => sortPinnedFirst(groups), [groups]);
   const ungroupedProjects = useMemo(
@@ -1109,6 +1308,8 @@ function AppShell() {
             onInit={setFlowInstance}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
+            onNodeDragStart={onNodeDragStart}
+            onNodeDragStop={onNodeDragStop}
             onPaneClick={onPaneClick}
             onMove={(_, nextViewport) => setViewportState(nextViewport)}
             onPaneMouseMove={(event) => {
@@ -1120,7 +1321,7 @@ function AppShell() {
             onEdgeClick={(_, edge) => selectElement({ kind: "arrow", id: edge.id })}
             onEdgeDoubleClick={(_, edge) => openElementProperties({ kind: "arrow", id: edge.id })}
             zoomOnDoubleClick={false}
-            nodesDraggable={false}
+            nodesDraggable
             nodesConnectable={false}
             edgesFocusable
             edgesReconnectable={false}
@@ -1161,10 +1362,7 @@ function AppShell() {
         selectedArrow={selectedArrow}
         onClose={() => setPropertiesSidebarCollapsed(true)}
         onUpdateModule={(moduleId, updater) =>
-          updateCurrentProject((project) => ({
-            ...project,
-            modules: project.modules.map((module) => (module.id === moduleId ? updater(module) : module)),
-          }))
+          updateModuleInCurrentProject(moduleId, updater)
         }
         onUpdateArrow={(arrowId, updater) =>
           updateCurrentProject((project) => ({
