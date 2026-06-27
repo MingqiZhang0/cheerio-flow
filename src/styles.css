@@ -475,7 +475,7 @@ button {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 5px;
+  gap: 6px;
   padding: 22px 20px 16px;
   color: #203538;
   background: transparent;
@@ -483,64 +483,152 @@ button {
 }
 
 .module-node.shape-rectangle {
+  width: fit-content;
   min-width: 170px;
-  max-width: 420px;
+  max-width: 560px;
+  height: 128px;
+  min-height: 128px;
+  max-height: 128px;
+  overflow: visible;
 }
 
 .module-node.shape-rectangle .module-body {
+  position: relative;
   width: fit-content;
   min-width: 170px;
-  max-width: 420px;
-  min-height: 118px;
-  height: auto;
+  max-width: 560px;
+  min-height: 0;
+  height: 128px;
+  min-height: 128px;
+  max-height: 128px;
+  padding: 24px 28px 18px;
+  overflow: visible;
+  box-sizing: border-box;
 }
 
 .module-node.shape-ellipse {
+  width: fit-content;
   min-width: 170px;
-  max-width: 320px;
+  max-width: 420px;
+  height: 118px;
+  min-height: 118px;
+  max-height: 118px;
+  overflow: visible;
 }
 
 .module-node.shape-ellipse .module-body {
+  position: relative;
   width: fit-content;
   min-width: 170px;
-  max-width: 320px;
-  min-height: 108px;
-  max-height: 180px;
+  max-width: 420px;
+  min-height: 0;
+  height: 118px;
+  min-height: 118px;
+  max-height: 118px;
+  padding: 24px 28px 18px;
+  overflow: visible;
+  box-sizing: border-box;
 }
 
-.module-node.shape-circle,
-.module-node.shape-circle .module-body {
+.module-node.shape-circle {
+  position: relative;
   width: 154px;
   min-width: 154px;
   max-width: 154px;
   height: 154px;
   min-height: 154px;
   max-height: 154px;
+  overflow: visible;
 }
 
-.module-node.shape-diamond,
-.module-node.shape-diamond .module-body {
+.module-node.shape-diamond {
+  position: relative;
   width: 164px;
   min-width: 164px;
   max-width: 164px;
   height: 164px;
   min-height: 164px;
   max-height: 164px;
+  overflow: visible;
 }
 
-.module-node.shape-triangle,
-.module-node.shape-triangle .module-body {
+.module-node.shape-triangle {
+  position: relative;
   width: 164px;
   min-width: 164px;
   max-width: 164px;
   height: 140px;
   min-height: 140px;
   max-height: 140px;
+  overflow: visible;
+}
+
+.module-node.shape-circle .module-body {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 24px 10px;
+  overflow: visible;
+  text-align: center;
+  color: #203538;
+  background: transparent;
+  cursor: pointer;
+}
+
+.module-node.shape-diamond .module-body {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 30px 8px 24px;
+  overflow: visible;
+  text-align: center;
+  color: #203538;
+  background: transparent;
+  cursor: pointer;
+}
+
+.module-node.shape-triangle .module-body {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 30px 10px 16px;
+  overflow: visible;
+  text-align: center;
+  color: #203538;
+  background: transparent;
+  cursor: pointer;
 }
 
 .module-shape-visual {
   position: absolute;
   inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
   overflow: visible;
   filter: drop-shadow(0 8px 14px rgb(48 76 79 / 10%));
   pointer-events: none;
@@ -560,7 +648,7 @@ button {
   position: absolute;
   top: 12px;
   left: 14px;
-  z-index: 2;
+  z-index: 1;
   padding: 2px 6px;
   border-radius: 5px;
   color: #ffffff;
@@ -612,8 +700,9 @@ button {
 
 .module-meta {
   position: relative;
-  z-index: 2;
+  z-index: 1;
   max-width: 100%;
+  margin-bottom: 2px;
   padding: 2px 7px;
   border-radius: 999px;
   color: #2c5b5d;
@@ -625,8 +714,9 @@ button {
 
 .module-content {
   position: relative;
-  z-index: 2;
+  z-index: 1;
   max-width: 100%;
+  min-width: 0;
   overflow: hidden;
   text-align: center;
   font-size: 14px;
@@ -637,35 +727,90 @@ button {
   -webkit-box-orient: vertical;
 }
 
+.module-content .katex,
+.module-content .katex-html {
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: clip;
+}
+
+.module-node.shape-circle .module-content > *,
+.module-node.shape-diamond .module-content > *,
+.module-node.shape-triangle .module-content > * {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .module-node.shape-rectangle .module-content {
   max-width: 360px;
-  -webkit-line-clamp: 6;
+  min-width: 0;
+  -webkit-line-clamp: 2;
 }
 
 .module-node.shape-ellipse .module-content {
   max-width: 250px;
-  -webkit-line-clamp: 4;
+  min-width: 0;
+  -webkit-line-clamp: 1;
 }
 
 .module-node.shape-circle .module-content {
-  max-width: 98px;
-  -webkit-line-clamp: 2;
+  width: 80px;
+  max-width: 80px;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
 }
 
 .module-node.shape-diamond .module-content {
-  max-width: 92px;
-  -webkit-line-clamp: 3;
+  width: 64px;
+  max-width: 64px;
+  min-width: 0;
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
 }
 
 .module-node.shape-triangle .module-content {
-  max-width: 94px;
-  -webkit-line-clamp: 2;
-  font-size: 13px;
+  width: 68px;
+  max-width: 68px;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
 }
 
 .module-node.shape-triangle .module-meta {
   color: #823425;
   background: rgb(255 221 214 / 80%);
+}
+
+.module-node.shape-circle .module-meta,
+.module-node.shape-diamond .module-meta,
+.module-node.shape-triangle .module-meta {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  margin: 0;
+  max-width: 78px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .module-handle {
@@ -1113,3 +1258,4 @@ button {
     width: min(420px, 42vw);
   }
 }
+
