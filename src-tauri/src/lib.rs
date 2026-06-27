@@ -92,6 +92,10 @@ struct AppState {
     current_project_id: Option<String>,
     project_sidebar_collapsed: bool,
     properties_sidebar_collapsed: bool,
+    #[serde(default = "default_left_sidebar_width")]
+    left_sidebar_width: f64,
+    #[serde(default = "default_right_sidebar_width")]
+    right_sidebar_width: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +144,8 @@ impl Default for AppState {
             current_project_id: None,
             project_sidebar_collapsed: false,
             properties_sidebar_collapsed: true,
+            left_sidebar_width: 320.0,
+            right_sidebar_width: 340.0,
         }
     }
 }
@@ -150,6 +156,14 @@ fn default_status() -> String {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_left_sidebar_width() -> f64 {
+    320.0
+}
+
+fn default_right_sidebar_width() -> f64 {
+    340.0
 }
 
 fn now_string() -> String {

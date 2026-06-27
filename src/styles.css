@@ -58,6 +58,7 @@ button {
   width: 320px;
   min-width: 320px;
   height: 100%;
+  position: relative;
   display: flex;
   flex-direction: column;
   border-right: 1px solid #ccd8d4;
@@ -69,6 +70,46 @@ button {
   min-width: 48px;
   align-items: center;
   padding-top: 12px;
+}
+
+.sidebar-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 30;
+  width: 9px;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;
+}
+
+.sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: transparent;
+}
+
+.sidebar-resizer:hover::after {
+  background: #82aaa3;
+}
+
+.sidebar-resizer-left {
+  right: -5px;
+}
+
+.sidebar-resizer-left::after {
+  left: 4px;
+}
+
+.sidebar-resizer-right {
+  left: -5px;
+}
+
+.sidebar-resizer-right::after {
+  right: 4px;
 }
 
 .sidebar-header,
@@ -419,14 +460,17 @@ button {
 
 .module-node {
   position: relative;
-  width: 170px;
-  height: 132px;
+  width: fit-content;
+  height: fit-content;
+  min-width: 150px;
+  min-height: 120px;
 }
 
 .module-body {
   position: relative;
-  width: 170px;
-  height: 132px;
+  width: 100%;
+  min-width: 150px;
+  min-height: 120px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -436,6 +480,62 @@ button {
   color: #203538;
   background: transparent;
   cursor: pointer;
+}
+
+.module-node.shape-rectangle {
+  min-width: 170px;
+  max-width: 420px;
+}
+
+.module-node.shape-rectangle .module-body {
+  width: fit-content;
+  min-width: 170px;
+  max-width: 420px;
+  min-height: 118px;
+  height: auto;
+}
+
+.module-node.shape-ellipse {
+  min-width: 170px;
+  max-width: 320px;
+}
+
+.module-node.shape-ellipse .module-body {
+  width: fit-content;
+  min-width: 170px;
+  max-width: 320px;
+  min-height: 108px;
+  max-height: 180px;
+}
+
+.module-node.shape-circle,
+.module-node.shape-circle .module-body {
+  width: 154px;
+  min-width: 154px;
+  max-width: 154px;
+  height: 154px;
+  min-height: 154px;
+  max-height: 154px;
+}
+
+.module-node.shape-diamond,
+.module-node.shape-diamond .module-body {
+  width: 164px;
+  min-width: 164px;
+  max-width: 164px;
+  height: 164px;
+  min-height: 164px;
+  max-height: 164px;
+}
+
+.module-node.shape-triangle,
+.module-node.shape-triangle .module-body {
+  width: 164px;
+  min-width: 164px;
+  max-width: 164px;
+  height: 140px;
+  min-height: 140px;
+  max-height: 140px;
 }
 
 .module-shape-visual {
@@ -533,6 +633,39 @@ button {
   line-height: 1.35;
   overflow-wrap: anywhere;
   pointer-events: none;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+}
+
+.module-node.shape-rectangle .module-content {
+  max-width: 360px;
+  -webkit-line-clamp: 6;
+}
+
+.module-node.shape-ellipse .module-content {
+  max-width: 250px;
+  -webkit-line-clamp: 4;
+}
+
+.module-node.shape-circle .module-content {
+  max-width: 98px;
+  -webkit-line-clamp: 2;
+}
+
+.module-node.shape-diamond .module-content {
+  max-width: 92px;
+  -webkit-line-clamp: 3;
+}
+
+.module-node.shape-triangle .module-content {
+  max-width: 94px;
+  -webkit-line-clamp: 2;
+  font-size: 13px;
+}
+
+.module-node.shape-triangle .module-meta {
+  color: #823425;
+  background: rgb(255 221 214 / 80%);
 }
 
 .module-handle {
@@ -663,9 +796,14 @@ button {
   pointer-events: auto;
 }
 
+.move-gizmo-axis::before,
 .move-gizmo-axis::after {
   content: "";
   position: absolute;
+  pointer-events: none;
+}
+
+.move-gizmo-axis::after {
   border-radius: 999px;
 }
 
@@ -680,10 +818,18 @@ button {
 
 .move-gizmo-x::after {
   left: 0;
-  right: 0;
+  right: 10px;
   top: 7px;
   height: 4px;
   background: #d95050;
+}
+
+.move-gizmo-x::before {
+  right: 0;
+  top: 3px;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+  border-left: 10px solid #d95050;
 }
 
 .move-gizmo-y {
@@ -696,11 +842,19 @@ button {
 }
 
 .move-gizmo-y::after {
-  top: 0;
+  top: 10px;
   bottom: 0;
   left: 7px;
   width: 4px;
   background: #3d76d9;
+}
+
+.move-gizmo-y::before {
+  top: 0;
+  left: 3px;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 10px solid #3d76d9;
 }
 
 .move-gizmo-center {
@@ -838,6 +992,7 @@ button {
   min-width: 340px;
   height: 100%;
   min-height: 0;
+  position: relative;
   display: flex;
   flex-direction: column;
   border-left: 1px solid #ccd8d4;

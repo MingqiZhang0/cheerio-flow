@@ -8,6 +8,7 @@ import {
   ReactFlowProvider,
   applyEdgeChanges,
   applyNodeChanges,
+  useUpdateNodeInternals,
   type Edge,
   type EdgeChange,
   type Node,
@@ -62,11 +63,14 @@ import {
 } from "./types";
 import {
   applyGroupMembership,
+  applyModuleShapeSemantics,
+  applyModuleTypeSemantics,
   createArrow,
   createEmptyGroup,
   createEmptyProject,
   createModule,
   getNextModuleShortId,
+  normalizeModuleVisualSemantics,
   normalizeGroups,
   normalizeProjects,
   sortPinnedFirst,
@@ -77,6 +81,22 @@ type ArrowEdgeType = Edge<FlowArrowData>;
 type SaveStatus = "saving" | "saved" | "error";
 type CtrlWheelState = { x: number; y: number } | null;
 type MoveMode = "x" | "y" | "free";
+type SidebarResizeSide = "left" | "right";
+
+const LEFT_SIDEBAR_DEFAULT_WIDTH = 320;
+const LEFT_SIDEBAR_MIN_WIDTH = 240;
+const LEFT_SIDEBAR_MAX_WIDTH = 560;
+const RIGHT_SIDEBAR_DEFAULT_WIDTH = 340;
+const RIGHT_SIDEBAR_MIN_WIDTH = 280;
+const RIGHT_SIDEBAR_MAX_WIDTH = 600;
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function clampWithDefault(value: unknown, fallback: number, min: number, max: number) {
+  return clamp(typeof value === "number" && Number.isFinite(value) ? value : fallback, min, max);
+}
 
 const SHAPE_ICONS: Record<ModuleShape, typeof Square> = {
   rectangle: Square,
@@ -206,7 +226,8 @@ function ShapeVisual({ shape }: { shape: ModuleShape }) {
   );
 }
 
-const ModuleNode = memo(function ModuleNode({ data, selected }: NodeProps<ModuleNodeType>) {
+const ModuleNode = memo(function ModuleNode({ id, data, selected }: NodeProps<ModuleNodeType>) {
+  const updateNodeInternals = useUpdateNodeInternals();
   const html = useMemo(() => {
     if (!data.latexEnabled) return "";
     try {
@@ -216,8 +237,13 @@ const ModuleNode = memo(function ModuleNode({ data, selected }: NodeProps<Module
     }
   }, [data.content, data.latexEnabled]);
 
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => updateNodeInternals(id));
+    return () => window.cancelAnimationFrame(frame);
+  }, [data.content, data.latexEnabled, data.moduleType, data.shape, id, updateNodeInternals]);
+
   return (
-    <div className={`module-node ${selected ? "selected" : ""} ${data.enabled ? "" : "disabled"}`}>
+    <div className={`module-node shape-${SHAPE_CLASS[data.shape]} ${selected ? "selected" : ""} ${data.enabled ? "" : "disabled"}`}>
       <Handle type="target" position={Position.Top} id="top" className="module-handle module-handle-top" />
       <div className={`module-body shape-${SHAPE_CLASS[data.shape]}`}>
         <ShapeVisual shape={data.shape} />
@@ -335,6 +361,10 @@ function AppShell() {
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
   const [projectSidebarCollapsed, setProjectSidebarCollapsed] = useState(false);
   const [propertiesSidebarCollapsed, setPropertiesSidebarCollapsed] = useState(true);
+  const [leftSidebarWidth, setLeftSidebarWidth] = useState(LEFT_SIDEBAR_DEFAULT_WIDTH);
+  const [rightSidebarWidth, setRightSidebarWidth] = useState(RIGHT_SIDEBAR_DEFAULT_WIDTH);
+  const [savedLeftSidebarWidth, setSavedLeftSidebarWidth] = useState(LEFT_SIDEBAR_DEFAULT_WIDTH);
+  const [savedRightSidebarWidth, setSavedRightSidebarWidth] = useState(RIGHT_SIDEBAR_DEFAULT_WIDTH);
   const [selectedElement, setSelectedElement] = useState<SelectedElement>(null);
   const [collapsedGroupIds, setCollapsedGroupIds] = useState<Set<string>>(new Set());
   const [shapeMenuOpen, setShapeMenuOpen] = useState(false);
@@ -359,6 +389,14 @@ function AppShell() {
   const hydratedProjectIdRef = useRef<string | null>(null);
   const capturedPointerRef = useRef<{ element: HTMLElement; pointerId: number } | null>(null);
   const resetInteractionStateRef = useRef<(options?: { clearPlacement?: boolean; clearSelection?: boolean }) => void>(() => undefined);
+  const sidebarResizeRef = useRef<{
+    side: SidebarResizeSide;
+    startX: number;
+    startWidth: number;
+    latestWidth: number;
+    pointerId: number;
+    element: HTMLElement;
+  } | null>(null);
   const gizmoDragRef = useRef<{
     nodeId: string;
     mode: MoveMode;
@@ -374,6 +412,8 @@ function AppShell() {
     currentProjectId: null,
     projectSidebarCollapsed: false,
     propertiesSidebarCollapsed: true,
+    leftSidebarWidth: LEFT_SIDEBAR_DEFAULT_WIDTH,
+    rightSidebarWidth: RIGHT_SIDEBAR_DEFAULT_WIDTH,
   });
   const lastPointerRef = useRef({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
 
@@ -387,8 +427,10 @@ function AppShell() {
       currentProjectId: currentProject?.id ?? null,
       projectSidebarCollapsed,
       propertiesSidebarCollapsed,
+      leftSidebarWidth: savedLeftSidebarWidth,
+      rightSidebarWidth: savedRightSidebarWidth,
     }),
-    [currentProject?.id, projectSidebarCollapsed, propertiesSidebarCollapsed],
+    [currentProject?.id, projectSidebarCollapsed, propertiesSidebarCollapsed, savedLeftSidebarWidth, savedRightSidebarWidth],
   );
 
   const setFlowNodes = useCallback((nextOrUpdater: ModuleNodeType[] | ((previous: ModuleNodeType[]) => ModuleNodeType[])) => {
@@ -462,6 +504,12 @@ function AppShell() {
         setCurrentProjectId(data.appState.currentProjectId ?? firstProject.id);
         setProjectSidebarCollapsed(data.appState.projectSidebarCollapsed);
         setPropertiesSidebarCollapsed(data.appState.propertiesSidebarCollapsed);
+        const nextLeftWidth = clampWithDefault(data.appState.leftSidebarWidth, LEFT_SIDEBAR_DEFAULT_WIDTH, LEFT_SIDEBAR_MIN_WIDTH, LEFT_SIDEBAR_MAX_WIDTH);
+        const nextRightWidth = clampWithDefault(data.appState.rightSidebarWidth, RIGHT_SIDEBAR_DEFAULT_WIDTH, RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH);
+        setLeftSidebarWidth(nextLeftWidth);
+        setRightSidebarWidth(nextRightWidth);
+        setSavedLeftSidebarWidth(nextLeftWidth);
+        setSavedRightSidebarWidth(nextRightWidth);
         setLoaded(true);
         loadedRef.current = true;
       })
@@ -510,6 +558,7 @@ function AppShell() {
       lastPointerRef.current = { x: event.clientX, y: event.clientY };
     };
     const onKeyDown = (event: KeyboardEvent) => {
+      if (sidebarResizeRef.current) return;
       if (gizmoDragRef.current && !capturedPointerRef.current) {
         resetInteractionStateRef.current();
       }
@@ -583,6 +632,11 @@ function AppShell() {
       if (captured?.element.hasPointerCapture?.(captured.pointerId)) {
         captured.element.releasePointerCapture(captured.pointerId);
       }
+      const sidebarResize = sidebarResizeRef.current;
+      if (sidebarResize?.element.hasPointerCapture?.(sidebarResize.pointerId)) {
+        sidebarResize.element.releasePointerCapture(sidebarResize.pointerId);
+      }
+      sidebarResizeRef.current = null;
       capturedPointerRef.current = null;
       gizmoDragRef.current = null;
       isVisualDraggingRef.current = false;
@@ -652,6 +706,70 @@ function AppShell() {
     updateProjects(applyPositions);
     return nextProjects;
   }, [currentProjectId, mergeLatestFlowPositions, updateProjects]);
+
+  const startSidebarResize = useCallback((event: React.PointerEvent, side: SidebarResizeSide) => {
+    event.preventDefault();
+    event.stopPropagation();
+    resetInteractionState();
+
+    const pointerTarget = event.currentTarget as HTMLElement;
+    const startWidth = side === "left" ? leftSidebarWidth : rightSidebarWidth;
+    sidebarResizeRef.current = {
+      side,
+      startX: event.clientX,
+      startWidth,
+      latestWidth: startWidth,
+      pointerId: event.pointerId,
+      element: pointerTarget,
+    };
+    pointerTarget.setPointerCapture?.(event.pointerId);
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const active = sidebarResizeRef.current;
+      if (!active) return;
+      const delta = moveEvent.clientX - active.startX;
+      if (active.side === "left") {
+        const nextWidth = clamp(active.startWidth + delta, LEFT_SIDEBAR_MIN_WIDTH, LEFT_SIDEBAR_MAX_WIDTH);
+        active.latestWidth = nextWidth;
+        setLeftSidebarWidth(nextWidth);
+      } else {
+        const nextWidth = clamp(active.startWidth - delta, RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH);
+        active.latestWidth = nextWidth;
+        setRightSidebarWidth(nextWidth);
+      }
+    };
+
+    const finishResize = () => {
+      const active = sidebarResizeRef.current;
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", finishResize);
+      window.removeEventListener("pointercancel", finishResize);
+      window.removeEventListener("blur", finishResize);
+      document.removeEventListener("mouseup", finishResize);
+      document.removeEventListener("pointerup", finishResize);
+      if (active?.element.hasPointerCapture?.(active.pointerId)) {
+        active.element.releasePointerCapture(active.pointerId);
+      }
+      if (active?.side === "left") {
+        setSavedLeftSidebarWidth(active.latestWidth);
+      }
+      if (active?.side === "right") {
+        setSavedRightSidebarWidth(active.latestWidth);
+      }
+      sidebarResizeRef.current = null;
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", finishResize);
+    window.addEventListener("pointercancel", finishResize);
+    window.addEventListener("blur", finishResize);
+    document.addEventListener("mouseup", finishResize);
+    document.addEventListener("pointerup", finishResize);
+  }, [leftSidebarWidth, resetInteractionState, rightSidebarWidth]);
 
   const projectEdges = useMemo(
     () => currentProject?.arrows.map((arrow) => arrowToEdge(arrow, selectedElement?.kind === "arrow" && selectedElement.id === arrow.id)) ?? [],
@@ -773,6 +891,12 @@ function AppShell() {
       updateProjects(() => hydratedProjects);
       setGroups(normalizedGroups);
       setCurrentProjectId(data.appState.currentProjectId ?? hydratedProjects[0]?.id ?? null);
+      const nextLeftWidth = clampWithDefault(data.appState.leftSidebarWidth, LEFT_SIDEBAR_DEFAULT_WIDTH, LEFT_SIDEBAR_MIN_WIDTH, LEFT_SIDEBAR_MAX_WIDTH);
+      const nextRightWidth = clampWithDefault(data.appState.rightSidebarWidth, RIGHT_SIDEBAR_DEFAULT_WIDTH, RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH);
+      setLeftSidebarWidth(nextLeftWidth);
+      setRightSidebarWidth(nextRightWidth);
+      setSavedLeftSidebarWidth(nextLeftWidth);
+      setSavedRightSidebarWidth(nextRightWidth);
       setDataDir(data.dataDir);
       setStorageRootInput(data.storageRoot ?? "");
       setStorageReport(data.report ?? null);
@@ -1024,7 +1148,14 @@ function AppShell() {
       const project = projectsRef.current.find((item) => item.id === currentProjectId);
       const currentModule = project?.modules.find((module) => module.id === moduleId);
       if (!project || !currentModule) return;
-      const nextModule = updater(currentModule);
+      const rawModule = updater(currentModule);
+      const nextData =
+        rawModule.data.moduleType !== currentModule.data.moduleType && rawModule.data.shape === currentModule.data.shape
+          ? applyModuleTypeSemantics(rawModule.data, rawModule.data.moduleType)
+          : rawModule.data.shape !== currentModule.data.shape && rawModule.data.moduleType === currentModule.data.moduleType
+            ? applyModuleShapeSemantics(rawModule.data, rawModule.data.shape)
+            : normalizeModuleVisualSemantics(rawModule.data);
+      const nextModule = { ...rawModule, data: nextData };
       updateProjects((previous) =>
         previous.map((item) =>
           item.id === project.id
@@ -1059,7 +1190,10 @@ function AppShell() {
 
   return (
     <main className="app-shell">
-      <aside className={`project-sidebar ${projectSidebarCollapsed ? "collapsed" : ""}`}>
+      <aside
+        className={`project-sidebar ${projectSidebarCollapsed ? "collapsed" : ""}`}
+        style={projectSidebarCollapsed ? undefined : { width: leftSidebarWidth, minWidth: leftSidebarWidth }}
+      >
         {projectSidebarCollapsed ? (
           <SidebarButton title="Show projects" onClick={() => setProjectSidebarCollapsed(false)}>
             <ChevronsRight size={18} />
@@ -1219,6 +1353,13 @@ function AppShell() {
                 </div>
               </section>
             )}
+            <div
+              className="sidebar-resizer sidebar-resizer-left"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize project sidebar"
+              onPointerDown={(event) => startSidebarResize(event, "left")}
+            />
           </>
         )}
       </aside>
@@ -1360,6 +1501,8 @@ function AppShell() {
         currentProject={currentProject}
         selectedModule={selectedModule}
         selectedArrow={selectedArrow}
+        width={rightSidebarWidth}
+        onResizeStart={(event) => startSidebarResize(event, "right")}
         onClose={() => setPropertiesSidebarCollapsed(true)}
         onUpdateModule={(moduleId, updater) =>
           updateModuleInCurrentProject(moduleId, updater)
@@ -1414,8 +1557,10 @@ function MoveGizmo({
   viewport: { x: number; y: number; zoom: number };
   onPointerDown: (event: React.PointerEvent, mode: MoveMode) => void;
 }) {
-  const left = viewport.x + (node.position.x + 85) * viewport.zoom;
-  const top = viewport.y + (node.position.y + 66) * viewport.zoom;
+  const width = node.measured?.width ?? node.width ?? 170;
+  const height = node.measured?.height ?? node.height ?? 132;
+  const left = viewport.x + (node.position.x + width / 2) * viewport.zoom;
+  const top = viewport.y + (node.position.y + height / 2) * viewport.zoom;
 
   return (
     <div className="move-gizmo" style={{ left, top }}>
@@ -1522,6 +1667,8 @@ function PropertiesPanel({
   currentProject,
   selectedModule,
   selectedArrow,
+  width,
+  onResizeStart,
   onClose,
   onUpdateModule,
   onUpdateArrow,
@@ -1530,6 +1677,8 @@ function PropertiesPanel({
   currentProject: Project | null;
   selectedModule: FlowModule | null;
   selectedArrow: FlowArrow | null;
+  width: number;
+  onResizeStart: (event: React.PointerEvent) => void;
   onClose: () => void;
   onUpdateModule: (moduleId: string, updater: (module: FlowModule) => FlowModule) => void;
   onUpdateArrow: (arrowId: string, updater: (arrow: FlowArrow) => FlowArrow) => void;
@@ -1557,7 +1706,14 @@ function PropertiesPanel({
   }
 
   return (
-    <aside className="properties-sidebar">
+    <aside className="properties-sidebar" style={{ width, minWidth: width }}>
+      <div
+        className="sidebar-resizer sidebar-resizer-right"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize properties sidebar"
+        onPointerDown={onResizeStart}
+      />
       <div className="properties-header">
         <div>
           <div className="editor-title">Properties</div>
@@ -1589,7 +1745,7 @@ function PropertiesPanel({
               onChange={(event) =>
                 onUpdateModule(selectedModule.id, (module) => ({
                   ...module,
-                  data: { ...module.data, moduleType: event.target.value as FlowModuleData["moduleType"] },
+                  data: applyModuleTypeSemantics(module.data, event.target.value as FlowModuleData["moduleType"]),
                 }))
               }
             >
@@ -1608,7 +1764,7 @@ function PropertiesPanel({
               onChange={(event) =>
                 onUpdateModule(selectedModule.id, (module) => ({
                   ...module,
-                  data: { ...module.data, shape: event.target.value as FlowModuleData["shape"] },
+                  data: applyModuleShapeSemantics(module.data, event.target.value as FlowModuleData["shape"]),
                 }))
               }
             >

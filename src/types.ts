@@ -68,6 +68,8 @@ export interface AppState {
   currentProjectId: string | null;
   projectSidebarCollapsed: boolean;
   propertiesSidebarCollapsed: boolean;
+  leftSidebarWidth: number;
+  rightSidebarWidth: number;
 }
 
 export interface StorageReport {

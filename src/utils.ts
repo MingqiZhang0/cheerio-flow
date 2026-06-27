@@ -16,6 +16,8 @@ export const DEFAULT_APP_STATE: AppState = {
   currentProjectId: null,
   projectSidebarCollapsed: false,
   propertiesSidebarCollapsed: true,
+  leftSidebarWidth: 320,
+  rightSidebarWidth: 340,
 };
 
 export function createId(prefix: string) {
@@ -67,7 +69,7 @@ export function createModule(shape: ModuleShape, x: number, y: number, shortId: 
   return {
     id: createId("module"),
     position: { x, y },
-    data: {
+    data: normalizeModuleVisualSemantics({
       shortId,
       moduleType: "formula",
       shape,
@@ -76,7 +78,7 @@ export function createModule(shape: ModuleShape, x: number, y: number, shortId: 
       note: "",
       status: "enabled",
       enabled: true,
-    },
+    }),
   };
 }
 
@@ -131,6 +133,38 @@ function normalizeByAlias<T extends string>(value: unknown, values: readonly T[]
   return fallback;
 }
 
+export function normalizeModuleVisualSemantics(data: FlowModule["data"]): FlowModule["data"] {
+  if (data.moduleType === "error") {
+    return { ...data, shape: "triangle" };
+  }
+  if (data.shape === "triangle") {
+    return { ...data, moduleType: "error" };
+  }
+  return data;
+}
+
+export function applyModuleTypeSemantics(data: FlowModule["data"], moduleType: ModuleType): FlowModule["data"] {
+  if (moduleType === "error") {
+    return { ...data, moduleType, shape: "triangle" };
+  }
+  return {
+    ...data,
+    moduleType,
+    shape: data.shape === "triangle" ? "rectangle" : data.shape,
+  };
+}
+
+export function applyModuleShapeSemantics(data: FlowModule["data"], shape: ModuleShape): FlowModule["data"] {
+  if (shape === "triangle") {
+    return { ...data, shape, moduleType: "error" };
+  }
+  return {
+    ...data,
+    shape,
+    moduleType: data.moduleType === "error" ? "formula" : data.moduleType,
+  };
+}
+
 const categoryAliases: Record<string, ProjectCategory> = {
   "\u79d1\u7814": "research",
   "\u7b14\u8bb0": "note",
@@ -180,7 +214,7 @@ export function normalizeProject(project: Project): Project {
         x: Number.isFinite(module.position?.x) ? module.position.x : 0,
         y: Number.isFinite(module.position?.y) ? module.position.y : 0,
       },
-      data: {
+      data: normalizeModuleVisualSemantics({
         ...module.data,
         shortId: fallbackShortId,
         moduleType: normalizeByAlias(module.data?.moduleType, MODULE_TYPES, moduleTypeAliases, "formula"),
@@ -190,7 +224,7 @@ export function normalizeProject(project: Project): Project {
         note: typeof module.data?.note === "string" ? module.data.note : "",
         status,
         enabled: status === "enabled",
-      },
+      }),
     };
   });
 
