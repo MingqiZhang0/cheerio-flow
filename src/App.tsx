@@ -43,6 +43,7 @@ import {
   X,
 } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { scanLightweightIntegrity, type LightweightIntegrityReport } from "./integrity";
 import { chooseStorageRoot, loadDatabase, persistDatabase, removeProject, switchStorageRoot } from "./storage";
 import {
   ARROW_TYPES,
@@ -426,6 +427,8 @@ function AppShell() {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dataDir, setDataDir] = useState("");
+  const [integrityReport, setIntegrityReport] = useState<LightweightIntegrityReport | null>(null);
+  const [integrityBannerDismissed, setIntegrityBannerDismissed] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [groups, setGroups] = useState<ProjectGroup[]>([]);
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
@@ -488,6 +491,7 @@ function AppShell() {
   } | null>(null);
   const loadedRef = useRef(false);
   const canPersistRef = useRef(false);
+  const skipNextAutosaveRef = useRef(false);
   const projectsRef = useRef<Project[]>([]);
   const groupsRef = useRef<ProjectGroup[]>([]);
   const appStateRef = useRef<AppState>({
@@ -572,7 +576,16 @@ function AppShell() {
   const hydrateLoadedData = useCallback(
     (data: PersistedData) => {
       const normalizedProjects = normalizeProjects(data.projects);
-      const normalizedGroups = normalizeGroups(data.groups, normalizedProjects);
+      const loadedGroups = data.groups ?? [];
+      const nextIntegrityReport = scanLightweightIntegrity(normalizedProjects, loadedGroups, data.appState);
+      setIntegrityReport(nextIntegrityReport);
+      setIntegrityBannerDismissed(false);
+      if (nextIntegrityReport.ok) {
+        console.info("Lightweight integrity scan passed.");
+      } else {
+        console.warn("Lightweight integrity scan found issues.", nextIntegrityReport.issues);
+      }
+      const normalizedGroups = normalizeGroups(loadedGroups, normalizedProjects);
       const hydratedProjects = applyGroupMembership(normalizedProjects, normalizedGroups);
       const firstProject = hydratedProjects[0] ?? createEmptyProject();
       const nextProjects = hydratedProjects.length > 0 ? hydratedProjects : [firstProject];
@@ -592,6 +605,7 @@ function AppShell() {
       setRightSidebarWidth(nextRightWidth);
       setSavedLeftSidebarWidth(nextLeftWidth);
       setSavedRightSidebarWidth(nextRightWidth);
+      skipNextAutosaveRef.current = true;
       canPersistRef.current = true;
       loadedRef.current = true;
       setLoaded(true);
@@ -609,10 +623,12 @@ function AppShell() {
       .catch((reason: unknown) => {
         console.error("Failed to load Cheerio Flow data", reason);
         setError(reason instanceof Error ? reason.message : String(reason));
+        setIntegrityReport(null);
         if (saveTimerRef.current) {
           window.clearTimeout(saveTimerRef.current);
           saveTimerRef.current = null;
         }
+        skipNextAutosaveRef.current = false;
         canPersistRef.current = false;
         loadedRef.current = false;
         setSaveStatus("error");
@@ -625,6 +641,10 @@ function AppShell() {
 
   useEffect(() => {
     if (!loaded || !canPersistRef.current) return;
+    if (skipNextAutosaveRef.current) {
+      skipNextAutosaveRef.current = false;
+      return;
+    }
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = window.setTimeout(() => {
       void saveAllNow();
@@ -1443,6 +1463,7 @@ function AppShell() {
     () => sortPinnedFirst(projects.filter((project) => !project.groupId || !groups.some((group) => group.id === project.groupId))),
     [groups, projects],
   );
+  const showIntegrityBanner = Boolean(integrityReport && !integrityReport.ok && !integrityBannerDismissed);
 
   if (!loaded) {
     return (
@@ -1697,6 +1718,14 @@ function AppShell() {
         </header>
 
         <div className="canvas-wrap">
+          {showIntegrityBanner && integrityReport && (
+            <div className="integrity-banner integrity-banner-warning">
+              <span>Data integrity warnings found: {integrityReport.issueCount} issue(s). The scan is read-only and did not write changes to disk.</span>
+              <button className="integrity-banner-dismiss" type="button" onClick={() => setIntegrityBannerDismissed(true)} aria-label="Dismiss integrity warning">
+                <X size={15} />
+              </button>
+            </div>
+          )}
           {pendingShape && ghostPoint && (
             <div className={`ghost-module shape-${SHAPE_CLASS[pendingShape]}`} style={{ left: ghostPoint.x, top: ghostPoint.y }}>
               {pendingShape}

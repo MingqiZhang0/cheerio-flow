@@ -1,5 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
@@ -93,8 +92,8 @@ struct ProjectGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppState {
-    #[serde(default = "default_data_version", deserialize_with = "deserialize_data_version")]
-    data_version: u32,
+    #[serde(default = "default_data_version")]
+    data_version: serde_json::Value,
     current_project_id: Option<String>,
     project_sidebar_collapsed: bool,
     properties_sidebar_collapsed: bool,
@@ -165,20 +164,8 @@ fn default_enabled() -> bool {
     true
 }
 
-fn default_data_version() -> u32 {
-    1
-}
-
-fn deserialize_data_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_u64()
-        .and_then(|number| u32::try_from(number).ok())
-        .filter(|number| *number > 0)
-        .unwrap_or_else(default_data_version))
+fn default_data_version() -> serde_json::Value {
+    serde_json::Value::from(1)
 }
 
 fn default_left_sidebar_width() -> f64 {
@@ -336,7 +323,7 @@ fn load_database_from(app: &tauri::AppHandle, storage_root: PathBuf) -> Result<P
     }
 
     let groups_path = data_root.join(GROUPS_FILE);
-    let mut groups = if groups_path.exists() {
+    let groups = if groups_path.exists() {
         read_json::<Vec<ProjectGroup>>(&groups_path)?
     } else {
         vec![]
@@ -362,23 +349,6 @@ fn load_database_from(app: &tauri::AppHandle, storage_root: PathBuf) -> Result<P
         write_json(&projects_dir.join(format!("{}.json", project.id)), &project)?;
         projects.push(project);
     }
-
-    let known_project_ids: HashSet<String> = projects.iter().map(|project| project.id.clone()).collect();
-    groups.iter_mut().for_each(|group| {
-        group.project_ids.retain(|project_id| known_project_ids.contains(project_id));
-    });
-
-    if app_state
-        .current_project_id
-        .as_ref()
-        .is_none_or(|id| !projects.iter().any(|project| &project.id == id))
-    {
-        app_state.current_project_id = projects.first().map(|project| project.id.clone());
-    }
-
-    ensure_data_dirs(&data_root)?;
-    write_json(&groups_path, &groups)?;
-    write_json(&app_state_path, &app_state)?;
 
     projects.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     let report = build_report(&storage_root, &data_root, &bootstrap, &projects);

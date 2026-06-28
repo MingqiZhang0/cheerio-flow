@@ -445,6 +445,49 @@ button {
   min-height: 0;
 }
 
+.integrity-banner {
+  position: absolute;
+  top: 12px;
+  left: 16px;
+  right: 16px;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid #dec27c;
+  border-radius: 6px;
+  color: #5f4413;
+  background: #fff6dc;
+  box-shadow: 0 8px 22px rgb(70 61 33 / 14%);
+  font-size: 13px;
+  font-weight: 750;
+  pointer-events: none;
+}
+
+.integrity-banner-warning {
+  border-color: #dec27c;
+}
+
+.integrity-banner-dismiss {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(95 68 19 / 24%);
+  border-radius: 6px;
+  color: #5f4413;
+  background: transparent;
+  pointer-events: auto;
+}
+
+.integrity-banner-dismiss:hover {
+  background: rgb(95 68 19 / 9%);
+}
+
 .react-flow {
   background: #eef3f1;
 }

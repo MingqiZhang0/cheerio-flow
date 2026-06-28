@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { AppState, PersistedData, Project, ProjectGroup, StorageReport } from "./types";
-import { DEFAULT_APP_STATE, createEmptyProject, normalizeGroups, normalizeProjects } from "./utils";
+import { DEFAULT_APP_STATE, createEmptyProject, normalizeProjects } from "./utils";
 
 const LOCAL_STORAGE_KEY = "cheerio-flow-browser-fallback";
 
@@ -34,7 +34,7 @@ function normalizeAppStateDataVersion(dataVersion: unknown) {
 
 function normalizePersistedData(data: PersistedData): PersistedData {
   const projects = normalizeProjects(data.projects);
-  const groups = normalizeGroups(data.groups ?? [], projects);
+  const groups = Array.isArray(data.groups) ? data.groups : [];
   const appState = {
     ...DEFAULT_APP_STATE,
     ...data.appState,
@@ -44,10 +44,7 @@ function normalizePersistedData(data: PersistedData): PersistedData {
     storageRoot: data.storageRoot ?? data.dataDir,
     projects,
     groups,
-    appState: {
-      ...appState,
-      dataVersion: normalizeAppStateDataVersion(appState.dataVersion),
-    },
+    appState,
   };
   return {
     ...normalized,
