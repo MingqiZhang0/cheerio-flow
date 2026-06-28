@@ -5,6 +5,7 @@ use tauri::Manager;
 use time::{format_description, OffsetDateTime};
 
 const DATA_DIR_NAME: &str = "CheerioFlowData";
+const BACKUPS_DIR_NAME: &str = "CheerioFlowBackups";
 const GROUPS_FILE: &str = "groups.json";
 const APP_STATE_FILE: &str = "app-state.json";
 const BOOTSTRAP_FILE: &str = "cheerio-flow-bootstrap.json";
@@ -119,6 +120,35 @@ struct StorageReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BackupReport {
+    backup_id: String,
+    created_at: String,
+    source_data_dir: String,
+    backup_dir: String,
+    manifest_path: String,
+    project_file_count: usize,
+    copied_file_count: usize,
+    total_bytes: u64,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupManifest {
+    manifest_version: u32,
+    backup_id: String,
+    created_at: String,
+    data_version: Option<serde_json::Value>,
+    source_data_dir: String,
+    backup_dir: String,
+    project_file_count: usize,
+    copied_file_count: usize,
+    total_bytes: u64,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PersistedData {
     data_dir: String,
     storage_root: String,
@@ -177,8 +207,9 @@ fn default_right_sidebar_width() -> f64 {
 }
 
 fn now_string() -> String {
-    let format = format_description::parse_borrowed::<3>("[year]-[month]-[day] [hour]:[minute]:[second]")
-        .expect("valid time format");
+    let format =
+        format_description::parse_borrowed::<3>("[year]-[month]-[day] [hour]:[minute]:[second]")
+            .expect("valid time format");
     OffsetDateTime::now_local()
         .unwrap_or_else(|_| OffsetDateTime::now_utc())
         .format(&format)
@@ -191,7 +222,8 @@ where
 {
     let text = fs::read_to_string(path)
         .map_err(|err| format!("Failed to read file {}: {err}", path.display()))?;
-    serde_json::from_str(&text).map_err(|err| format!("Failed to parse JSON {}: {err}", path.display()))
+    serde_json::from_str(&text)
+        .map_err(|err| format!("Failed to parse JSON {}: {err}", path.display()))
 }
 
 fn write_json<T>(path: &Path, value: &T) -> Result<(), String>
@@ -209,7 +241,10 @@ where
 
 fn default_project() -> Project {
     Project {
-        id: format!("project-{}", OffsetDateTime::now_utc().unix_timestamp_nanos()),
+        id: format!(
+            "project-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ),
         title: "Empty Project".to_string(),
         category: "research".to_string(),
         created_at: now_string(),
@@ -225,8 +260,12 @@ fn bootstrap_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .path()
         .app_config_dir()
         .map_err(|err| format!("Failed to get app config directory: {err}"))?;
-    fs::create_dir_all(&config_dir)
-        .map_err(|err| format!("Failed to create app config directory {}: {err}", config_dir.display()))?;
+    fs::create_dir_all(&config_dir).map_err(|err| {
+        format!(
+            "Failed to create app config directory {}: {err}",
+            config_dir.display()
+        )
+    })?;
     Ok(config_dir.join(BOOTSTRAP_FILE))
 }
 
@@ -263,10 +302,18 @@ fn data_root_for(storage_root: &Path) -> PathBuf {
     storage_root.join(DATA_DIR_NAME)
 }
 
+fn backups_root_for(storage_root: &Path) -> PathBuf {
+    storage_root.join(BACKUPS_DIR_NAME)
+}
+
 fn ensure_data_dirs(data_root: &Path) -> Result<PathBuf, String> {
     let projects_dir = data_root.join("projects");
-    fs::create_dir_all(&projects_dir)
-        .map_err(|err| format!("Failed to create projects directory {}: {err}", projects_dir.display()))?;
+    fs::create_dir_all(&projects_dir).map_err(|err| {
+        format!(
+            "Failed to create projects directory {}: {err}",
+            projects_dir.display()
+        )
+    })?;
     Ok(projects_dir)
 }
 
@@ -281,7 +328,9 @@ fn storage_has_any_data(data_root: &Path) -> bool {
         .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"));
 
     data_root.exists()
-        && (has_project_json || data_root.join(GROUPS_FILE).exists() || data_root.join(APP_STATE_FILE).exists())
+        && (has_project_json
+            || data_root.join(GROUPS_FILE).exists()
+            || data_root.join(APP_STATE_FILE).exists())
 }
 
 fn build_report(
@@ -303,7 +352,10 @@ fn build_report(
     }
 }
 
-fn load_database_from(app: &tauri::AppHandle, storage_root: PathBuf) -> Result<PersistedData, String> {
+fn load_database_from(
+    app: &tauri::AppHandle,
+    storage_root: PathBuf,
+) -> Result<PersistedData, String> {
     let bootstrap = bootstrap_path(app)?;
     let data_root = data_root_for(&storage_root);
     let projects_dir = data_root.join("projects");
@@ -311,10 +363,14 @@ fn load_database_from(app: &tauri::AppHandle, storage_root: PathBuf) -> Result<P
 
     let mut projects = Vec::new();
     if projects_dir.exists() {
-        for entry in fs::read_dir(&projects_dir)
-            .map_err(|err| format!("Failed to scan projects directory {}: {err}", projects_dir.display()))?
-        {
-            let entry = entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
+        for entry in fs::read_dir(&projects_dir).map_err(|err| {
+            format!(
+                "Failed to scan projects directory {}: {err}",
+                projects_dir.display()
+            )
+        })? {
+            let entry =
+                entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
                 projects.push(read_json::<Project>(&path)?);
@@ -391,6 +447,247 @@ fn save_database_to(
     Ok(report)
 }
 
+fn backup_timestamp() -> String {
+    let format =
+        format_description::parse_borrowed::<3>("[year][month][day]-[hour][minute][second]")
+            .expect("valid backup id time format");
+    OffsetDateTime::now_local()
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .format(&format)
+        .unwrap_or_else(|_| "19700101-000000".to_string())
+}
+
+fn allocate_backup_dir(backups_root: &Path) -> Result<(String, PathBuf), String> {
+    fs::create_dir_all(backups_root).map_err(|err| {
+        format!(
+            "Failed to create backups directory {}: {err}",
+            backups_root.display()
+        )
+    })?;
+
+    let timestamp = backup_timestamp();
+    for index in 0..1000 {
+        let backup_id = if index == 0 {
+            format!("backup-{timestamp}")
+        } else {
+            format!("backup-{timestamp}-{index:03}")
+        };
+        let backup_dir = backups_root.join(&backup_id);
+        match fs::create_dir(&backup_dir) {
+            Ok(()) => return Ok((backup_id, backup_dir)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "Failed to create backup directory {}: {err}",
+                    backup_dir.display()
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "Failed to allocate a unique backup directory under {}",
+        backups_root.display()
+    ))
+}
+
+fn should_skip_backup_entry(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|item| item.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        BACKUPS_DIR_NAME | ".DS_Store" | "Thumbs.db" | "desktop.ini"
+    ) || name.ends_with(".lock")
+        || name.ends_with(".tmp")
+}
+
+fn copy_backup_tree(
+    source: &Path,
+    destination: &Path,
+    copied_file_count: &mut usize,
+    total_bytes: &mut u64,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|err| {
+        format!(
+            "Failed to create backup directory {}: {err}",
+            destination.display()
+        )
+    })?;
+
+    for entry in fs::read_dir(source).map_err(|err| {
+        format!(
+            "Failed to scan source data directory {}: {err}",
+            source.display()
+        )
+    })? {
+        let entry =
+            entry.map_err(|err| format!("Failed to read source data directory entry: {err}"))?;
+        let source_path = entry.path();
+        if should_skip_backup_entry(&source_path) {
+            continue;
+        }
+
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path).map_err(|err| {
+            format!(
+                "Failed to inspect source path {}: {err}",
+                source_path.display()
+            )
+        })?;
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            warnings.push(format!("Skipped symlink {}", source_path.display()));
+        } else if file_type.is_dir() {
+            copy_backup_tree(
+                &source_path,
+                &destination_path,
+                copied_file_count,
+                total_bytes,
+                warnings,
+            )?;
+        } else if file_type.is_file() {
+            let bytes = fs::copy(&source_path, &destination_path).map_err(|err| {
+                format!(
+                    "Failed to copy {} to {}: {err}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+            *copied_file_count += 1;
+            *total_bytes += bytes;
+        } else {
+            warnings.push(format!(
+                "Skipped unsupported file type {}",
+                source_path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn count_project_json_files(
+    projects_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<usize, String> {
+    if !projects_dir.exists() {
+        return Ok(0);
+    }
+    if !projects_dir.is_dir() {
+        warnings.push(format!(
+            "Projects path is not a directory: {}",
+            projects_dir.display()
+        ));
+        return Ok(0);
+    }
+
+    let mut count = 0;
+    for entry in fs::read_dir(projects_dir).map_err(|err| {
+        format!(
+            "Failed to scan projects directory {}: {err}",
+            projects_dir.display()
+        )
+    })? {
+        let entry =
+            entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| format!("Failed to inspect project path {}: {err}", path.display()))?;
+        if metadata.file_type().is_file()
+            && path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn read_app_data_version(
+    data_root: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<serde_json::Value> {
+    let app_state_path = data_root.join(APP_STATE_FILE);
+    if !app_state_path.exists() {
+        return None;
+    }
+
+    match read_json::<serde_json::Value>(&app_state_path) {
+        Ok(value) => value.get("dataVersion").cloned(),
+        Err(err) => {
+            warnings.push(format!(
+                "Could not read data version from app-state.json: {err}"
+            ));
+            None
+        }
+    }
+}
+
+#[tauri::command]
+fn create_full_backup(app: tauri::AppHandle) -> Result<BackupReport, String> {
+    let storage_root = active_storage_root(&app)?;
+    let data_root = data_root_for(&storage_root);
+    if !data_root.exists() {
+        return Err(format!(
+            "Source data directory does not exist: {}",
+            data_root.display()
+        ));
+    }
+    if !data_root.is_dir() {
+        return Err(format!(
+            "Source data path is not a directory: {}",
+            data_root.display()
+        ));
+    }
+
+    let backups_root = backups_root_for(&storage_root);
+    let (backup_id, backup_dir) = allocate_backup_dir(&backups_root)?;
+    let backup_data_dir = backup_dir.join(DATA_DIR_NAME);
+    let manifest_path = backup_dir.join("backup-manifest.json");
+    let mut warnings = Vec::new();
+    let project_file_count = count_project_json_files(&data_root.join("projects"), &mut warnings)?;
+    let data_version = read_app_data_version(&data_root, &mut warnings);
+    let mut copied_file_count = 0;
+    let mut total_bytes = 0;
+
+    copy_backup_tree(
+        &data_root,
+        &backup_data_dir,
+        &mut copied_file_count,
+        &mut total_bytes,
+        &mut warnings,
+    )?;
+
+    let created_at = now_string();
+    let report = BackupReport {
+        backup_id: backup_id.clone(),
+        created_at: created_at.clone(),
+        source_data_dir: data_root.to_string_lossy().to_string(),
+        backup_dir: backup_dir.to_string_lossy().to_string(),
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+        project_file_count,
+        copied_file_count,
+        total_bytes,
+        warnings: warnings.clone(),
+    };
+    let manifest = BackupManifest {
+        manifest_version: 1,
+        backup_id,
+        created_at,
+        data_version,
+        source_data_dir: report.source_data_dir.clone(),
+        backup_dir: report.backup_dir.clone(),
+        project_file_count,
+        copied_file_count,
+        total_bytes,
+        warnings,
+    };
+    write_json(&manifest_path, &manifest)?;
+    Ok(report)
+}
+
 #[tauri::command]
 fn load_database(app: tauri::AppHandle) -> Result<PersistedData, String> {
     let storage_root = active_storage_root(&app)?;
@@ -415,8 +712,12 @@ fn set_storage_root(
         PathBuf::from(storage_root.trim())
     };
 
-    fs::create_dir_all(&next_root)
-        .map_err(|err| format!("Failed to create storage root {}: {err}", next_root.display()))?;
+    fs::create_dir_all(&next_root).map_err(|err| {
+        format!(
+            "Failed to create storage root {}: {err}",
+            next_root.display()
+        )
+    })?;
     save_database_to(&app, next_root.clone(), payload)?;
     let loaded = load_database_from(&app, next_root.clone())?;
     write_bootstrap(&app, &next_root)?;
@@ -424,15 +725,22 @@ fn set_storage_root(
 }
 
 #[tauri::command]
-fn switch_storage_root(app: tauri::AppHandle, storage_root: String) -> Result<PersistedData, String> {
+fn switch_storage_root(
+    app: tauri::AppHandle,
+    storage_root: String,
+) -> Result<PersistedData, String> {
     let next_root = if storage_root.trim().is_empty() {
         default_storage_root(&app)?
     } else {
         PathBuf::from(storage_root.trim())
     };
 
-    fs::create_dir_all(&next_root)
-        .map_err(|err| format!("Failed to create storage root {}: {err}", next_root.display()))?;
+    fs::create_dir_all(&next_root).map_err(|err| {
+        format!(
+            "Failed to create storage root {}: {err}",
+            next_root.display()
+        )
+    })?;
     let loaded = load_database_from(&app, next_root.clone())?;
     write_bootstrap(&app, &next_root)?;
     Ok(loaded)
@@ -442,7 +750,9 @@ fn switch_storage_root(app: tauri::AppHandle, storage_root: String) -> Result<Pe
 fn delete_project(app: tauri::AppHandle, project_id: String) -> Result<StorageReport, String> {
     let storage_root = active_storage_root(&app)?;
     let data_root = data_root_for(&storage_root);
-    let path = data_root.join("projects").join(format!("{}.json", project_id));
+    let path = data_root
+        .join("projects")
+        .join(format!("{}.json", project_id));
     if path.exists() {
         fs::remove_file(&path)
             .map_err(|err| format!("Failed to delete project file {}: {err}", path.display()))?;
@@ -459,7 +769,8 @@ pub fn run() {
             save_database,
             set_storage_root,
             switch_storage_root,
-            delete_project
+            delete_project,
+            create_full_backup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

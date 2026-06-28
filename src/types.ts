@@ -87,6 +87,18 @@ export interface StorageReport {
   arrowCount: number;
 }
 
+export interface BackupReport {
+  backupId: string;
+  createdAt: string;
+  sourceDataDir: string;
+  backupDir: string;
+  manifestPath: string;
+  projectFileCount: number;
+  copiedFileCount: number;
+  totalBytes: number;
+  warnings: string[];
+}
+
 export interface PersistedData {
   dataDir: string;
   storageRoot: string;

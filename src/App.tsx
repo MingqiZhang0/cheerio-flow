@@ -18,6 +18,7 @@ import {
 } from "@xyflow/react";
 import katex from "katex";
 import {
+  Archive,
   Box,
   ChevronsLeft,
   ChevronsRight,
@@ -44,7 +45,7 @@ import {
 } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { scanLightweightIntegrity, type LightweightIntegrityReport } from "./integrity";
-import { chooseStorageRoot, loadDatabase, persistDatabase, removeProject, switchStorageRoot } from "./storage";
+import { chooseStorageRoot, createFullBackup, loadDatabase, persistDatabase, removeProject, switchStorageRoot } from "./storage";
 import {
   ARROW_TYPES,
   MODULE_SHAPES,
@@ -52,6 +53,7 @@ import {
   PROJECT_CATEGORIES,
   type AppState,
   type ArrowType,
+  type BackupReport,
   type FlowArrow,
   type FlowArrowData,
   type FlowModule,
@@ -81,6 +83,7 @@ import {
 type ModuleNodeType = Node<FlowModuleData, "module">;
 type ArrowEdgeType = Edge<FlowArrowData>;
 type SaveStatus = "saving" | "saved" | "error";
+type BackupStatus = "idle" | "running" | "success" | "error";
 type CtrlWheelState = { x: number; y: number } | null;
 type MoveMode = "x" | "y" | "free";
 type ResizeEdge = "right" | "bottom" | "corner";
@@ -111,6 +114,19 @@ function clampModuleHeight(value: number) {
 
 function clampWithDefault(value: unknown, fallback: number, min: number, max: number) {
   return clamp(typeof value === "number" && Number.isFinite(value) ? value : fallback, min, max);
+}
+
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
 }
 
 function isResizableShape(shape: ModuleShape) {
@@ -450,6 +466,9 @@ function AppShell() {
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [storageReport, setStorageReport] = useState<StorageReport | null>(null);
   const [storageRootInput, setStorageRootInput] = useState("");
+  const [backupStatus, setBackupStatus] = useState<BackupStatus>("idle");
+  const [backupReport, setBackupReport] = useState<BackupReport | null>(null);
+  const [backupError, setBackupError] = useState<string | null>(null);
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [consoleInput, setConsoleInput] = useState("");
   const [consoleMessage, setConsoleMessage] = useState("");
@@ -1193,6 +1212,27 @@ function AppShell() {
     }
   }, [hydrateLoadedData, storageRootInput]);
 
+  const handleCreateFullBackup = useCallback(async () => {
+    if (!canPersistRef.current) {
+      setBackupStatus("error");
+      setBackupReport(null);
+      setBackupError("Cannot create backup because local data did not load successfully.");
+      return;
+    }
+
+    setBackupStatus("running");
+    setBackupError(null);
+    try {
+      const report = await createFullBackup();
+      setBackupReport(report);
+      setBackupStatus("success");
+    } catch (reason: unknown) {
+      setBackupReport(null);
+      setBackupStatus("error");
+      setBackupError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, []);
+
   const createModuleAt = useCallback(
     (shape: ModuleShape, clientX: number, clientY: number) => {
       if (!currentProjectId || !flowInstance) {
@@ -1478,7 +1518,7 @@ function AppShell() {
     <main className="app-shell">
       <aside
         className={`project-sidebar ${projectSidebarCollapsed ? "collapsed" : ""}`}
-        style={projectSidebarCollapsed ? undefined : { width: leftSidebarWidth, minWidth: leftSidebarWidth }}
+        style={projectSidebarCollapsed ? undefined : { width: leftSidebarWidth }}
       >
         {projectSidebarCollapsed ? (
           <SidebarButton title="Show projects" onClick={() => setProjectSidebarCollapsed(false)}>
@@ -1636,8 +1676,26 @@ function AppShell() {
                 </button>
                 <div className="readonly-row">
                   <span>Data directory</span>
-                  <strong>{dataDir || "unavailable"}</strong>
+                  <strong className="path-text">{dataDir || "unavailable"}</strong>
                 </div>
+                <button className="action-button" type="button" onClick={() => void handleCreateFullBackup()} disabled={backupStatus === "running"}>
+                  <Archive size={15} />
+                  {backupStatus === "running" ? "Creating Backup..." : "Create Full Backup"}
+                </button>
+                {backupStatus === "success" && backupReport && (
+                  <div className="backup-result backup-result-success">
+                    <strong className="backup-path">Backup created: {backupReport.backupDir}</strong>
+                    <span>
+                      Copied {backupReport.copiedFileCount} files, including {backupReport.projectFileCount} project files.
+                    </span>
+                    <span>Total size: {formatBytes(backupReport.totalBytes)}</span>
+                  </div>
+                )}
+                {backupStatus === "error" && backupError && (
+                  <div className="backup-result backup-result-error">
+                    <strong>Backup failed: {backupError}</strong>
+                  </div>
+                )}
               </section>
             )}
             {!currentProject && !canPersistRef.current && (
@@ -1654,8 +1712,17 @@ function AppShell() {
                 </button>
                 <div className="readonly-row">
                   <span>Data directory</span>
-                  <strong>{dataDir || "unavailable"}</strong>
+                  <strong className="path-text">{dataDir || "unavailable"}</strong>
                 </div>
+                <button className="action-button" type="button" onClick={() => void handleCreateFullBackup()} disabled={backupStatus === "running"}>
+                  <Archive size={15} />
+                  {backupStatus === "running" ? "Creating Backup..." : "Create Full Backup"}
+                </button>
+                {backupStatus === "error" && backupError && (
+                  <div className="backup-result backup-result-error">
+                    <strong>Backup failed: {backupError}</strong>
+                  </div>
+                )}
               </section>
             )}
             <div

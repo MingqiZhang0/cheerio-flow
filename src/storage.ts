@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppState, PersistedData, Project, ProjectGroup, StorageReport } from "./types";
+import type { AppState, BackupReport, PersistedData, Project, ProjectGroup, StorageReport } from "./types";
 import { DEFAULT_APP_STATE, createEmptyProject, normalizeProjects } from "./utils";
 
 const LOCAL_STORAGE_KEY = "cheerio-flow-browser-fallback";
@@ -129,6 +129,18 @@ export async function persistDatabase(projects: Project[], groups: ProjectGroup[
       groups,
       appState,
     });
+  }
+}
+
+export async function createFullBackup(): Promise<BackupReport> {
+  try {
+    return await invoke<BackupReport>("create_full_backup");
+  } catch (reason: unknown) {
+    if (!isProbablyNotTauriError(reason)) {
+      console.error("Failed to create full backup", reason);
+      throw reason;
+    }
+    throw new Error("Full backups require the desktop app.");
   }
 }
 
