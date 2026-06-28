@@ -36,6 +36,8 @@ import {
   PanelRightOpen,
   Pin,
   PinOff,
+  RefreshCw,
+  RotateCcw,
   Save,
   Shapes,
   Square,
@@ -45,7 +47,7 @@ import {
 } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { scanLightweightIntegrity, type LightweightIntegrityReport } from "./integrity";
-import { chooseStorageRoot, createFullBackup, loadDatabase, persistDatabase, removeProject, switchStorageRoot } from "./storage";
+import { chooseStorageRoot, createFullBackup, listFullBackups, loadDatabase, persistDatabase, removeProject, restoreFullBackup, switchStorageRoot } from "./storage";
 import {
   ARROW_TYPES,
   MODULE_SHAPES,
@@ -54,6 +56,7 @@ import {
   type AppState,
   type ArrowType,
   type BackupReport,
+  type BackupSummary,
   type FlowArrow,
   type FlowArrowData,
   type FlowModule,
@@ -61,6 +64,7 @@ import {
   type ModuleShape,
   type Project,
   type ProjectGroup,
+  type RestoreReport,
   type SelectedElement,
   type PersistedData,
   type StorageReport,
@@ -84,6 +88,7 @@ type ModuleNodeType = Node<FlowModuleData, "module">;
 type ArrowEdgeType = Edge<FlowArrowData>;
 type SaveStatus = "saving" | "saved" | "error";
 type BackupStatus = "idle" | "running" | "success" | "error";
+type RestoreStatus = "idle" | "loading" | "running" | "success" | "error";
 type CtrlWheelState = { x: number; y: number } | null;
 type MoveMode = "x" | "y" | "free";
 type ResizeEdge = "right" | "bottom" | "corner";
@@ -469,6 +474,12 @@ function AppShell() {
   const [backupStatus, setBackupStatus] = useState<BackupStatus>("idle");
   const [backupReport, setBackupReport] = useState<BackupReport | null>(null);
   const [backupError, setBackupError] = useState<string | null>(null);
+  const [restoreStatus, setRestoreStatus] = useState<RestoreStatus>("idle");
+  const [restoreBackups, setRestoreBackups] = useState<BackupSummary[]>([]);
+  const [selectedBackupId, setSelectedBackupId] = useState("");
+  const [restoreConfirmation, setRestoreConfirmation] = useState("");
+  const [restoreReport, setRestoreReport] = useState<RestoreReport | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [consoleInput, setConsoleInput] = useState("");
   const [consoleMessage, setConsoleMessage] = useState("");
@@ -526,6 +537,10 @@ function AppShell() {
   const currentProject = useMemo(
     () => projects.find((project) => project.id === currentProjectId) ?? projects[0] ?? null,
     [currentProjectId, projects],
+  );
+  const selectedBackup = useMemo(
+    () => restoreBackups.find((backup) => backup.backupId === selectedBackupId) ?? null,
+    [restoreBackups, selectedBackupId],
   );
 
   const appState = useMemo<AppState>(
@@ -1233,6 +1248,68 @@ function AppShell() {
     }
   }, []);
 
+  const handleRefreshFullBackups = useCallback(async () => {
+    setRestoreStatus("loading");
+    setRestoreError(null);
+    try {
+      const backups = await listFullBackups();
+      setRestoreBackups(backups);
+      setSelectedBackupId((current) => (current && backups.some((backup) => backup.backupId === current) ? current : backups[0]?.backupId ?? ""));
+      setRestoreStatus("idle");
+    } catch (reason: unknown) {
+      setRestoreStatus("error");
+      setRestoreError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, []);
+
+  const handleRestoreFullBackup = useCallback(async () => {
+    if (!selectedBackupId) {
+      setRestoreStatus("error");
+      setRestoreError("Choose a backup before restoring.");
+      return;
+    }
+    if (restoreConfirmation !== "RESTORE") {
+      setRestoreStatus("error");
+      setRestoreError("Type RESTORE to confirm this recovery operation.");
+      return;
+    }
+
+    if (saveTimerRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    canPersistRef.current = false;
+    loadedRef.current = false;
+    setRestoreStatus("running");
+    setRestoreError(null);
+    setRestoreReport(null);
+    try {
+      const report = await restoreFullBackup(selectedBackupId);
+      setRestoreReport(report);
+      const data = await loadDatabase();
+      hydrateLoadedData(data);
+      setRestoreConfirmation("");
+      setSaveStatus("saved");
+      setError(null);
+      setRestoreStatus("success");
+    } catch (reason: unknown) {
+      setRestoreStatus("error");
+      const restoreMessage = reason instanceof Error ? reason.message : String(reason);
+      setRestoreError(restoreMessage);
+      setSaveStatus("error");
+      try {
+        const data = await loadDatabase();
+        hydrateLoadedData(data);
+        setError(restoreMessage);
+      } catch (loadReason: unknown) {
+        canPersistRef.current = false;
+        loadedRef.current = false;
+        const loadMessage = loadReason instanceof Error ? loadReason.message : String(loadReason);
+        setError(`${restoreMessage} Reload also failed: ${loadMessage}`);
+      }
+    }
+  }, [hydrateLoadedData, restoreConfirmation, selectedBackupId]);
+
   const createModuleAt = useCallback(
     (shape: ModuleShape, clientX: number, clientY: number) => {
       if (!currentProjectId || !flowInstance) {
@@ -1504,6 +1581,105 @@ function AppShell() {
     [groups, projects],
   );
   const showIntegrityBanner = Boolean(integrityReport && !integrityReport.ok && !integrityBannerDismissed);
+  const backupRestorePanel = (
+    <>
+      <button className="action-button" type="button" onClick={() => void handleCreateFullBackup()} disabled={backupStatus === "running" || !canPersistRef.current}>
+        <Archive size={15} />
+        {backupStatus === "running" ? "Creating Backup..." : "Create Full Backup"}
+      </button>
+      {backupStatus === "success" && backupReport && (
+        <div className="backup-result backup-result-success">
+          <strong className="backup-path">Backup created: {backupReport.backupDir}</strong>
+          <span>
+            Copied {backupReport.copiedFileCount} files, including {backupReport.projectFileCount} project files.
+          </span>
+          <span>Total size: {formatBytes(backupReport.totalBytes)}</span>
+        </div>
+      )}
+      {backupStatus === "error" && backupError && (
+        <div className="backup-result backup-result-error">
+          <strong>Backup failed: {backupError}</strong>
+        </div>
+      )}
+
+      <div className="restore-panel">
+        <div className="restore-title-row">
+          <strong>Restore from Backup</strong>
+          <button className="tiny-button" type="button" onClick={() => void handleRefreshFullBackups()} disabled={restoreStatus === "loading" || restoreStatus === "running"}>
+            <RefreshCw size={14} />
+          </button>
+        </div>
+        {!canPersistRef.current && (
+          <div className="empty-hint">Current local data is unavailable. Restore can still attempt recovery from a saved backup.</div>
+        )}
+        <label>
+          Backup
+          <select
+            value={selectedBackupId}
+            onChange={(event) => {
+              setSelectedBackupId(event.target.value);
+              setRestoreConfirmation("");
+            }}
+            disabled={restoreStatus === "running" || restoreBackups.length === 0}
+          >
+            {restoreBackups.length === 0 ? (
+              <option value="">No backups loaded</option>
+            ) : (
+              restoreBackups.map((backup) => (
+                <option key={backup.backupId} value={backup.backupId}>
+                  {backup.backupId}
+                </option>
+              ))
+            )}
+          </select>
+        </label>
+        {selectedBackup && (
+          <div className="backup-result">
+            <strong className="backup-path">{selectedBackup.backupId}</strong>
+            <span>Created: {selectedBackup.createdAt || "unknown"}</span>
+            <span>
+              {selectedBackup.projectFileCount} project files, {formatBytes(selectedBackup.totalBytes)}
+            </span>
+            {selectedBackup.warnings.length > 0 && <span>Warnings: {selectedBackup.warnings.join(" | ")}</span>}
+          </div>
+        )}
+        <div className="backup-result backup-result-warning">
+          <strong>Restore will replace the current saved local data. A pre-restore backup will be created first.</strong>
+        </div>
+        <label>
+          Type RESTORE to confirm
+          <input value={restoreConfirmation} onChange={(event) => setRestoreConfirmation(event.target.value)} disabled={restoreStatus === "running"} />
+        </label>
+        <button
+          className="action-button restore-button"
+          type="button"
+          onClick={() => void handleRestoreFullBackup()}
+          disabled={restoreStatus === "running" || !selectedBackupId || restoreConfirmation !== "RESTORE"}
+        >
+          <RotateCcw size={15} />
+          {restoreStatus === "running" ? "Restoring..." : "Restore Selected Backup"}
+        </button>
+        {restoreStatus === "loading" && (
+          <div className="backup-result">
+            <span>Loading backups...</span>
+          </div>
+        )}
+        {restoreStatus === "success" && restoreReport && (
+          <div className="backup-result backup-result-success">
+            <strong>Restored: {restoreReport.restoredBackupId}</strong>
+            <span className="backup-path">Pre-restore backup: {restoreReport.preRestoreBackupDir}</span>
+            <span className="backup-path">Restored data: {restoreReport.restoredDataDir}</span>
+            {restoreReport.warnings.length > 0 && <span>Warnings: {restoreReport.warnings.join(" | ")}</span>}
+          </div>
+        )}
+        {restoreStatus === "error" && restoreError && (
+          <div className="backup-result backup-result-error">
+            <strong>Restore failed: {restoreError}</strong>
+          </div>
+        )}
+      </div>
+    </>
+  );
 
   if (!loaded) {
     return (
@@ -1678,24 +1854,7 @@ function AppShell() {
                   <span>Data directory</span>
                   <strong className="path-text">{dataDir || "unavailable"}</strong>
                 </div>
-                <button className="action-button" type="button" onClick={() => void handleCreateFullBackup()} disabled={backupStatus === "running"}>
-                  <Archive size={15} />
-                  {backupStatus === "running" ? "Creating Backup..." : "Create Full Backup"}
-                </button>
-                {backupStatus === "success" && backupReport && (
-                  <div className="backup-result backup-result-success">
-                    <strong className="backup-path">Backup created: {backupReport.backupDir}</strong>
-                    <span>
-                      Copied {backupReport.copiedFileCount} files, including {backupReport.projectFileCount} project files.
-                    </span>
-                    <span>Total size: {formatBytes(backupReport.totalBytes)}</span>
-                  </div>
-                )}
-                {backupStatus === "error" && backupError && (
-                  <div className="backup-result backup-result-error">
-                    <strong>Backup failed: {backupError}</strong>
-                  </div>
-                )}
+                {backupRestorePanel}
               </section>
             )}
             {!currentProject && !canPersistRef.current && (
@@ -1714,15 +1873,7 @@ function AppShell() {
                   <span>Data directory</span>
                   <strong className="path-text">{dataDir || "unavailable"}</strong>
                 </div>
-                <button className="action-button" type="button" onClick={() => void handleCreateFullBackup()} disabled={backupStatus === "running"}>
-                  <Archive size={15} />
-                  {backupStatus === "running" ? "Creating Backup..." : "Create Full Backup"}
-                </button>
-                {backupStatus === "error" && backupError && (
-                  <div className="backup-result backup-result-error">
-                    <strong>Backup failed: {backupError}</strong>
-                  </div>
-                )}
+                {backupRestorePanel}
               </section>
             )}
             <div

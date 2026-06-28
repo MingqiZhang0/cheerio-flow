@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppState, BackupReport, PersistedData, Project, ProjectGroup, StorageReport } from "./types";
+import type { AppState, BackupReport, BackupSummary, PersistedData, Project, ProjectGroup, RestoreReport, StorageReport } from "./types";
 import { DEFAULT_APP_STATE, createEmptyProject, normalizeProjects } from "./utils";
 
 const LOCAL_STORAGE_KEY = "cheerio-flow-browser-fallback";
@@ -141,6 +141,30 @@ export async function createFullBackup(): Promise<BackupReport> {
       throw reason;
     }
     throw new Error("Full backups require the desktop app.");
+  }
+}
+
+export async function listFullBackups(): Promise<BackupSummary[]> {
+  try {
+    return await invoke<BackupSummary[]>("list_full_backups");
+  } catch (reason: unknown) {
+    if (!isProbablyNotTauriError(reason)) {
+      console.error("Failed to list full backups", reason);
+      throw reason;
+    }
+    throw new Error("Full backup restore requires the desktop app.");
+  }
+}
+
+export async function restoreFullBackup(backupId: string): Promise<RestoreReport> {
+  try {
+    return await invoke<RestoreReport>("restore_full_backup", { backupId });
+  } catch (reason: unknown) {
+    if (!isProbablyNotTauriError(reason)) {
+      console.error("Failed to restore full backup", reason);
+      throw reason;
+    }
+    throw new Error("Full backup restore requires the desktop app.");
   }
 }
 

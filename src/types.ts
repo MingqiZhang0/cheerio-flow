@@ -99,6 +99,31 @@ export interface BackupReport {
   warnings: string[];
 }
 
+export interface BackupSummary {
+  backupId: string;
+  createdAt: string;
+  backupDir: string;
+  manifestPath: string;
+  projectFileCount: number;
+  copiedFileCount: number;
+  totalBytes: number;
+  dataVersion?: unknown;
+  warnings: string[];
+}
+
+export interface RestoreReport {
+  restoredBackupId: string;
+  restoredAt: string;
+  sourceBackupDir: string;
+  restoredDataDir: string;
+  preRestoreBackupDir: string;
+  manifestPath: string;
+  projectFileCount: number;
+  copiedFileCount: number;
+  totalBytes: number;
+  warnings: string[];
+}
+
 export interface PersistedData {
   dataDir: string;
   storageRoot: string;

@@ -149,6 +149,35 @@ struct BackupManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BackupSummary {
+    backup_id: String,
+    created_at: String,
+    backup_dir: String,
+    manifest_path: String,
+    project_file_count: usize,
+    copied_file_count: usize,
+    total_bytes: u64,
+    data_version: Option<serde_json::Value>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreReport {
+    restored_backup_id: String,
+    restored_at: String,
+    source_backup_dir: String,
+    restored_data_dir: String,
+    pre_restore_backup_dir: String,
+    manifest_path: String,
+    project_file_count: usize,
+    copied_file_count: usize,
+    total_bytes: u64,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PersistedData {
     data_dir: String,
     storage_root: String,
@@ -458,6 +487,13 @@ fn backup_timestamp() -> String {
 }
 
 fn allocate_backup_dir(backups_root: &Path) -> Result<(String, PathBuf), String> {
+    allocate_backup_dir_with_suffix(backups_root, None)
+}
+
+fn allocate_backup_dir_with_suffix(
+    backups_root: &Path,
+    suffix: Option<&str>,
+) -> Result<(String, PathBuf), String> {
     fs::create_dir_all(backups_root).map_err(|err| {
         format!(
             "Failed to create backups directory {}: {err}",
@@ -467,10 +503,14 @@ fn allocate_backup_dir(backups_root: &Path) -> Result<(String, PathBuf), String>
 
     let timestamp = backup_timestamp();
     for index in 0..1000 {
+        let base = match suffix {
+            Some(suffix) if !suffix.is_empty() => format!("backup-{timestamp}-{suffix}"),
+            _ => format!("backup-{timestamp}"),
+        };
         let backup_id = if index == 0 {
-            format!("backup-{timestamp}")
+            base
         } else {
-            format!("backup-{timestamp}-{index:03}")
+            format!("{base}-{index:03}")
         };
         let backup_dir = backups_root.join(&backup_id);
         match fs::create_dir(&backup_dir) {
@@ -576,7 +616,13 @@ fn count_project_json_files(
     if !projects_dir.exists() {
         return Ok(0);
     }
-    if !projects_dir.is_dir() {
+    let projects_metadata = fs::symlink_metadata(projects_dir).map_err(|err| {
+        format!(
+            "Failed to inspect projects directory {}: {err}",
+            projects_dir.display()
+        )
+    })?;
+    if projects_metadata.file_type().is_symlink() || !projects_metadata.file_type().is_dir() {
         warnings.push(format!(
             "Projects path is not a directory: {}",
             projects_dir.display()
@@ -623,6 +669,269 @@ fn read_app_data_version(
             None
         }
     }
+}
+
+fn validate_backup_id(backup_id: &str) -> Result<(), String> {
+    let trimmed = backup_id.trim();
+    if trimmed.is_empty() {
+        return Err("Backup id cannot be empty".to_string());
+    }
+    if trimmed != backup_id {
+        return Err("Backup id cannot contain leading or trailing whitespace".to_string());
+    }
+    if !trimmed.starts_with("backup-") {
+        return Err("Backup id must start with backup-".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("Backup id cannot contain path separators".to_string());
+    }
+    if trimmed.contains("..") {
+        return Err("Backup id cannot contain ..".to_string());
+    }
+    if Path::new(trimmed).is_absolute() {
+        return Err("Backup id cannot be an absolute path".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("Failed to inspect {label} {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} cannot be a symlink: {}", path.display()));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!("{label} is not a file: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn ensure_directory(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("Failed to inspect {label} {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} cannot be a symlink: {}", path.display()));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(format!("{label} is not a directory: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn validate_data_dir(data_root: &Path) -> Result<usize, String> {
+    if !data_root.exists() {
+        return Err(format!(
+            "Data directory does not exist: {}",
+            data_root.display()
+        ));
+    }
+    ensure_directory(data_root, "data directory")?;
+
+    let groups_path = data_root.join(GROUPS_FILE);
+    ensure_regular_file(&groups_path, GROUPS_FILE)?;
+    read_json::<Vec<ProjectGroup>>(&groups_path)?;
+
+    let app_state_path = data_root.join(APP_STATE_FILE);
+    ensure_regular_file(&app_state_path, APP_STATE_FILE)?;
+    read_json::<AppState>(&app_state_path)?;
+
+    let projects_dir = data_root.join("projects");
+    if !projects_dir.exists() {
+        return Err(format!(
+            "Projects directory does not exist: {}",
+            projects_dir.display()
+        ));
+    }
+    ensure_directory(&projects_dir, "projects directory")?;
+
+    let mut project_file_count = 0;
+    for entry in fs::read_dir(&projects_dir).map_err(|err| {
+        format!(
+            "Failed to scan projects directory {}: {err}",
+            projects_dir.display()
+        )
+    })? {
+        let entry =
+            entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        ensure_regular_file(&path, "project JSON")?;
+        read_json::<Project>(&path)?;
+        project_file_count += 1;
+    }
+
+    if project_file_count == 0 {
+        return Err(format!(
+            "Projects directory contains no project JSON files: {}",
+            projects_dir.display()
+        ));
+    }
+
+    Ok(project_file_count)
+}
+
+fn validate_backup_for_restore(
+    backups_root: &Path,
+    backup_id: &str,
+) -> Result<(PathBuf, PathBuf, PathBuf, BackupManifest, usize), String> {
+    validate_backup_id(backup_id)?;
+    let backup_dir = backups_root.join(backup_id);
+    if !backup_dir.exists() {
+        return Err(format!(
+            "Backup directory does not exist: {}",
+            backup_dir.display()
+        ));
+    }
+    ensure_directory(&backup_dir, "backup directory")?;
+
+    let backup_data_dir = backup_dir.join(DATA_DIR_NAME);
+    if !backup_data_dir.exists() {
+        return Err(format!(
+            "Backup data directory does not exist: {}",
+            backup_data_dir.display()
+        ));
+    }
+    ensure_directory(&backup_data_dir, "backup data directory")?;
+
+    let manifest_path = backup_dir.join("backup-manifest.json");
+    ensure_regular_file(&manifest_path, "backup manifest")?;
+    let manifest = read_json::<BackupManifest>(&manifest_path)?;
+    if manifest.backup_id != backup_id {
+        return Err(format!(
+            "Backup manifest id {} does not match requested backup id {}",
+            manifest.backup_id, backup_id
+        ));
+    }
+    let project_file_count = validate_data_dir(&backup_data_dir)?;
+    Ok((
+        backup_dir,
+        backup_data_dir,
+        manifest_path,
+        manifest,
+        project_file_count,
+    ))
+}
+
+fn create_pre_restore_backup(
+    storage_root: &Path,
+    data_root: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<PathBuf, String> {
+    let backups_root = backups_root_for(storage_root);
+    let (backup_id, backup_dir) =
+        allocate_backup_dir_with_suffix(&backups_root, Some("pre-restore"))?;
+    let backup_data_dir = backup_dir.join(DATA_DIR_NAME);
+    let manifest_path = backup_dir.join("backup-manifest.json");
+    let mut backup_warnings = Vec::new();
+    let mut copied_file_count = 0;
+    let mut total_bytes = 0;
+    let mut project_file_count = 0;
+    let mut data_version = None;
+
+    if data_root.exists() {
+        ensure_directory(data_root, "current data directory")?;
+        project_file_count =
+            count_project_json_files(&data_root.join("projects"), &mut backup_warnings)?;
+        data_version = read_app_data_version(data_root, &mut backup_warnings);
+        copy_backup_tree(
+            data_root,
+            &backup_data_dir,
+            &mut copied_file_count,
+            &mut total_bytes,
+            &mut backup_warnings,
+        )?;
+    } else {
+        fs::create_dir_all(&backup_data_dir).map_err(|err| {
+            format!(
+                "Failed to create empty pre-restore data directory {}: {err}",
+                backup_data_dir.display()
+            )
+        })?;
+        backup_warnings.push(format!(
+            "Current data directory did not exist before restore: {}",
+            data_root.display()
+        ));
+    }
+
+    let created_at = now_string();
+    let manifest = BackupManifest {
+        manifest_version: 1,
+        backup_id,
+        created_at,
+        data_version,
+        source_data_dir: data_root.to_string_lossy().to_string(),
+        backup_dir: backup_dir.to_string_lossy().to_string(),
+        project_file_count,
+        copied_file_count,
+        total_bytes,
+        warnings: backup_warnings.clone(),
+    };
+    write_json(&manifest_path, &manifest)?;
+    warnings.extend(backup_warnings);
+    Ok(backup_dir)
+}
+
+fn allocate_restore_staging_dir(storage_root: &Path) -> Result<PathBuf, String> {
+    let timestamp = backup_timestamp();
+    for index in 0..1000 {
+        let staging_name = if index == 0 {
+            format!(".restore-staging-{timestamp}")
+        } else {
+            format!(".restore-staging-{timestamp}-{index:03}")
+        };
+        let staging_dir = storage_root.join(staging_name);
+        match fs::create_dir(&staging_dir) {
+            Ok(()) => return Ok(staging_dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "Failed to create restore staging directory {}: {err}",
+                    staging_dir.display()
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "Failed to allocate a unique restore staging directory under {}",
+        storage_root.display()
+    ))
+}
+
+fn rename_current_data_to_before_restore(data_root: &Path) -> Result<PathBuf, String> {
+    let parent = data_root.parent().ok_or_else(|| {
+        format!(
+            "Cannot determine parent directory for current data directory {}",
+            data_root.display()
+        )
+    })?;
+    let timestamp = backup_timestamp();
+    for index in 0..1000 {
+        let name = if index == 0 {
+            format!("{DATA_DIR_NAME}.before-restore-{timestamp}")
+        } else {
+            format!("{DATA_DIR_NAME}.before-restore-{timestamp}-{index:03}")
+        };
+        let candidate = parent.join(name);
+        match fs::rename(data_root, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "Failed to move current data directory {} to {}: {err}",
+                    data_root.display(),
+                    candidate.display()
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "Failed to allocate a before-restore directory under {}",
+        parent.display()
+    ))
 }
 
 #[tauri::command]
@@ -686,6 +995,184 @@ fn create_full_backup(app: tauri::AppHandle) -> Result<BackupReport, String> {
     };
     write_json(&manifest_path, &manifest)?;
     Ok(report)
+}
+
+#[tauri::command]
+fn list_full_backups(app: tauri::AppHandle) -> Result<Vec<BackupSummary>, String> {
+    let storage_root = active_storage_root(&app)?;
+    let backups_root = backups_root_for(&storage_root);
+    if !backups_root.exists() {
+        return Ok(vec![]);
+    }
+    ensure_directory(&backups_root, "backups directory")?;
+
+    let mut summaries = Vec::new();
+    for entry in fs::read_dir(&backups_root).map_err(|err| {
+        format!(
+            "Failed to scan backups directory {}: {err}",
+            backups_root.display()
+        )
+    })? {
+        let entry =
+            entry.map_err(|err| format!("Failed to read backups directory entry: {err}"))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| format!("Failed to inspect backup path {}: {err}", path.display()))?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Some(backup_id) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !backup_id.starts_with("backup-") {
+            continue;
+        }
+
+        let manifest_path = path.join("backup-manifest.json");
+        let backup_data_dir = path.join(DATA_DIR_NAME);
+        let mut warnings = Vec::new();
+        if !backup_data_dir.exists() {
+            warnings.push(format!(
+                "Missing backup data directory: {}",
+                backup_data_dir.display()
+            ));
+        } else if let Err(err) = ensure_directory(&backup_data_dir, "backup data directory") {
+            warnings.push(err);
+        }
+
+        let manifest = if manifest_path.exists() {
+            match ensure_regular_file(&manifest_path, "backup manifest")
+                .and_then(|_| read_json::<BackupManifest>(&manifest_path))
+            {
+                Ok(manifest) => Some(manifest),
+                Err(err) => {
+                    warnings.push(err);
+                    None
+                }
+            }
+        } else {
+            warnings.push(format!(
+                "Missing backup manifest: {}",
+                manifest_path.display()
+            ));
+            None
+        };
+
+        let counted_project_files =
+            count_project_json_files(&backup_data_dir.join("projects"), &mut warnings)
+                .unwrap_or_else(|err| {
+                    warnings.push(err);
+                    0
+                });
+
+        let summary = BackupSummary {
+            backup_id: backup_id.to_string(),
+            created_at: manifest
+                .as_ref()
+                .map(|item| item.created_at.clone())
+                .unwrap_or_default(),
+            backup_dir: path.to_string_lossy().to_string(),
+            manifest_path: manifest_path.to_string_lossy().to_string(),
+            project_file_count: manifest
+                .as_ref()
+                .map(|item| item.project_file_count)
+                .unwrap_or(counted_project_files),
+            copied_file_count: manifest
+                .as_ref()
+                .map(|item| item.copied_file_count)
+                .unwrap_or(0),
+            total_bytes: manifest.as_ref().map(|item| item.total_bytes).unwrap_or(0),
+            data_version: manifest.as_ref().and_then(|item| item.data_version.clone()),
+            warnings: {
+                if let Some(manifest) = &manifest {
+                    warnings.extend(manifest.warnings.clone());
+                }
+                warnings
+            },
+        };
+        summaries.push(summary);
+    }
+
+    summaries.sort_by(|a, b| b.backup_id.cmp(&a.backup_id));
+    Ok(summaries)
+}
+
+#[tauri::command]
+fn restore_full_backup(app: tauri::AppHandle, backup_id: String) -> Result<RestoreReport, String> {
+    let storage_root = active_storage_root(&app)?;
+    let data_root = data_root_for(&storage_root);
+    let backups_root = backups_root_for(&storage_root);
+    let (backup_dir, backup_data_dir, manifest_path, manifest, validated_project_file_count) =
+        validate_backup_for_restore(&backups_root, &backup_id)?;
+    let mut warnings = manifest.warnings.clone();
+
+    let pre_restore_backup_dir =
+        create_pre_restore_backup(&storage_root, &data_root, &mut warnings)?;
+
+    let staging_dir = allocate_restore_staging_dir(&storage_root)?;
+    let staging_data_dir = staging_dir.join(DATA_DIR_NAME);
+    let mut copied_file_count = 0;
+    let mut total_bytes = 0;
+    copy_backup_tree(
+        &backup_data_dir,
+        &staging_data_dir,
+        &mut copied_file_count,
+        &mut total_bytes,
+        &mut warnings,
+    )?;
+    let staged_project_file_count = validate_data_dir(&staging_data_dir)?;
+
+    let before_restore_dir = if data_root.exists() {
+        Some(rename_current_data_to_before_restore(&data_root)?)
+    } else {
+        warnings.push(format!(
+            "Current data directory did not exist when restore replaced data: {}",
+            data_root.display()
+        ));
+        None
+    };
+
+    if let Err(restore_err) = fs::rename(&staging_data_dir, &data_root) {
+        if let Some(before_restore_dir) = &before_restore_dir {
+            if let Err(rollback_err) = fs::rename(before_restore_dir, &data_root) {
+                return Err(format!(
+                    "Failed to restore {} to {}; rollback from {} also failed: {restore_err}; rollback error: {rollback_err}",
+                    staging_data_dir.display(),
+                    data_root.display(),
+                    before_restore_dir.display()
+                ));
+            }
+        }
+        return Err(format!(
+            "Failed to restore {} to {}: {restore_err}",
+            staging_data_dir.display(),
+            data_root.display()
+        ));
+    }
+
+    if let Some(before_restore_dir) = &before_restore_dir {
+        warnings.push(format!(
+            "Previous data directory was preserved at {}",
+            before_restore_dir.display()
+        ));
+    }
+    warnings.push(format!(
+        "Pre-restore backup was created at {}",
+        pre_restore_backup_dir.display()
+    ));
+
+    Ok(RestoreReport {
+        restored_backup_id: backup_id,
+        restored_at: now_string(),
+        source_backup_dir: backup_dir.to_string_lossy().to_string(),
+        restored_data_dir: data_root.to_string_lossy().to_string(),
+        pre_restore_backup_dir: pre_restore_backup_dir.to_string_lossy().to_string(),
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+        project_file_count: staged_project_file_count.max(validated_project_file_count),
+        copied_file_count,
+        total_bytes,
+        warnings,
+    })
 }
 
 #[tauri::command]
@@ -770,7 +1257,9 @@ pub fn run() {
             set_storage_root,
             switch_storage_root,
             delete_project,
-            create_full_backup
+            create_full_backup,
+            list_full_backups,
+            restore_full_backup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
