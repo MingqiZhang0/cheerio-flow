@@ -166,6 +166,28 @@ export async function chooseStorageRoot(
   }
 }
 
+export async function switchStorageRoot(storageRoot: string): Promise<PersistedData> {
+  try {
+    const data = await invoke<PersistedData>("switch_storage_root", {
+      storageRoot,
+    });
+    return normalizePersistedData(data);
+  } catch (reason: unknown) {
+    if (!isProbablyNotTauriError(reason)) {
+      console.error("Failed to switch Tauri storage root", reason);
+      throw reason;
+    }
+    const current = readBrowserFallback();
+    const data = normalizePersistedData({
+      ...current,
+      storageRoot: storageRoot.trim() || current.storageRoot,
+      dataDir: `${storageRoot.trim() || current.storageRoot}/CheerioFlowData`,
+    });
+    writeBrowserFallback(data);
+    return data;
+  }
+}
+
 export async function removeProject(projectId: string) {
   try {
     await invoke("delete_project", { projectId });

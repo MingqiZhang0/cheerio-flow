@@ -399,26 +399,13 @@ fn save_database_to(
     storage_root: PathBuf,
     payload: DatabasePayload,
 ) -> Result<StorageReport, String> {
+    if payload.projects.is_empty() {
+        return Err("Refusing to save empty project list because it could overwrite or orphan existing project files".to_string());
+    }
+
     let bootstrap = bootstrap_path(app)?;
     let data_root = data_root_for(&storage_root);
     let projects_dir = ensure_data_dirs(&data_root)?;
-
-    let current_ids: HashSet<String> = payload.projects.iter().map(|project| project.id.clone()).collect();
-    if projects_dir.exists() {
-        for entry in fs::read_dir(&projects_dir)
-            .map_err(|err| format!("Failed to scan projects directory {}: {err}", projects_dir.display()))?
-        {
-            let entry = entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
-                if !current_ids.contains(stem) {
-                    fs::remove_file(&path)
-                        .map_err(|err| format!("Failed to delete stale project file {}: {err}", path.display()))?;
-                }
-            }
-        }
-    }
 
     for project in &payload.projects {
         write_json(&projects_dir.join(format!("{}.json", project.id)), project)?;
@@ -460,9 +447,25 @@ fn set_storage_root(
 
     fs::create_dir_all(&next_root)
         .map_err(|err| format!("Failed to create storage root {}: {err}", next_root.display()))?;
-    write_bootstrap(&app, &next_root)?;
     save_database_to(&app, next_root.clone(), payload)?;
-    load_database_from(&app, next_root)
+    let loaded = load_database_from(&app, next_root.clone())?;
+    write_bootstrap(&app, &next_root)?;
+    Ok(loaded)
+}
+
+#[tauri::command]
+fn switch_storage_root(app: tauri::AppHandle, storage_root: String) -> Result<PersistedData, String> {
+    let next_root = if storage_root.trim().is_empty() {
+        default_storage_root(&app)?
+    } else {
+        PathBuf::from(storage_root.trim())
+    };
+
+    fs::create_dir_all(&next_root)
+        .map_err(|err| format!("Failed to create storage root {}: {err}", next_root.display()))?;
+    let loaded = load_database_from(&app, next_root.clone())?;
+    write_bootstrap(&app, &next_root)?;
+    Ok(loaded)
 }
 
 #[tauri::command]
@@ -485,6 +488,7 @@ pub fn run() {
             load_database,
             save_database,
             set_storage_root,
+            switch_storage_root,
             delete_project
         ])
         .run(tauri::generate_context!())

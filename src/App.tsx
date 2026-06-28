@@ -43,7 +43,7 @@ import {
   X,
 } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { chooseStorageRoot, loadDatabase, persistDatabase, removeProject } from "./storage";
+import { chooseStorageRoot, loadDatabase, persistDatabase, removeProject, switchStorageRoot } from "./storage";
 import {
   ARROW_TYPES,
   MODULE_SHAPES,
@@ -59,6 +59,7 @@ import {
   type Project,
   type ProjectGroup,
   type SelectedElement,
+  type PersistedData,
   type StorageReport,
 } from "./types";
 import {
@@ -486,6 +487,7 @@ function AppShell() {
     viewportZoom: number;
   } | null>(null);
   const loadedRef = useRef(false);
+  const canPersistRef = useRef(false);
   const projectsRef = useRef<Project[]>([]);
   const groupsRef = useRef<ProjectGroup[]>([]);
   const appStateRef = useRef<AppState>({
@@ -548,7 +550,7 @@ function AppShell() {
   }, [appState]);
 
   const saveAllNow = useCallback(async (projectsOverride?: Project[]) => {
-    if (!loadedRef.current) return;
+    if (!loadedRef.current || !canPersistRef.current) return;
     setSaveStatus("saving");
     try {
       const currentProjects = projectsOverride ?? projectsRef.current;
@@ -567,50 +569,62 @@ function AppShell() {
     }
   }, []);
 
+  const hydrateLoadedData = useCallback(
+    (data: PersistedData) => {
+      const normalizedProjects = normalizeProjects(data.projects);
+      const normalizedGroups = normalizeGroups(data.groups, normalizedProjects);
+      const hydratedProjects = applyGroupMembership(normalizedProjects, normalizedGroups);
+      const firstProject = hydratedProjects[0] ?? createEmptyProject();
+      const nextProjects = hydratedProjects.length > 0 ? hydratedProjects : [firstProject];
+      groupsRef.current = normalizedGroups;
+      hydratedProjectIdRef.current = null;
+      setDataDir(data.dataDir);
+      setStorageReport(data.report ?? null);
+      setStorageRootInput(data.storageRoot ?? "");
+      setGroups(normalizedGroups);
+      updateProjects(() => nextProjects);
+      setCurrentProjectId(data.appState.currentProjectId ?? firstProject.id);
+      setProjectSidebarCollapsed(data.appState.projectSidebarCollapsed);
+      setPropertiesSidebarCollapsed(data.appState.propertiesSidebarCollapsed);
+      const nextLeftWidth = clampWithDefault(data.appState.leftSidebarWidth, LEFT_SIDEBAR_DEFAULT_WIDTH, LEFT_SIDEBAR_MIN_WIDTH, LEFT_SIDEBAR_MAX_WIDTH);
+      const nextRightWidth = clampWithDefault(data.appState.rightSidebarWidth, RIGHT_SIDEBAR_DEFAULT_WIDTH, RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH);
+      setLeftSidebarWidth(nextLeftWidth);
+      setRightSidebarWidth(nextRightWidth);
+      setSavedLeftSidebarWidth(nextLeftWidth);
+      setSavedRightSidebarWidth(nextRightWidth);
+      canPersistRef.current = true;
+      loadedRef.current = true;
+      setLoaded(true);
+    },
+    [updateProjects],
+  );
+
   useEffect(() => {
     let cancelled = false;
     loadDatabase()
       .then((data) => {
         if (cancelled) return;
-        const normalizedProjects = normalizeProjects(data.projects);
-        const normalizedGroups = normalizeGroups(data.groups, normalizedProjects);
-        const hydratedProjects = applyGroupMembership(normalizedProjects, normalizedGroups);
-        const firstProject = hydratedProjects[0] ?? createEmptyProject();
-        const nextProjects = hydratedProjects.length > 0 ? hydratedProjects : [firstProject];
-        groupsRef.current = normalizedGroups;
-        setDataDir(data.dataDir);
-        setStorageReport(data.report ?? null);
-        setStorageRootInput(data.storageRoot ?? "");
-        setGroups(normalizedGroups);
-        updateProjects(() => nextProjects);
-        setCurrentProjectId(data.appState.currentProjectId ?? firstProject.id);
-        setProjectSidebarCollapsed(data.appState.projectSidebarCollapsed);
-        setPropertiesSidebarCollapsed(data.appState.propertiesSidebarCollapsed);
-        const nextLeftWidth = clampWithDefault(data.appState.leftSidebarWidth, LEFT_SIDEBAR_DEFAULT_WIDTH, LEFT_SIDEBAR_MIN_WIDTH, LEFT_SIDEBAR_MAX_WIDTH);
-        const nextRightWidth = clampWithDefault(data.appState.rightSidebarWidth, RIGHT_SIDEBAR_DEFAULT_WIDTH, RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH);
-        setLeftSidebarWidth(nextLeftWidth);
-        setRightSidebarWidth(nextRightWidth);
-        setSavedLeftSidebarWidth(nextLeftWidth);
-        setSavedRightSidebarWidth(nextRightWidth);
-        setLoaded(true);
-        loadedRef.current = true;
+        hydrateLoadedData(data);
       })
       .catch((reason: unknown) => {
         console.error("Failed to load Cheerio Flow data", reason);
         setError(reason instanceof Error ? reason.message : String(reason));
-        updateProjects(() => []);
-        setCurrentProjectId(null);
-        setLoaded(true);
-        loadedRef.current = true;
+        if (saveTimerRef.current) {
+          window.clearTimeout(saveTimerRef.current);
+          saveTimerRef.current = null;
+        }
+        canPersistRef.current = false;
+        loadedRef.current = false;
         setSaveStatus("error");
+        setLoaded(true);
       });
     return () => {
       cancelled = true;
     };
-  }, [updateProjects]);
+  }, [hydrateLoadedData]);
 
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || !canPersistRef.current) return;
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = window.setTimeout(() => {
       void saveAllNow();
@@ -1137,34 +1151,27 @@ function AppShell() {
 
   const applyStorageRoot = useCallback(async () => {
     setSaveStatus("saving");
+    const shouldSaveCurrentData = canPersistRef.current;
+    if (saveTimerRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    canPersistRef.current = false;
     try {
-      const data = await chooseStorageRoot(storageRootInput, projectsRef.current, groupsRef.current, appStateRef.current);
-      const normalizedProjects = normalizeProjects(data.projects);
-      const normalizedGroups = normalizeGroups(data.groups, normalizedProjects);
-      const hydratedProjects = applyGroupMembership(normalizedProjects, normalizedGroups);
-      groupsRef.current = normalizedGroups;
-      hydratedProjectIdRef.current = null;
-      updateProjects(() => hydratedProjects);
-      setGroups(normalizedGroups);
-      setCurrentProjectId(data.appState.currentProjectId ?? hydratedProjects[0]?.id ?? null);
-      const nextLeftWidth = clampWithDefault(data.appState.leftSidebarWidth, LEFT_SIDEBAR_DEFAULT_WIDTH, LEFT_SIDEBAR_MIN_WIDTH, LEFT_SIDEBAR_MAX_WIDTH);
-      const nextRightWidth = clampWithDefault(data.appState.rightSidebarWidth, RIGHT_SIDEBAR_DEFAULT_WIDTH, RIGHT_SIDEBAR_MIN_WIDTH, RIGHT_SIDEBAR_MAX_WIDTH);
-      setLeftSidebarWidth(nextLeftWidth);
-      setRightSidebarWidth(nextRightWidth);
-      setSavedLeftSidebarWidth(nextLeftWidth);
-      setSavedRightSidebarWidth(nextRightWidth);
-      setDataDir(data.dataDir);
-      setStorageRootInput(data.storageRoot ?? "");
-      setStorageReport(data.report ?? null);
+      const data = shouldSaveCurrentData
+        ? await chooseStorageRoot(storageRootInput, projectsRef.current, groupsRef.current, appStateRef.current)
+        : await switchStorageRoot(storageRootInput);
+      hydrateLoadedData(data);
       setSaveStatus("saved");
       setError(null);
-      console.info("Cheerio Flow storage root set", data.report);
+      console.info(shouldSaveCurrentData ? "Cheerio Flow storage root set" : "Cheerio Flow storage root switched", data.report);
     } catch (reason: unknown) {
       console.error("Failed to apply storage root", reason);
+      loadedRef.current = false;
       setSaveStatus("error");
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, [storageRootInput, updateProjects]);
+  }, [hydrateLoadedData, storageRootInput]);
 
   const createModuleAt = useCallback(
     (shape: ModuleShape, clientX: number, clientY: number) => {
@@ -1598,15 +1605,34 @@ function AppShell() {
                   Delete Current Project
                 </button>
                 <label>
-                  Storage root
+                  Storage parent folder
                   <input value={storageRootInput} onChange={(event) => setStorageRootInput(event.target.value)} />
                 </label>
+                <div className="empty-hint">Choose a parent folder. CheerioFlowData will be created inside it.</div>
                 <button className="action-button" type="button" onClick={() => void applyStorageRoot()}>
                   <Save size={15} />
                   Apply Storage Path
                 </button>
                 <div className="readonly-row">
-                  <span>Active data directory</span>
+                  <span>Data directory</span>
+                  <strong>{dataDir || "unavailable"}</strong>
+                </div>
+              </section>
+            )}
+            {!currentProject && !canPersistRef.current && (
+              <section className="project-editor">
+                <div className="editor-title">Storage Recovery</div>
+                <label>
+                  Storage parent folder
+                  <input value={storageRootInput} onChange={(event) => setStorageRootInput(event.target.value)} />
+                </label>
+                <div className="empty-hint">Choose a parent folder. CheerioFlowData will be created inside it.</div>
+                <button className="action-button" type="button" onClick={() => void applyStorageRoot()}>
+                  <Save size={15} />
+                  Switch and Reload
+                </button>
+                <div className="readonly-row">
+                  <span>Data directory</span>
                   <strong>{dataDir || "unavailable"}</strong>
                 </div>
               </section>
@@ -1748,7 +1774,7 @@ function AppShell() {
         <footer className="statusbar">
           <span>
             <Save size={14} />
-            Local data: {dataDir || "unavailable"}
+            Data directory: {dataDir || "unavailable"}
           </span>
           {storageReport && (
             <span>
