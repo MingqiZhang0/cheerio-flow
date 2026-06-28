@@ -489,6 +489,7 @@ function AppShell() {
   const projectsRef = useRef<Project[]>([]);
   const groupsRef = useRef<ProjectGroup[]>([]);
   const appStateRef = useRef<AppState>({
+    dataVersion: 1,
     currentProjectId: null,
     projectSidebarCollapsed: false,
     propertiesSidebarCollapsed: true,
@@ -504,6 +505,7 @@ function AppShell() {
 
   const appState = useMemo<AppState>(
     () => ({
+      dataVersion: 1,
       currentProjectId: currentProject?.id ?? null,
       projectSidebarCollapsed,
       propertiesSidebarCollapsed,

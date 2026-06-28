@@ -67,6 +67,7 @@ export interface ProjectGroup {
 }
 
 export interface AppState {
+  dataVersion: number;
   currentProjectId: string | null;
   projectSidebarCollapsed: boolean;
   propertiesSidebarCollapsed: boolean;

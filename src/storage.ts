@@ -28,15 +28,26 @@ function createBrowserReport(data: PersistedData): StorageReport {
   };
 }
 
+function normalizeAppStateDataVersion(dataVersion: unknown) {
+  return typeof dataVersion === "number" && Number.isFinite(dataVersion) && dataVersion > 0 ? dataVersion : DEFAULT_APP_STATE.dataVersion;
+}
+
 function normalizePersistedData(data: PersistedData): PersistedData {
   const projects = normalizeProjects(data.projects);
   const groups = normalizeGroups(data.groups ?? [], projects);
+  const appState = {
+    ...DEFAULT_APP_STATE,
+    ...data.appState,
+  };
   const normalized = {
     ...data,
     storageRoot: data.storageRoot ?? data.dataDir,
     projects,
     groups,
-    appState: { ...DEFAULT_APP_STATE, ...data.appState },
+    appState: {
+      ...appState,
+      dataVersion: normalizeAppStateDataVersion(appState.dataVersion),
+    },
   };
   return {
     ...normalized,
@@ -82,7 +93,14 @@ function writeBrowserFallback(data: PersistedData) {
 }
 
 function buildPayload(projects: Project[], groups: ProjectGroup[], appState: AppState) {
-  return { projects, groups, appState };
+  return {
+    projects,
+    groups,
+    appState: {
+      ...appState,
+      dataVersion: normalizeAppStateDataVersion(appState.dataVersion),
+    },
+  };
 }
 
 export async function loadDatabase(): Promise<PersistedData> {

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,6 +93,8 @@ struct ProjectGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppState {
+    #[serde(default = "default_data_version", deserialize_with = "deserialize_data_version")]
+    data_version: u32,
     current_project_id: Option<String>,
     project_sidebar_collapsed: bool,
     properties_sidebar_collapsed: bool,
@@ -145,6 +147,7 @@ struct BootstrapConfig {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            data_version: default_data_version(),
             current_project_id: None,
             project_sidebar_collapsed: false,
             properties_sidebar_collapsed: true,
@@ -160,6 +163,22 @@ fn default_status() -> String {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_data_version() -> u32 {
+    1
+}
+
+fn deserialize_data_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_u64()
+        .and_then(|number| u32::try_from(number).ok())
+        .filter(|number| *number > 0)
+        .unwrap_or_else(default_data_version))
 }
 
 fn default_left_sidebar_width() -> f64 {
