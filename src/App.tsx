@@ -1823,7 +1823,7 @@ function AppShell() {
         {backupStatus === "running" ? "Creating Backup..." : "Create Full Backup"}
       </button>
       {backupStatus === "success" && backupReport && (
-        <div className="backup-result backup-result-success">
+        <div className="backup-result backup-result-panel backup-result-success">
           <strong className="backup-path">Backup created: {backupReport.backupDir}</strong>
           <span>
             Copied {backupReport.copiedFileCount} files, including {backupReport.projectFileCount} project files.
