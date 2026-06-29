@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppState, BackupReport, BackupSummary, PersistedData, Project, ProjectGroup, RestoreReport, StorageReport } from "./types";
+import type { AppState, BackupReport, BackupSummary, MigrationDryRunReport, PersistedData, Project, ProjectGroup, RestoreReport, StorageReport } from "./types";
 import { DEFAULT_APP_STATE, createEmptyProject, normalizeProjects } from "./utils";
 
 const LOCAL_STORAGE_KEY = "cheerio-flow-browser-fallback";
@@ -165,6 +165,18 @@ export async function restoreFullBackup(backupId: string): Promise<RestoreReport
       throw reason;
     }
     throw new Error("Full backup restore requires the desktop app.");
+  }
+}
+
+export async function generateMigrationDryRunPlan(): Promise<MigrationDryRunReport> {
+  try {
+    return await invoke<MigrationDryRunReport>("generate_migration_dry_run_plan");
+  } catch (reason: unknown) {
+    if (!isProbablyNotTauriError(reason)) {
+      console.error("Failed to generate migration dry-run plan", reason);
+      throw reason;
+    }
+    throw new Error("Migration dry-run requires the desktop app.");
   }
 }
 

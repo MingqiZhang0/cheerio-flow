@@ -483,6 +483,34 @@ button {
   color: #6d332b;
 }
 
+.migration-dry-run-panel,
+.migration-report {
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+  padding-top: 8px;
+  border-top: 1px solid #d9e2df;
+}
+
+.migration-summary-grid {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding: 9px;
+  border: 1px solid #cbd8d4;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #41585b;
+  font-size: 12px;
+}
+
+.migration-summary-grid span,
+.migration-operation {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .check-row {
   display: flex !important;
   grid-template-columns: none !important;

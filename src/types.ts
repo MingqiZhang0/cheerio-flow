@@ -124,6 +124,70 @@ export interface RestoreReport {
   warnings: string[];
 }
 
+export interface MigrationDryRunSummary {
+  projectFileCount: number;
+  readableProjectCount: number;
+  groupedProjectCount: number;
+  ungroupedProjectCount: number;
+  groupCount: number;
+  plannedMoveCount: number;
+  blockerCount: number;
+  warningCount: number;
+}
+
+export interface ProjectMigrationPlan {
+  projectId: string;
+  projectTitle: string;
+  sourceRelativePath: string;
+  targetRelativePath: string;
+  currentGroupId?: string | null;
+  targetGroupId?: string | null;
+  targetBucket: string;
+  status: string;
+  blockers: string[];
+  warnings: string[];
+}
+
+export interface GroupMigrationPlan {
+  groupId: string;
+  title: string;
+  targetRelativeDir: string;
+  projectIds: string[];
+  existingProjectCount: number;
+  missingProjectIds: string[];
+  status: string;
+  blockers: string[];
+  warnings: string[];
+}
+
+export interface MigrationPlannedOperation {
+  operationType: string;
+  sourceRelativePath: string;
+  targetRelativePath: string;
+  projectId?: string | null;
+  groupId?: string | null;
+  status: string;
+  notes: string[];
+}
+
+export interface MigrationDryRunReport {
+  reportVersion: number;
+  generatedAt: string;
+  sourceDataDir: string;
+  sourceProjectsDir: string;
+  currentLayout: string;
+  targetLayout: string;
+  sourceDataVersion: number;
+  targetDataVersion: number;
+  summary: MigrationDryRunSummary;
+  projectPlans: ProjectMigrationPlan[];
+  groupPlans: GroupMigrationPlan[];
+  plannedOperations: MigrationPlannedOperation[];
+  blockers: string[];
+  warnings: string[];
+  dryRunOnly: boolean;
+}
+
 export interface PersistedData {
   dataDir: string;
   storageRoot: string;

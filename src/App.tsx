@@ -47,7 +47,7 @@ import {
 } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { scanLightweightIntegrity, type LightweightIntegrityReport } from "./integrity";
-import { chooseStorageRoot, createFullBackup, listFullBackups, loadDatabase, persistDatabase, removeProject, restoreFullBackup, switchStorageRoot } from "./storage";
+import { chooseStorageRoot, createFullBackup, generateMigrationDryRunPlan, listFullBackups, loadDatabase, persistDatabase, removeProject, restoreFullBackup, switchStorageRoot } from "./storage";
 import {
   ARROW_TYPES,
   MODULE_SHAPES,
@@ -61,6 +61,7 @@ import {
   type FlowArrowData,
   type FlowModule,
   type FlowModuleData,
+  type MigrationDryRunReport,
   type ModuleShape,
   type Project,
   type ProjectGroup,
@@ -89,6 +90,7 @@ type ArrowEdgeType = Edge<FlowArrowData>;
 type SaveStatus = "saving" | "saved" | "error";
 type BackupStatus = "idle" | "running" | "success" | "error";
 type RestoreStatus = "idle" | "loading" | "running" | "success" | "error";
+type MigrationDryRunStatus = "idle" | "running" | "success" | "error";
 type CtrlWheelState = { x: number; y: number } | null;
 type MoveMode = "x" | "y" | "free";
 type ResizeEdge = "right" | "bottom" | "corner";
@@ -132,6 +134,13 @@ function formatBytes(bytes: number) {
     unitIndex += 1;
   }
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+}
+
+function getPreviewItems<T>(items: T[], limit: number) {
+  return {
+    visible: items.slice(0, limit),
+    remaining: Math.max(0, items.length - limit),
+  };
 }
 
 function isResizableShape(shape: ModuleShape) {
@@ -480,6 +489,9 @@ function AppShell() {
   const [restoreConfirmation, setRestoreConfirmation] = useState("");
   const [restoreReport, setRestoreReport] = useState<RestoreReport | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [migrationDryRunStatus, setMigrationDryRunStatus] = useState<MigrationDryRunStatus>("idle");
+  const [migrationDryRunReport, setMigrationDryRunReport] = useState<MigrationDryRunReport | null>(null);
+  const [migrationDryRunError, setMigrationDryRunError] = useState<string | null>(null);
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [consoleInput, setConsoleInput] = useState("");
   const [consoleMessage, setConsoleMessage] = useState("");
@@ -1310,6 +1322,20 @@ function AppShell() {
     }
   }, [hydrateLoadedData, restoreConfirmation, selectedBackupId]);
 
+  const handleGenerateMigrationDryRunPlan = useCallback(async () => {
+    setMigrationDryRunStatus("running");
+    setMigrationDryRunError(null);
+    try {
+      const report = await generateMigrationDryRunPlan();
+      setMigrationDryRunReport(report);
+      setMigrationDryRunStatus("success");
+    } catch (reason: unknown) {
+      setMigrationDryRunReport(null);
+      setMigrationDryRunStatus("error");
+      setMigrationDryRunError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, []);
+
   const createModuleAt = useCallback(
     (shape: ModuleShape, clientX: number, clientY: number) => {
       if (!currentProjectId || !flowInstance) {
@@ -1581,6 +1607,9 @@ function AppShell() {
     [groups, projects],
   );
   const showIntegrityBanner = Boolean(integrityReport && !integrityReport.ok && !integrityBannerDismissed);
+  const migrationBlockerPreview = migrationDryRunReport ? getPreviewItems(migrationDryRunReport.blockers, 10) : null;
+  const migrationWarningPreview = migrationDryRunReport ? getPreviewItems(migrationDryRunReport.warnings, 10) : null;
+  const migrationOperationPreview = migrationDryRunReport ? getPreviewItems(migrationDryRunReport.plannedOperations, 20) : null;
   const backupRestorePanel = (
     <>
       <button className="action-button" type="button" onClick={() => void handleCreateFullBackup()} disabled={backupStatus === "running" || !canPersistRef.current}>
@@ -1675,6 +1704,74 @@ function AppShell() {
         {restoreStatus === "error" && restoreError && (
           <div className="backup-result backup-result-error">
             <strong>Restore failed: {restoreError}</strong>
+          </div>
+        )}
+      </div>
+
+      <div className="migration-dry-run-panel">
+        <div className="restore-title-row">
+          <strong>Migration dry-run</strong>
+        </div>
+        <div className="empty-hint">Dry-run only. No files were moved, copied, deleted, repaired, or written.</div>
+        <button className="action-button" type="button" onClick={() => void handleGenerateMigrationDryRunPlan()} disabled={migrationDryRunStatus === "running"}>
+          <GitBranch size={15} />
+          {migrationDryRunStatus === "running" ? "Previewing..." : "Preview group-folder migration"}
+        </button>
+        {migrationDryRunStatus === "error" && migrationDryRunError && (
+          <div className="backup-result backup-result-error">
+            <strong>Migration dry-run failed: {migrationDryRunError}</strong>
+          </div>
+        )}
+        {migrationDryRunStatus === "success" && migrationDryRunReport && (
+          <div className="migration-report">
+            <div className={migrationDryRunReport.summary.blockerCount > 0 ? "backup-result backup-result-warning" : "backup-result backup-result-success"}>
+              <strong>
+                {migrationDryRunReport.summary.blockerCount > 0
+                  ? "Migration preview found blocking issues. Real migration should not run until these are resolved."
+                  : "Migration preview found no blocking issues."}
+              </strong>
+              <span>This is a dry-run report only.</span>
+              <span>No dataVersion change was made.</span>
+              <span>No folders were created.</span>
+            </div>
+            <div className="migration-summary-grid">
+              <span>Project files: {migrationDryRunReport.summary.projectFileCount}</span>
+              <span>Grouped: {migrationDryRunReport.summary.groupedProjectCount}</span>
+              <span>Ungrouped: {migrationDryRunReport.summary.ungroupedProjectCount}</span>
+              <span>Groups: {migrationDryRunReport.summary.groupCount}</span>
+              <span>Planned moves: {migrationDryRunReport.summary.plannedMoveCount}</span>
+              <span>Blockers: {migrationDryRunReport.summary.blockerCount}</span>
+              <span>Warnings: {migrationDryRunReport.summary.warningCount}</span>
+            </div>
+            {migrationBlockerPreview && migrationBlockerPreview.visible.length > 0 && (
+              <div className="backup-result backup-result-error">
+                <strong>Blockers</strong>
+                {migrationBlockerPreview.visible.map((item, index) => (
+                  <span key={`${item}-${index}`}>{item}</span>
+                ))}
+                {migrationBlockerPreview.remaining > 0 && <span>+{migrationBlockerPreview.remaining} more</span>}
+              </div>
+            )}
+            {migrationWarningPreview && migrationWarningPreview.visible.length > 0 && (
+              <div className="backup-result backup-result-warning">
+                <strong>Warnings</strong>
+                {migrationWarningPreview.visible.map((item, index) => (
+                  <span key={`${item}-${index}`}>{item}</span>
+                ))}
+                {migrationWarningPreview.remaining > 0 && <span>+{migrationWarningPreview.remaining} more</span>}
+              </div>
+            )}
+            {migrationOperationPreview && migrationOperationPreview.visible.length > 0 && (
+              <div className="backup-result">
+                <strong>Planned operations</strong>
+                {migrationOperationPreview.visible.map((operation, index) => (
+                  <span className="migration-operation" key={`${operation.operationType}-${index}`}>
+                    {operation.operationType}: {operation.sourceRelativePath || "(new directory)"} -&gt; {operation.targetRelativePath || "(blocked)"} [{operation.status}]
+                  </span>
+                ))}
+                {migrationOperationPreview.remaining > 0 && <span>+{migrationOperationPreview.remaining} more</span>}
+              </div>
+            )}
           </div>
         )}
       </div>

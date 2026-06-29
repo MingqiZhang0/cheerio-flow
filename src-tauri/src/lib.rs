@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
@@ -174,6 +175,80 @@ struct RestoreReport {
     copied_file_count: usize,
     total_bytes: u64,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationDryRunSummary {
+    project_file_count: usize,
+    readable_project_count: usize,
+    grouped_project_count: usize,
+    ungrouped_project_count: usize,
+    group_count: usize,
+    planned_move_count: usize,
+    blocker_count: usize,
+    warning_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectMigrationPlan {
+    project_id: String,
+    project_title: String,
+    source_relative_path: String,
+    target_relative_path: String,
+    current_group_id: Option<String>,
+    target_group_id: Option<String>,
+    target_bucket: String,
+    status: String,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupMigrationPlan {
+    group_id: String,
+    title: String,
+    target_relative_dir: String,
+    project_ids: Vec<String>,
+    existing_project_count: usize,
+    missing_project_ids: Vec<String>,
+    status: String,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationPlannedOperation {
+    operation_type: String,
+    source_relative_path: String,
+    target_relative_path: String,
+    project_id: Option<String>,
+    group_id: Option<String>,
+    status: String,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationDryRunReport {
+    report_version: u32,
+    generated_at: String,
+    source_data_dir: String,
+    source_projects_dir: String,
+    current_layout: String,
+    target_layout: String,
+    source_data_version: u32,
+    target_data_version: u32,
+    summary: MigrationDryRunSummary,
+    project_plans: Vec<ProjectMigrationPlan>,
+    group_plans: Vec<GroupMigrationPlan>,
+    planned_operations: Vec<MigrationPlannedOperation>,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+    dry_run_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -718,6 +793,439 @@ fn ensure_directory(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct MigrationProjectRecord {
+    project_id: String,
+    project_title: String,
+    source_relative_path: String,
+    current_group_id: Option<String>,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MigrationGroupRecord {
+    group_id: String,
+    title: String,
+    project_ids: Vec<String>,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn relative_to_data_root(data_root: &Path, path: &Path) -> String {
+    path.strip_prefix(data_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn validate_path_segment_for_migration(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} cannot be empty"));
+    }
+    if value.trim() != value {
+        return Err(format!(
+            "{label} cannot contain leading or trailing whitespace: {value}"
+        ));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(format!("{label} cannot contain path separators: {value}"));
+    }
+    if value.contains("..") {
+        return Err(format!("{label} cannot contain ..: {value}"));
+    }
+    if value.contains('\0') {
+        return Err(format!("{label} cannot contain NUL: {value}"));
+    }
+    if Path::new(value).is_absolute() {
+        return Err(format!("{label} cannot be an absolute path: {value}"));
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return Err(format!(
+            "{label} cannot contain a Windows drive prefix: {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn migration_status(blockers: &[String], warnings: &[String]) -> String {
+    if !blockers.is_empty() {
+        "blocked".to_string()
+    } else if !warnings.is_empty() {
+        "warning".to_string()
+    } else {
+        "planned".to_string()
+    }
+}
+
+fn push_unique(items: &mut Vec<String>, item: String) {
+    if !items.iter().any(|existing| existing == &item) {
+        items.push(item);
+    }
+}
+
+fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|item| item.as_str())
+        .map(|item| item.to_string())
+}
+
+fn string_array_field(value: &serde_json::Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(raw_items) = value.get(key) else {
+        return Ok(vec![]);
+    };
+    let Some(items) = raw_items.as_array() else {
+        return Err(format!("{key} is not an array"));
+    };
+    let mut result = Vec::new();
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(format!("{key} contains a non-string value"));
+        };
+        result.push(text.to_string());
+    }
+    Ok(result)
+}
+
+fn read_source_data_version_for_migration(
+    app_state_path: &Path,
+    blockers: &mut Vec<String>,
+) -> u32 {
+    if !app_state_path.exists() {
+        push_unique(
+            blockers,
+            format!(
+                "app-state.json does not exist: {}",
+                app_state_path.display()
+            ),
+        );
+        return 1;
+    }
+    match ensure_regular_file(app_state_path, APP_STATE_FILE)
+        .and_then(|_| read_json::<serde_json::Value>(app_state_path))
+    {
+        Ok(value) => value
+            .get("dataVersion")
+            .and_then(|item| item.as_u64())
+            .and_then(|item| u32::try_from(item).ok())
+            .unwrap_or(1),
+        Err(err) => {
+            push_unique(blockers, err);
+            1
+        }
+    }
+}
+
+fn read_groups_for_migration(
+    groups_path: &Path,
+    blockers: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> (Vec<MigrationGroupRecord>, bool) {
+    if !groups_path.exists() {
+        push_unique(
+            blockers,
+            format!("groups.json does not exist: {}", groups_path.display()),
+        );
+        return (vec![], false);
+    }
+
+    let value = match ensure_regular_file(groups_path, GROUPS_FILE)
+        .and_then(|_| read_json::<serde_json::Value>(groups_path))
+    {
+        Ok(value) => value,
+        Err(err) => {
+            push_unique(blockers, err);
+            return (vec![], false);
+        }
+    };
+
+    let Some(items) = value.as_array() else {
+        push_unique(
+            blockers,
+            format!("groups.json is not an array: {}", groups_path.display()),
+        );
+        return (vec![], false);
+    };
+
+    let mut seen_group_ids = HashSet::new();
+    let mut records = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let mut group_blockers = Vec::new();
+        let mut group_warnings = Vec::new();
+        let group_id = string_field(item, "id").unwrap_or_default();
+        if let Err(err) = validate_path_segment_for_migration(&group_id, "group id") {
+            group_blockers.push(format!("Group at index {index}: {err}"));
+        }
+        if !group_id.is_empty() && !seen_group_ids.insert(group_id.clone()) {
+            group_blockers.push(format!("Duplicate group id: {group_id}"));
+        }
+
+        let title = string_field(item, "title").unwrap_or_default();
+        if title.trim().is_empty() {
+            group_warnings.push(format!("Group {group_id} has a missing title"));
+        }
+
+        let project_ids = match string_array_field(item, "projectIds") {
+            Ok(project_ids) => {
+                let mut seen_project_ids = HashSet::new();
+                for project_id in &project_ids {
+                    if !seen_project_ids.insert(project_id.clone()) {
+                        group_warnings.push(format!(
+                            "Group {group_id} lists duplicate project id {project_id}"
+                        ));
+                    }
+                }
+                project_ids
+            }
+            Err(err) => {
+                group_blockers.push(format!("Group {group_id}: {err}"));
+                vec![]
+            }
+        };
+
+        for blocker in &group_blockers {
+            push_unique(blockers, blocker.clone());
+        }
+        for warning in &group_warnings {
+            push_unique(warnings, warning.clone());
+        }
+        records.push(MigrationGroupRecord {
+            group_id,
+            title,
+            project_ids,
+            blockers: group_blockers,
+            warnings: group_warnings,
+        });
+    }
+    (records, true)
+}
+
+fn read_projects_for_migration(
+    data_root: &Path,
+    projects_dir: &Path,
+    blockers: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<(Vec<MigrationProjectRecord>, usize), String> {
+    if !projects_dir.exists() {
+        push_unique(
+            blockers,
+            format!(
+                "projects directory does not exist: {}",
+                projects_dir.display()
+            ),
+        );
+        return Ok((vec![], 0));
+    }
+    if let Err(err) = ensure_directory(projects_dir, "projects directory") {
+        push_unique(blockers, err);
+        return Ok((vec![], 0));
+    }
+
+    let mut records = Vec::new();
+    let mut source_project_file_count = 0;
+    for entry in fs::read_dir(projects_dir).map_err(|err| {
+        format!(
+            "Failed to scan projects directory {}: {err}",
+            projects_dir.display()
+        )
+    })? {
+        let entry =
+            entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
+        let path = entry.path();
+        let source_relative_path = relative_to_data_root(data_root, &path);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| format!("Failed to inspect project path {}: {err}", path.display()))?;
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            push_unique(
+                blockers,
+                format!("Project path is a symlink: {source_relative_path}"),
+            );
+            continue;
+        }
+        if file_type.is_dir() {
+            push_unique(
+                warnings,
+                format!(
+                "projects/ contains a subdirectory, suggesting mixed layout: {source_relative_path}"
+            ),
+            );
+            continue;
+        }
+        if !file_type.is_file() {
+            push_unique(
+                warnings,
+                format!("projects/ contains an unsupported entry: {source_relative_path}"),
+            );
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            push_unique(
+                warnings,
+                format!("projects/ contains a non-JSON file: {source_relative_path}"),
+            );
+            continue;
+        }
+        source_project_file_count += 1;
+
+        let file_stem = path
+            .file_stem()
+            .and_then(|item| item.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut project_blockers = Vec::new();
+        let mut project_warnings = Vec::new();
+        let value = match read_json::<serde_json::Value>(&path) {
+            Ok(value) => value,
+            Err(err) => {
+                project_blockers.push(err);
+                if let Err(err) =
+                    validate_path_segment_for_migration(&file_stem, "project file stem")
+                {
+                    project_blockers.push(format!("{source_relative_path}: {err}"));
+                }
+                for blocker in &project_blockers {
+                    push_unique(blockers, blocker.clone());
+                }
+                records.push(MigrationProjectRecord {
+                    project_id: file_stem.clone(),
+                    project_title: String::new(),
+                    source_relative_path,
+                    current_group_id: None,
+                    blockers: project_blockers,
+                    warnings: project_warnings,
+                });
+                continue;
+            }
+        };
+
+        let project_id = string_field(&value, "id").unwrap_or_default();
+        if let Err(err) = validate_path_segment_for_migration(&project_id, "project id") {
+            project_blockers.push(format!("{source_relative_path}: {err}"));
+        }
+        if project_id != file_stem {
+            project_blockers.push(format!(
+                "Project id {project_id} does not match file stem {file_stem} at {source_relative_path}"
+            ));
+        }
+        let current_group_id = string_field(&value, "groupId").filter(|item| !item.is_empty());
+        if let Some(group_id) = &current_group_id {
+            if let Err(err) = validate_path_segment_for_migration(group_id, "project groupId") {
+                project_blockers.push(format!("{source_relative_path}: {err}"));
+            }
+        }
+
+        let project_title = string_field(&value, "title").unwrap_or_default();
+        if project_title.trim().is_empty() {
+            project_warnings.push(format!("Project {project_id} has a missing title"));
+        }
+
+        for blocker in &project_blockers {
+            push_unique(blockers, blocker.clone());
+        }
+        for warning in &project_warnings {
+            push_unique(warnings, warning.clone());
+        }
+        records.push(MigrationProjectRecord {
+            project_id,
+            project_title,
+            source_relative_path,
+            current_group_id,
+            blockers: project_blockers,
+            warnings: project_warnings,
+        });
+    }
+    Ok((records, source_project_file_count))
+}
+
+fn path_exists_for_migration(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("Failed to inspect path {}: {err}", path.display())),
+    }
+}
+
+fn data_relative_path(data_root: &Path, relative_path: &str) -> PathBuf {
+    relative_path
+        .split('/')
+        .fold(data_root.to_path_buf(), |path, segment| path.join(segment))
+}
+
+fn inspect_projects_layout_for_migration(
+    data_root: &Path,
+    projects_dir: &Path,
+    blockers: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<String, String> {
+    if !data_root.exists() || !projects_dir.exists() {
+        return Ok("missing".to_string());
+    }
+    if let Err(err) = ensure_directory(data_root, "data directory") {
+        push_unique(blockers, err);
+        return Ok("unknown".to_string());
+    }
+    if let Err(err) = ensure_directory(projects_dir, "projects directory") {
+        push_unique(blockers, err);
+        return Ok("unknown".to_string());
+    }
+
+    let mut has_subdir = false;
+    for reserved in ["ungrouped", "groups"] {
+        let path = projects_dir.join(reserved);
+        if path_exists_for_migration(&path)? {
+            has_subdir = true;
+            push_unique(
+                blockers,
+                format!(
+                    "Reserved future target directory already exists: {}",
+                    relative_to_data_root(data_root, &path)
+                ),
+            );
+        }
+    }
+
+    for entry in fs::read_dir(projects_dir).map_err(|err| {
+        format!(
+            "Failed to scan projects directory {}: {err}",
+            projects_dir.display()
+        )
+    })? {
+        let entry =
+            entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| format!("Failed to inspect projects entry {}: {err}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            push_unique(
+                blockers,
+                format!(
+                    "projects/ contains a symlink: {}",
+                    relative_to_data_root(data_root, &path)
+                ),
+            );
+        } else if metadata.file_type().is_dir() {
+            has_subdir = true;
+            push_unique(
+                warnings,
+                format!(
+                    "projects/ contains a subdirectory: {}",
+                    relative_to_data_root(data_root, &path)
+                ),
+            );
+        }
+    }
+
+    if has_subdir {
+        Ok("mixed".to_string())
+    } else {
+        Ok("flat".to_string())
+    }
+}
+
 fn validate_data_dir(data_root: &Path) -> Result<usize, String> {
     if !data_root.exists() {
         return Err(format!(
@@ -932,6 +1440,388 @@ fn rename_current_data_to_before_restore(data_root: &Path) -> Result<PathBuf, St
         "Failed to allocate a before-restore directory under {}",
         parent.display()
     ))
+}
+
+#[tauri::command]
+fn generate_migration_dry_run_plan(app: tauri::AppHandle) -> Result<MigrationDryRunReport, String> {
+    let storage_root = active_storage_root(&app)?;
+    let data_root = data_root_for(&storage_root);
+    let projects_dir = data_root.join("projects");
+    let groups_path = data_root.join(GROUPS_FILE);
+    let app_state_path = data_root.join(APP_STATE_FILE);
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+
+    let current_layout = inspect_projects_layout_for_migration(
+        &data_root,
+        &projects_dir,
+        &mut blockers,
+        &mut warnings,
+    )?;
+    let source_data_version =
+        read_source_data_version_for_migration(&app_state_path, &mut blockers);
+    let (group_records, groups_metadata_trustworthy) =
+        read_groups_for_migration(&groups_path, &mut blockers, &mut warnings);
+    let (project_records, source_project_file_count) =
+        read_projects_for_migration(&data_root, &projects_dir, &mut blockers, &mut warnings)?;
+
+    let mut project_id_counts: HashMap<String, usize> = HashMap::new();
+    let mut present_project_ids = HashSet::new();
+    for project in &project_records {
+        if !project.project_id.is_empty() {
+            *project_id_counts
+                .entry(project.project_id.clone())
+                .or_insert(0) += 1;
+            present_project_ids.insert(project.project_id.clone());
+        }
+    }
+
+    let mut group_id_counts: HashMap<String, usize> = HashMap::new();
+    let mut group_index_by_id: HashMap<String, usize> = HashMap::new();
+    let mut group_memberships: HashMap<String, Vec<String>> = HashMap::new();
+    for (index, group) in group_records.iter().enumerate() {
+        if !group.group_id.is_empty() {
+            *group_id_counts.entry(group.group_id.clone()).or_insert(0) += 1;
+            group_index_by_id
+                .entry(group.group_id.clone())
+                .or_insert(index);
+        }
+        for project_id in &group.project_ids {
+            group_memberships
+                .entry(project_id.clone())
+                .or_default()
+                .push(group.group_id.clone());
+        }
+    }
+
+    let mut group_plans = Vec::new();
+    for group in &group_records {
+        let mut group_blockers = group.blockers.clone();
+        let group_warnings = group.warnings.clone();
+        if group_id_counts.get(&group.group_id).copied().unwrap_or(0) > 1 {
+            group_blockers.push(format!("Duplicate group id: {}", group.group_id));
+        }
+        let missing_project_ids = group
+            .project_ids
+            .iter()
+            .filter(|project_id| !present_project_ids.contains(*project_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_project_ids.is_empty() {
+            group_blockers.push(format!(
+                "Group {} references missing projects: {}",
+                group.group_id,
+                missing_project_ids.join(", ")
+            ));
+        }
+
+        for project_id in &group.project_ids {
+            for project in project_records
+                .iter()
+                .filter(|project| project.project_id == *project_id)
+            {
+                if project.current_group_id.as_deref() != Some(group.group_id.as_str()) {
+                    group_blockers.push(format!(
+                        "Group {} lists project {}, but project.groupId is {:?}",
+                        group.group_id, project_id, project.current_group_id
+                    ));
+                }
+            }
+        }
+
+        let target_relative_dir =
+            if validate_path_segment_for_migration(&group.group_id, "group id").is_ok() {
+                format!("projects/groups/{}", group.group_id)
+            } else {
+                String::new()
+            };
+        let status = migration_status(&group_blockers, &group_warnings);
+        for blocker in &group_blockers {
+            push_unique(&mut blockers, blocker.clone());
+        }
+        for warning in &group_warnings {
+            push_unique(&mut warnings, warning.clone());
+        }
+        group_plans.push(GroupMigrationPlan {
+            group_id: group.group_id.clone(),
+            title: group.title.clone(),
+            target_relative_dir,
+            project_ids: group.project_ids.clone(),
+            existing_project_count: group
+                .project_ids
+                .iter()
+                .filter(|project_id| present_project_ids.contains(*project_id))
+                .count(),
+            missing_project_ids,
+            status,
+            blockers: group_blockers,
+            warnings: group_warnings,
+        });
+    }
+
+    let invalid_group_ids = group_plans
+        .iter()
+        .filter(|group| group.status == "blocked")
+        .map(|group| group.group_id.clone())
+        .collect::<HashSet<_>>();
+    let valid_group_ids = group_plans
+        .iter()
+        .filter(|group| group.status != "blocked")
+        .map(|group| group.group_id.clone())
+        .collect::<HashSet<_>>();
+
+    let mut project_plans = Vec::new();
+    for project in &project_records {
+        let mut project_blockers = project.blockers.clone();
+        let project_warnings = project.warnings.clone();
+        if project_id_counts
+            .get(&project.project_id)
+            .copied()
+            .unwrap_or(0)
+            > 1
+        {
+            project_blockers.push(format!("Duplicate project id: {}", project.project_id));
+        }
+
+        let memberships = group_memberships
+            .get(&project.project_id)
+            .cloned()
+            .unwrap_or_default();
+        if memberships.len() > 1 {
+            project_blockers.push(format!(
+                "Project {} appears in multiple group.projectIds lists: {}",
+                project.project_id,
+                memberships.join(", ")
+            ));
+        }
+
+        match &project.current_group_id {
+            Some(group_id) => {
+                if !groups_metadata_trustworthy {
+                    project_blockers.push(format!(
+                        "Project {} has groupId {}, but groups.json is not trustworthy",
+                        project.project_id, group_id
+                    ));
+                } else if !group_index_by_id.contains_key(group_id) {
+                    project_blockers.push(format!(
+                        "Project {} references missing group {}",
+                        project.project_id, group_id
+                    ));
+                } else if invalid_group_ids.contains(group_id) {
+                    project_blockers.push(format!(
+                        "Project {} references blocked group {}",
+                        project.project_id, group_id
+                    ));
+                } else if !memberships.iter().any(|item| item == group_id) {
+                    project_blockers.push(format!(
+                        "Project {} has groupId {}, but that group.projectIds does not include it",
+                        project.project_id, group_id
+                    ));
+                }
+            }
+            None => {
+                if !memberships.is_empty() {
+                    project_blockers.push(format!(
+                        "Project {} is listed by group.projectIds but has no project.groupId: {}",
+                        project.project_id,
+                        memberships.join(", ")
+                    ));
+                }
+            }
+        }
+
+        let (target_bucket, target_group_id, target_relative_path) = if !project_blockers.is_empty()
+        {
+            ("blocked".to_string(), None, String::new())
+        } else if let Some(group_id) = &project.current_group_id {
+            if valid_group_ids.contains(group_id) {
+                (
+                    "grouped".to_string(),
+                    Some(group_id.clone()),
+                    format!("projects/groups/{}/{}.json", group_id, project.project_id),
+                )
+            } else {
+                ("blocked".to_string(), None, String::new())
+            }
+        } else {
+            (
+                "ungrouped".to_string(),
+                None,
+                format!("projects/ungrouped/{}.json", project.project_id),
+            )
+        };
+
+        if !target_relative_path.is_empty() {
+            let target_path = data_relative_path(&data_root, &target_relative_path);
+            match path_exists_for_migration(&target_path) {
+                Ok(true) => project_blockers.push(format!(
+                    "Target path already exists and would collide: {target_relative_path}"
+                )),
+                Ok(false) => {}
+                Err(err) => project_blockers.push(err),
+            }
+        }
+
+        let status = migration_status(&project_blockers, &project_warnings);
+        for blocker in &project_blockers {
+            push_unique(&mut blockers, blocker.clone());
+        }
+        for warning in &project_warnings {
+            push_unique(&mut warnings, warning.clone());
+        }
+        project_plans.push(ProjectMigrationPlan {
+            project_id: project.project_id.clone(),
+            project_title: project.project_title.clone(),
+            source_relative_path: project.source_relative_path.clone(),
+            target_relative_path,
+            current_group_id: project.current_group_id.clone(),
+            target_group_id,
+            target_bucket: if status == "blocked" {
+                "blocked".to_string()
+            } else {
+                target_bucket
+            },
+            status,
+            blockers: project_blockers,
+            warnings: project_warnings,
+        });
+    }
+
+    let mut target_path_indexes: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, plan) in project_plans.iter().enumerate() {
+        if !plan.target_relative_path.is_empty() {
+            target_path_indexes
+                .entry(plan.target_relative_path.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+    for (target_path, indexes) in target_path_indexes {
+        if indexes.len() <= 1 {
+            continue;
+        }
+        let message = format!("Multiple projects would target the same path: {target_path}");
+        push_unique(&mut blockers, message.clone());
+        for index in indexes {
+            let plan = &mut project_plans[index];
+            push_unique(&mut plan.blockers, message.clone());
+            plan.status = "blocked".to_string();
+            plan.target_bucket = "blocked".to_string();
+        }
+    }
+
+    let mut planned_operations = Vec::new();
+    let mut directory_operations = HashSet::new();
+    for plan in &project_plans {
+        if plan.status != "planned" {
+            if !plan.source_relative_path.is_empty() {
+                let op_notes = if plan.status == "blocked" {
+                    plan.blockers.clone()
+                } else {
+                    plan.warnings.clone()
+                };
+                planned_operations.push(MigrationPlannedOperation {
+                    operation_type: "moveProjectFile".to_string(),
+                    source_relative_path: plan.source_relative_path.clone(),
+                    target_relative_path: plan.target_relative_path.clone(),
+                    project_id: Some(plan.project_id.clone()),
+                    group_id: plan.target_group_id.clone(),
+                    status: plan.status.clone(),
+                    notes: op_notes,
+                });
+            }
+            continue;
+        }
+
+        let directory = if plan.target_bucket == "grouped" {
+            plan.target_group_id
+                .as_ref()
+                .map(|group_id| format!("projects/groups/{group_id}"))
+        } else {
+            Some("projects/ungrouped".to_string())
+        };
+        if let Some(directory) = directory {
+            if directory_operations.insert(directory.clone()) {
+                planned_operations.push(MigrationPlannedOperation {
+                    operation_type: "createDirectory".to_string(),
+                    source_relative_path: String::new(),
+                    target_relative_path: directory.clone(),
+                    project_id: None,
+                    group_id: plan.target_group_id.clone(),
+                    status: "planned".to_string(),
+                    notes: vec!["Planned only; no directory was created.".to_string()],
+                });
+            }
+        }
+        planned_operations.push(MigrationPlannedOperation {
+            operation_type: "moveProjectFile".to_string(),
+            source_relative_path: plan.source_relative_path.clone(),
+            target_relative_path: plan.target_relative_path.clone(),
+            project_id: Some(plan.project_id.clone()),
+            group_id: plan.target_group_id.clone(),
+            status: "planned".to_string(),
+            notes: vec!["Planned only; no file was moved.".to_string()],
+        });
+    }
+
+    for operation in &planned_operations {
+        if operation.status == "blocked" {
+            for note in &operation.notes {
+                push_unique(&mut blockers, note.clone());
+            }
+        } else if operation.status == "warning" {
+            for note in &operation.notes {
+                push_unique(&mut warnings, note.clone());
+            }
+        }
+    }
+
+    let planned_move_count = planned_operations
+        .iter()
+        .filter(|operation| {
+            operation.operation_type == "moveProjectFile" && operation.status == "planned"
+        })
+        .count();
+    let grouped_project_count = project_plans
+        .iter()
+        .filter(|plan| plan.status == "planned" && plan.target_bucket == "grouped")
+        .count();
+    let ungrouped_project_count = project_plans
+        .iter()
+        .filter(|plan| plan.status == "planned" && plan.target_bucket == "ungrouped")
+        .count();
+    let blocker_count = blockers.len();
+    let warning_count = warnings.len();
+
+    Ok(MigrationDryRunReport {
+        report_version: 1,
+        generated_at: now_string(),
+        source_data_dir: data_root.to_string_lossy().to_string(),
+        source_projects_dir: projects_dir.to_string_lossy().to_string(),
+        current_layout,
+        target_layout: "group-folder-v2".to_string(),
+        source_data_version,
+        target_data_version: 2,
+        summary: MigrationDryRunSummary {
+            project_file_count: source_project_file_count,
+            readable_project_count: project_records
+                .iter()
+                .filter(|project| !project.project_id.is_empty())
+                .count(),
+            grouped_project_count,
+            ungrouped_project_count,
+            group_count: group_records.len(),
+            planned_move_count,
+            blocker_count,
+            warning_count,
+        },
+        project_plans,
+        group_plans,
+        planned_operations,
+        blockers,
+        warnings,
+        dry_run_only: true,
+    })
 }
 
 #[tauri::command]
@@ -1259,7 +2149,8 @@ pub fn run() {
             delete_project,
             create_full_backup,
             list_full_backups,
-            restore_full_backup
+            restore_full_backup,
+            generate_migration_dry_run_plan
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
