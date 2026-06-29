@@ -263,6 +263,59 @@ Desktop development and desktop packaging require a working Rust/Tauri environme
 | Presentation mode               |       Not implemented | Planned future extension                      |
 | Real group-folder migration     |       Not implemented | Planned for v0.1.5                            |
 
+## Data Safety Demo
+
+Cheerio Flow treats local data safety as a first-class design goal.
+
+v0.1.4 focuses on preventing accidental local data loss caused by failed loads, broken JSON files, unsafe saves, restore failures, or future storage migrations.
+
+```mermaid
+flowchart TD
+    A[Local CheerioFlowData] --> B[Load database]
+
+    B -->|Valid data| C[Hydrate app state]
+    C --> D[Enable persistence gate]
+    D --> E[Normal save allowed]
+
+    B -->|Bad project JSON / load failure| F[Load failed]
+    F --> G[Disable persistence gate]
+    G --> H[Autosave blocked]
+    H --> I[Existing project files preserved]
+
+    A --> J[Read-only startup integrity scan]
+    J --> K[Report warnings / blockers]
+    K --> L[No automatic repair]
+    L --> I
+
+    A --> M[Manual full backup]
+    M --> N[CheerioFlowBackups / backup timestamp]
+    N --> O[Backup manifest]
+
+    N --> P[Restore selected backup]
+    P --> Q[Create pre-restore backup]
+    Q --> R[Copy into staging directory]
+    R --> S[Rename current data to before-restore]
+    S --> T[Activate restored CheerioFlowData]
+    T --> U[Reload database]
+
+    R -->|Failure| V[Rollback attempted]
+    S -->|Failure| V
+    V --> I
+
+    A --> W[Migration dry-run]
+    W --> X[Analyze future group-folder layout]
+    X --> Y[Generate report only]
+    Y --> Z[No files created, moved, deleted, or rewritten]
+```
+
+The diagram above shows the intended v0.1.4 safety model:
+
+- failed loads disable persistence instead of saving empty state;
+- startup integrity scanning is read-only;
+- full backup copies the active data folder before risky operations;
+- restore uses pre-restore backup, staging, rename, and rollback;
+- migration dry-run produces a report only and does not modify files.
+
 ## Data safety features
 
 | Safety feature               | Description                                             |
