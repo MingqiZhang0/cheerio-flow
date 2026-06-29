@@ -2141,6 +2141,7 @@ fn delete_project(app: tauri::AppHandle, project_id: String) -> Result<StorageRe
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             load_database,
             save_database,

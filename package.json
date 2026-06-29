@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
     "@xyflow/react": "^12.6.4",
     "katex": "^0.16.21",
     "lucide-react": "^0.468.0",

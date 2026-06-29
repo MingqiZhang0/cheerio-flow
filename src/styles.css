@@ -59,12 +59,13 @@ button {
   min-width: 0;
   max-width: 100vw;
   height: 100%;
+  min-height: 0;
   position: relative;
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
-  overflow-x: hidden;
+  overflow: hidden;
   border-right: 1px solid #ccd8d4;
   background: #f7faf8;
 }
@@ -237,13 +238,133 @@ button {
   opacity: 0.68;
 }
 
-.project-list {
-  flex: 1;
+.storage-root-actions {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+}
+
+.project-sidebar-body {
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.project-browser-panel {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 180px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.project-list {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
   overflow-x: hidden;
   padding: 0 12px 12px;
+}
+
+.sidebar-lower-area {
+  flex: 0 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-top: 1px solid #d8e1de;
+}
+
+.project-details-panel {
+  flex: 0 0 auto;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.sidebar-utility-drawer {
+  --storage-drawer-height: 360px;
+  flex: 0 1 var(--storage-drawer-height);
+  min-width: 0;
+  min-height: 160px;
+  max-height: var(--storage-drawer-height);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-top: 1px solid #d8e1de;
+  background: #edf4f1;
+}
+
+.sidebar-utility-drawer.dragging {
+  user-select: none;
+}
+
+.storage-drawer-resize-handle {
+  flex: 0 0 10px;
+  position: relative;
+  cursor: ns-resize;
+  touch-action: none;
+  background: transparent;
+}
+
+.storage-drawer-resize-handle::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 4px;
+  width: 46px;
+  height: 3px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: #b8c9c5;
+}
+
+.storage-drawer-resize-handle:hover::after,
+.sidebar-utility-drawer.dragging .storage-drawer-resize-handle::after {
+  background: #6f9993;
+}
+
+.storage-drawer-toggle,
+.storage-drawer-collapsed-button {
+  width: calc(100% - 24px);
+  min-width: 0;
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  margin: 0 12px 10px;
+  border: 1px solid #c8d5d1;
+  border-radius: 6px;
+  color: #25494d;
+  background: #ffffff;
+  font-weight: 800;
+}
+
+.storage-drawer-toggle:hover,
+.storage-drawer-collapsed-button:hover {
+  border-color: #77a79f;
+  background: #e8f4f0;
+}
+
+.storage-drawer-collapsed-button {
+  flex: 0 0 auto;
+  margin-top: 10px;
+}
+
+.sidebar-utility-scroll {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .project-group {
@@ -301,10 +422,9 @@ button {
 .project-item {
   min-width: 0;
   max-width: 100%;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 28px;
-  align-items: center;
-  gap: 4px;
+  overflow: visible;
+  display: flex;
+  flex-direction: column;
   border: 1px solid #dce5e2;
   border-radius: 7px;
   background: #ffffff;
@@ -313,6 +433,13 @@ button {
 .project-item.active {
   border-color: #78a89f;
   background: #e7f4ef;
+}
+
+.project-list-row-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px 28px;
+  align-items: center;
+  gap: 4px;
 }
 
 .project-pick {
@@ -333,6 +460,32 @@ button {
   font-weight: 800;
 }
 
+.project-row-menu {
+  border-top: 1px solid #dce5e2;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-radius: 0 0 7px 7px;
+  background: #f8faf9;
+}
+
+.project-row-menu button {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  border-radius: 4px;
+  padding: 7px 8px;
+  text-align: left;
+  color: #263c3f;
+  background: transparent;
+  font-weight: 750;
+}
+
+.project-row-menu button:hover {
+  background: #e8f4f0;
+}
+
 .project-editor {
   min-width: 0;
   max-width: 100%;
@@ -340,7 +493,6 @@ button {
   gap: 9px;
   overflow-x: hidden;
   padding: 12px;
-  border-top: 1px solid #d8e1de;
   background: #f3f7f5;
 }
 

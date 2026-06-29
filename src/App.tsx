@@ -16,10 +16,13 @@ import {
   type NodeProps,
   type ReactFlowInstance,
 } from "@xyflow/react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import katex from "katex";
 import {
   Archive,
   Box,
+  ChevronDown,
+  ChevronUp,
   ChevronsLeft,
   ChevronsRight,
   Circle,
@@ -27,12 +30,13 @@ import {
   Eye,
   EyeOff,
   FilePlus2,
+  FolderOpen,
   FolderPlus,
   GitBranch,
   GripVertical,
   Hexagon,
   Layers3,
-  PanelRightClose,
+  MoreHorizontal,
   PanelRightOpen,
   Pin,
   PinOff,
@@ -91,6 +95,7 @@ type SaveStatus = "saving" | "saved" | "error";
 type BackupStatus = "idle" | "running" | "success" | "error";
 type RestoreStatus = "idle" | "loading" | "running" | "success" | "error";
 type MigrationDryRunStatus = "idle" | "running" | "success" | "error";
+type FolderPickerStatus = "idle" | "opening" | "error";
 type CtrlWheelState = { x: number; y: number } | null;
 type MoveMode = "x" | "y" | "free";
 type ResizeEdge = "right" | "bottom" | "corner";
@@ -102,6 +107,10 @@ const LEFT_SIDEBAR_MAX_WIDTH = 560;
 const RIGHT_SIDEBAR_DEFAULT_WIDTH = 340;
 const RIGHT_SIDEBAR_MIN_WIDTH = 280;
 const RIGHT_SIDEBAR_MAX_WIDTH = 600;
+const PROJECT_BROWSER_MIN_HEIGHT = 180;
+const STORAGE_DRAWER_DEFAULT_HEIGHT = 360;
+const STORAGE_DRAWER_MIN_HEIGHT = 160;
+const STORAGE_DRAWER_MAX_RATIO = 0.65;
 const MODULE_RESIZE_MIN_WIDTH = 170;
 const MODULE_RESIZE_MAX_WIDTH = 2400;
 const MODULE_RESIZE_MIN_HEIGHT = 96;
@@ -141,6 +150,12 @@ function getPreviewItems<T>(items: T[], limit: number) {
     visible: items.slice(0, limit),
     remaining: Math.max(0, items.length - limit),
   };
+}
+
+function isCheerioFlowDataFolder(path: string) {
+  const normalized = path.replace(/[\\/]+$/, "");
+  const segments = normalized.split(/[\\/]/).filter(Boolean);
+  return segments[segments.length - 1] === "CheerioFlowData";
 }
 
 function isResizableShape(shape: ModuleShape) {
@@ -447,7 +462,7 @@ function SidebarButton({
   active?: boolean;
 }) {
   return (
-    <button className={`icon-button ${active ? "active" : ""}`} type="button" title={title} onClick={onClick}>
+    <button className={`icon-button ${active ? "active" : ""}`} type="button" title={title} aria-label={title} onClick={onClick}>
       {children}
     </button>
   );
@@ -462,6 +477,12 @@ function AppShell() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [groups, setGroups] = useState<ProjectGroup[]>([]);
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
+  const [isProjectDetailsOpen, setIsProjectDetailsOpen] = useState(false);
+  const [projectActionMenuId, setProjectActionMenuId] = useState<string | null>(null);
+  const [isStorageDrawerOpen, setIsStorageDrawerOpen] = useState(false);
+  const [storageDrawerHeight, setStorageDrawerHeight] = useState(STORAGE_DRAWER_DEFAULT_HEIGHT);
+  const [lastStorageDrawerHeight, setLastStorageDrawerHeight] = useState(STORAGE_DRAWER_DEFAULT_HEIGHT);
+  const [isDraggingStorageDrawer, setIsDraggingStorageDrawer] = useState(false);
   const [projectSidebarCollapsed, setProjectSidebarCollapsed] = useState(false);
   const [propertiesSidebarCollapsed, setPropertiesSidebarCollapsed] = useState(true);
   const [leftSidebarWidth, setLeftSidebarWidth] = useState(LEFT_SIDEBAR_DEFAULT_WIDTH);
@@ -480,6 +501,9 @@ function AppShell() {
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [storageReport, setStorageReport] = useState<StorageReport | null>(null);
   const [storageRootInput, setStorageRootInput] = useState("");
+  const [folderPickerStatus, setFolderPickerStatus] = useState<FolderPickerStatus>("idle");
+  const [folderPickerError, setFolderPickerError] = useState<string | null>(null);
+  const [storageRootInputWarning, setStorageRootInputWarning] = useState<string | null>(null);
   const [backupStatus, setBackupStatus] = useState<BackupStatus>("idle");
   const [backupReport, setBackupReport] = useState<BackupReport | null>(null);
   const [backupError, setBackupError] = useState<string | null>(null);
@@ -498,6 +522,7 @@ function AppShell() {
   const [consoleError, setConsoleError] = useState("");
   const [ctrlWheel, setCtrlWheel] = useState<CtrlWheelState>(null);
   const consoleInputRef = useRef<HTMLInputElement | null>(null);
+  const projectSidebarBodyRef = useRef<HTMLDivElement | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const isVisualDraggingRef = useRef(false);
   const flowNodesRef = useRef<ModuleNodeType[]>([]);
@@ -509,6 +534,13 @@ function AppShell() {
     startX: number;
     startWidth: number;
     latestWidth: number;
+    pointerId: number;
+    element: HTMLElement;
+  } | null>(null);
+  const storageDrawerDragRef = useRef<{
+    startY: number;
+    startHeight: number;
+    latestHeight: number;
     pointerId: number;
     element: HTMLElement;
   } | null>(null);
@@ -619,6 +651,20 @@ function AppShell() {
     }
   }, []);
 
+  const refreshBackups = useCallback(async () => {
+    setRestoreStatus("loading");
+    setRestoreError(null);
+    try {
+      const backups = await listFullBackups();
+      setRestoreBackups(backups);
+      setSelectedBackupId((current) => (current && backups.some((backup) => backup.backupId === current) ? current : backups[0]?.backupId ?? ""));
+      setRestoreStatus("idle");
+    } catch (reason: unknown) {
+      setRestoreStatus("error");
+      setRestoreError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, []);
+
   const hydrateLoadedData = useCallback(
     (data: PersistedData) => {
       const normalizedProjects = normalizeProjects(data.projects);
@@ -665,6 +711,7 @@ function AppShell() {
       .then((data) => {
         if (cancelled) return;
         hydrateLoadedData(data);
+        void refreshBackups();
       })
       .catch((reason: unknown) => {
         console.error("Failed to load Cheerio Flow data", reason);
@@ -679,11 +726,12 @@ function AppShell() {
         loadedRef.current = false;
         setSaveStatus("error");
         setLoaded(true);
+        void refreshBackups();
       });
     return () => {
       cancelled = true;
     };
-  }, [hydrateLoadedData]);
+  }, [hydrateLoadedData, refreshBackups]);
 
   useEffect(() => {
     if (!loaded || !canPersistRef.current) return;
@@ -721,6 +769,7 @@ function AppShell() {
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (sidebarResizeRef.current) return;
+      if (storageDrawerDragRef.current) return;
       if (resizeDragRef.current) return;
       if (gizmoDragRef.current && !capturedPointerRef.current) {
         resetInteractionStateRef.current();
@@ -806,11 +855,17 @@ function AppShell() {
       if (sidebarResize?.element.hasPointerCapture?.(sidebarResize.pointerId)) {
         sidebarResize.element.releasePointerCapture(sidebarResize.pointerId);
       }
+      const storageDrawerDrag = storageDrawerDragRef.current;
+      if (storageDrawerDrag?.element.hasPointerCapture?.(storageDrawerDrag.pointerId)) {
+        storageDrawerDrag.element.releasePointerCapture(storageDrawerDrag.pointerId);
+      }
       sidebarResizeRef.current = null;
+      storageDrawerDragRef.current = null;
       capturedPointerRef.current = null;
       gizmoDragRef.current = null;
       resizeDragRef.current = null;
       isVisualDraggingRef.current = false;
+      setIsDraggingStorageDrawer(false);
       document.body.style.userSelect = "";
       document.body.style.cursor = "";
       document.body.style.overflow = "";
@@ -830,7 +885,7 @@ function AppShell() {
 
   useEffect(() => {
     const resetStaleDrag = () => {
-      if (!gizmoDragRef.current && !resizeDragRef.current && isVisualDraggingRef.current) resetInteractionState();
+      if (!gizmoDragRef.current && !resizeDragRef.current && !storageDrawerDragRef.current && isVisualDraggingRef.current) resetInteractionState();
     };
     window.addEventListener("pointerup", resetStaleDrag);
     window.addEventListener("pointercancel", resetStaleDrag);
@@ -994,6 +1049,93 @@ function AppShell() {
     document.addEventListener("pointerup", finishResize);
   }, [leftSidebarWidth, resetInteractionState, rightSidebarWidth]);
 
+  const getStorageDrawerMaxHeight = useCallback(() => {
+    const bodyHeight = projectSidebarBodyRef.current?.clientHeight ?? window.innerHeight;
+    const detailsPanel = projectSidebarBodyRef.current?.querySelector<HTMLElement>(".project-details-panel");
+    const detailsHeight = detailsPanel?.offsetHeight ?? 0;
+    const maxByRatio = Math.floor(bodyHeight * STORAGE_DRAWER_MAX_RATIO);
+    const maxByAvailableSpace = Math.floor(bodyHeight - PROJECT_BROWSER_MIN_HEIGHT - detailsHeight);
+    return Math.max(STORAGE_DRAWER_MIN_HEIGHT, Math.min(maxByRatio, maxByAvailableSpace));
+  }, []);
+
+  const clampStorageDrawerHeight = useCallback(
+    (height: number) => clamp(height, STORAGE_DRAWER_MIN_HEIGHT, getStorageDrawerMaxHeight()),
+    [getStorageDrawerMaxHeight],
+  );
+
+  const hideStorageDrawer = useCallback(() => {
+    const nextHeight = clampStorageDrawerHeight(storageDrawerHeight);
+    setLastStorageDrawerHeight(nextHeight);
+    setIsStorageDrawerOpen(false);
+    setIsDraggingStorageDrawer(false);
+  }, [clampStorageDrawerHeight, storageDrawerHeight]);
+
+  const showStorageDrawer = useCallback(() => {
+    const nextHeight = clampStorageDrawerHeight(lastStorageDrawerHeight || STORAGE_DRAWER_DEFAULT_HEIGHT);
+    setStorageDrawerHeight(nextHeight);
+    setLastStorageDrawerHeight(nextHeight);
+    setIsStorageDrawerOpen(true);
+  }, [clampStorageDrawerHeight, lastStorageDrawerHeight]);
+
+  const startStorageDrawerResize = useCallback(
+    (event: React.PointerEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      resetInteractionState();
+
+      const pointerTarget = event.currentTarget as HTMLElement;
+      const startHeight = clampStorageDrawerHeight(storageDrawerHeight);
+      storageDrawerDragRef.current = {
+        startY: event.clientY,
+        startHeight,
+        latestHeight: startHeight,
+        pointerId: event.pointerId,
+        element: pointerTarget,
+      };
+      pointerTarget.setPointerCapture?.(event.pointerId);
+      setIsDraggingStorageDrawer(true);
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "ns-resize";
+
+      const onPointerMove = (moveEvent: PointerEvent) => {
+        const active = storageDrawerDragRef.current;
+        if (!active) return;
+        const delta = moveEvent.clientY - active.startY;
+        const nextHeight = clampStorageDrawerHeight(active.startHeight - delta);
+        active.latestHeight = nextHeight;
+        setStorageDrawerHeight(nextHeight);
+      };
+
+      const finishResize = () => {
+        const active = storageDrawerDragRef.current;
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", finishResize);
+        window.removeEventListener("pointercancel", finishResize);
+        window.removeEventListener("blur", finishResize);
+        document.removeEventListener("mouseup", finishResize);
+        document.removeEventListener("pointerup", finishResize);
+        if (active?.element.hasPointerCapture?.(active.pointerId)) {
+          active.element.releasePointerCapture(active.pointerId);
+        }
+        if (active) {
+          setLastStorageDrawerHeight(active.latestHeight);
+        }
+        storageDrawerDragRef.current = null;
+        setIsDraggingStorageDrawer(false);
+        document.body.style.userSelect = "";
+        document.body.style.cursor = "";
+      };
+
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", finishResize);
+      window.addEventListener("pointercancel", finishResize);
+      window.addEventListener("blur", finishResize);
+      document.addEventListener("mouseup", finishResize);
+      document.addEventListener("pointerup", finishResize);
+    },
+    [clampStorageDrawerHeight, resetInteractionState, storageDrawerHeight],
+  );
+
   const startResizeDrag = useCallback(
     (event: React.PointerEvent, edge: ResizeEdge) => {
       event.preventDefault();
@@ -1148,12 +1290,14 @@ function AppShell() {
     const applyProject = (previous: Project[]) => [...previous, project];
     updateProjects(applyProject);
     setCurrentProjectId(project.id);
+    setProjectActionMenuId(null);
     setSelectedElement(null);
     setPropertiesSidebarCollapsed(true);
   }, [projects.length, resetInteractionState, updateProjects]);
 
   const selectProject = useCallback(
     async (projectId: string) => {
+      setProjectActionMenuId(null);
       if (projectId === currentProject?.id) return;
       resetInteractionState({ clearPlacement: true });
       const projectsForSave = commitFlowNodePositionsToProject();
@@ -1180,6 +1324,8 @@ function AppShell() {
       })),
     );
     setCurrentProjectId(nextProjects[0]?.id ?? null);
+    setIsProjectDetailsOpen(false);
+    setProjectActionMenuId(null);
     setSelectedElement(null);
     removeProject(projectId).catch((reason: unknown) => {
       console.error("Failed to delete project", reason);
@@ -1215,6 +1361,43 @@ function AppShell() {
     );
   }, [updateProjects]);
 
+  const handleStorageRootInputChange = useCallback((value: string) => {
+    setStorageRootInput(value);
+    setStorageRootInputWarning(isCheerioFlowDataFolder(value) ? "You selected a folder named CheerioFlowData. Choose its parent folder so the app can create/use CheerioFlowData inside it." : null);
+  }, []);
+
+  const handleBrowseStorageRoot = useCallback(async () => {
+    setFolderPickerStatus("opening");
+    setFolderPickerError(null);
+
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Choose storage parent folder",
+      });
+      const selectedPath = Array.isArray(selected) ? selected[0] ?? "" : selected ?? "";
+
+      if (!selectedPath) {
+        setFolderPickerStatus("idle");
+        return;
+      }
+
+      setStorageRootInput(selectedPath);
+      setStorageRootInputWarning(isCheerioFlowDataFolder(selectedPath) ? "You selected a folder named CheerioFlowData. Choose its parent folder so the app can create/use CheerioFlowData inside it." : null);
+      setFolderPickerStatus("idle");
+    } catch (reason: unknown) {
+      setFolderPickerStatus("error");
+      setFolderPickerError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, []);
+
+  const openProjectDetails = useCallback((projectId: string) => {
+    setCurrentProjectId(projectId);
+    setIsProjectDetailsOpen(true);
+    setProjectActionMenuId(null);
+  }, []);
+
   const applyStorageRoot = useCallback(async () => {
     setSaveStatus("saving");
     const shouldSaveCurrentData = canPersistRef.current;
@@ -1228,6 +1411,7 @@ function AppShell() {
         ? await chooseStorageRoot(storageRootInput, projectsRef.current, groupsRef.current, appStateRef.current)
         : await switchStorageRoot(storageRootInput);
       hydrateLoadedData(data);
+      void refreshBackups();
       setSaveStatus("saved");
       setError(null);
       console.info(shouldSaveCurrentData ? "Cheerio Flow storage root set" : "Cheerio Flow storage root switched", data.report);
@@ -1237,7 +1421,7 @@ function AppShell() {
       setSaveStatus("error");
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, [hydrateLoadedData, storageRootInput]);
+  }, [hydrateLoadedData, refreshBackups, storageRootInput]);
 
   const handleCreateFullBackup = useCallback(async () => {
     if (!canPersistRef.current) {
@@ -1261,18 +1445,8 @@ function AppShell() {
   }, []);
 
   const handleRefreshFullBackups = useCallback(async () => {
-    setRestoreStatus("loading");
-    setRestoreError(null);
-    try {
-      const backups = await listFullBackups();
-      setRestoreBackups(backups);
-      setSelectedBackupId((current) => (current && backups.some((backup) => backup.backupId === current) ? current : backups[0]?.backupId ?? ""));
-      setRestoreStatus("idle");
-    } catch (reason: unknown) {
-      setRestoreStatus("error");
-      setRestoreError(reason instanceof Error ? reason.message : String(reason));
-    }
-  }, []);
+    await refreshBackups();
+  }, [refreshBackups]);
 
   const handleRestoreFullBackup = useCallback(async () => {
     if (!selectedBackupId) {
@@ -1610,6 +1784,38 @@ function AppShell() {
   const migrationBlockerPreview = migrationDryRunReport ? getPreviewItems(migrationDryRunReport.blockers, 10) : null;
   const migrationWarningPreview = migrationDryRunReport ? getPreviewItems(migrationDryRunReport.warnings, 10) : null;
   const migrationOperationPreview = migrationDryRunReport ? getPreviewItems(migrationDryRunReport.plannedOperations, 20) : null;
+  const effectiveStorageDrawerHeight = clampStorageDrawerHeight(storageDrawerHeight);
+  const storageRootControls = (
+    <>
+      <label>
+        Storage parent folder
+        <input value={storageRootInput} onChange={(event) => handleStorageRootInputChange(event.target.value)} />
+      </label>
+      <div className="empty-hint">Choose a parent folder. CheerioFlowData will be created inside it.</div>
+      {storageRootInputWarning && (
+        <div className="backup-result backup-result-warning">
+          <span>{storageRootInputWarning}</span>
+        </div>
+      )}
+      {folderPickerStatus === "error" && folderPickerError && (
+        <div className="backup-result backup-result-error">
+          <strong>Could not open folder picker: {folderPickerError}</strong>
+        </div>
+      )}
+    </>
+  );
+  const storageRootActions = (applyLabel: string) => (
+    <div className="storage-root-actions">
+      <button className="action-button" type="button" onClick={() => void handleBrowseStorageRoot()} disabled={folderPickerStatus === "opening"}>
+        <FolderOpen size={15} />
+        {folderPickerStatus === "opening" ? "Opening..." : "Browse..."}
+      </button>
+      <button className="action-button" type="button" onClick={() => void applyStorageRoot()}>
+        <Save size={15} />
+        {applyLabel}
+      </button>
+    </div>
+  );
   const backupRestorePanel = (
     <>
       <button className="action-button" type="button" onClick={() => void handleCreateFullBackup()} disabled={backupStatus === "running" || !canPersistRef.current}>
@@ -1820,159 +2026,177 @@ function AppShell() {
               </button>
             </div>
 
-            <div className="project-list">
-              {currentProjectGroups.map((group) => {
-                const GroupIcon = group.pinned ? Pin : PinOff;
-                const groupProjects = sortPinnedFirst(projects.filter((project) => project.groupId === group.id));
-                const collapsed = collapsedGroupIds.has(group.id);
-                return (
-                  <section className="project-group" key={group.id}>
-                    <div className="group-header">
-                      <button
-                        className="collapse-button"
-                        type="button"
-                        onClick={() =>
-                          setCollapsedGroupIds((previous) => {
-                            const next = new Set(previous);
-                            if (next.has(group.id)) next.delete(group.id);
-                            else next.add(group.id);
-                            return next;
-                          })
-                        }
-                      >
-                        {collapsed ? <EyeOff size={14} /> : <Eye size={14} />}
-                      </button>
-                      <input value={group.title} onChange={(event) => updateGroup(group.id, (item) => ({ ...item, title: event.target.value }))} />
-                      <button className="tiny-button" type="button" onClick={() => updateGroup(group.id, (item) => ({ ...item, pinned: !item.pinned }))}>
-                        <GroupIcon size={14} />
-                      </button>
-                      <button className="tiny-button danger" type="button" onClick={() => deleteGroup(group.id)}>
-                        <Trash2 size={14} />
+            <div className="project-sidebar-body" ref={projectSidebarBodyRef}>
+              <section className="project-browser-panel">
+                <div className="project-list">
+                  {currentProjectGroups.map((group) => {
+                    const GroupIcon = group.pinned ? Pin : PinOff;
+                    const groupProjects = sortPinnedFirst(projects.filter((project) => project.groupId === group.id));
+                    const collapsed = collapsedGroupIds.has(group.id);
+                    return (
+                      <section className="project-group" key={group.id}>
+                        <div className="group-header">
+                          <button
+                            className="collapse-button"
+                            type="button"
+                            onClick={() =>
+                              setCollapsedGroupIds((previous) => {
+                                const next = new Set(previous);
+                                if (next.has(group.id)) next.delete(group.id);
+                                else next.add(group.id);
+                                return next;
+                              })
+                            }
+                          >
+                            {collapsed ? <EyeOff size={14} /> : <Eye size={14} />}
+                          </button>
+                          <input value={group.title} onChange={(event) => updateGroup(group.id, (item) => ({ ...item, title: event.target.value }))} />
+                          <button className="tiny-button" type="button" onClick={() => updateGroup(group.id, (item) => ({ ...item, pinned: !item.pinned }))}>
+                            <GroupIcon size={14} />
+                          </button>
+                          <button className="tiny-button danger" type="button" onClick={() => deleteGroup(group.id)}>
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                        <div className="group-meta">Created {group.createdAt}</div>
+                        {!collapsed && (
+                          <div className="project-stack">
+                            {groupProjects.length === 0 ? (
+                              <div className="empty-hint">Empty group</div>
+                            ) : (
+                              groupProjects.map((project) => (
+                                <ProjectListItem
+                                  key={project.id}
+                                  project={project}
+                                  active={project.id === currentProject?.id}
+                                  menuOpen={projectActionMenuId === project.id}
+                                  onSelect={() => selectProject(project.id)}
+                                  onTogglePin={() => updateProject(project.id, (item) => ({ ...item, pinned: !item.pinned }))}
+                                  onToggleMenu={() => setProjectActionMenuId((current) => (current === project.id ? null : project.id))}
+                                  onOpenDetails={() => openProjectDetails(project.id)}
+                                />
+                              ))
+                            )}
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })}
+
+                  <section className="project-group">
+                    <div className="group-header simple">
+                      <GripVertical size={15} />
+                      <span>Ungrouped</span>
+                    </div>
+                    <div className="project-stack">
+                      {ungroupedProjects.map((project) => (
+                        <ProjectListItem
+                          key={project.id}
+                          project={project}
+                          active={project.id === currentProject?.id}
+                          menuOpen={projectActionMenuId === project.id}
+                          onSelect={() => selectProject(project.id)}
+                          onTogglePin={() => updateProject(project.id, (item) => ({ ...item, pinned: !item.pinned }))}
+                          onToggleMenu={() => setProjectActionMenuId((current) => (current === project.id ? null : project.id))}
+                          onOpenDetails={() => openProjectDetails(project.id)}
+                        />
+                      ))}
+                    </div>
+                  </section>
+                </div>
+              </section>
+
+              <div className="sidebar-lower-area">
+                {currentProject && isProjectDetailsOpen && (
+                  <section className="project-editor project-details-panel">
+                    <div className="restore-title-row">
+                      <strong>Project Details</strong>
+                      <button className="tiny-button" type="button" onClick={() => setIsProjectDetailsOpen(false)}>
+                        <X size={14} />
                       </button>
                     </div>
-                    <div className="group-meta">Created {group.createdAt}</div>
-                    {!collapsed && (
-                      <div className="project-stack">
-                        {groupProjects.length === 0 ? (
-                          <div className="empty-hint">Empty group</div>
-                        ) : (
-                          groupProjects.map((project) => (
-                            <ProjectListItem
-                              key={project.id}
-                              project={project}
-                              active={project.id === currentProject?.id}
-                              onSelect={() => selectProject(project.id)}
-                              onTogglePin={() => updateProject(project.id, (item) => ({ ...item, pinned: !item.pinned }))}
-                            />
-                          ))
-                        )}
-                      </div>
-                    )}
+                    <label>
+                      Title
+                      <input value={currentProject.title} onChange={(event) => updateCurrentProject((project) => ({ ...project, title: event.target.value }))} />
+                    </label>
+                    <label>
+                      Category
+                      <select
+                        value={currentProject.category}
+                        onChange={(event) => updateCurrentProject((project) => ({ ...project, category: event.target.value as Project["category"] }))}
+                      >
+                        {PROJECT_CATEGORIES.map((category) => (
+                          <option key={category} value={category}>
+                            {category}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      Group
+                      <select value={currentProject.groupId ?? ""} onChange={(event) => moveProjectToGroup(currentProject.id, event.target.value || null)}>
+                        <option value="">Ungrouped</option>
+                        {groups.map((group) => (
+                          <option key={group.id} value={group.id}>
+                            {group.title}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="readonly-row">
+                      <span>Created</span>
+                      <strong>{currentProject.createdAt}</strong>
+                    </div>
+                    <label className="check-row">
+                      <input
+                        type="checkbox"
+                        checked={currentProject.pinned}
+                        onChange={(event) => updateCurrentProject((project) => ({ ...project, pinned: event.target.checked }))}
+                      />
+                      Pinned
+                    </label>
+                    <button className="delete-button" type="button" onClick={deleteCurrentProject}>
+                      <Trash2 size={16} />
+                      Delete Current Project
+                    </button>
                   </section>
-                );
-              })}
+                )}
 
-              <section className="project-group">
-                <div className="group-header simple">
-                  <GripVertical size={15} />
-                  <span>Ungrouped</span>
-                </div>
-                <div className="project-stack">
-                  {ungroupedProjects.map((project) => (
-                    <ProjectListItem
-                      key={project.id}
-                      project={project}
-                      active={project.id === currentProject?.id}
-                      onSelect={() => selectProject(project.id)}
-                      onTogglePin={() => updateProject(project.id, (item) => ({ ...item, pinned: !item.pinned }))}
-                    />
-                  ))}
-                </div>
-              </section>
-            </div>
-
-            {currentProject && (
-              <section className="project-editor">
-                <div className="editor-title">Current Project</div>
-                <label>
-                  Title
-                  <input value={currentProject.title} onChange={(event) => updateCurrentProject((project) => ({ ...project, title: event.target.value }))} />
-                </label>
-                <label>
-                  Category
-                  <select
-                    value={currentProject.category}
-                    onChange={(event) => updateCurrentProject((project) => ({ ...project, category: event.target.value as Project["category"] }))}
+                {isStorageDrawerOpen ? (
+                  <section
+                    className={`sidebar-utility-drawer ${isDraggingStorageDrawer ? "dragging" : ""}`}
+                    style={{ "--storage-drawer-height": `${effectiveStorageDrawerHeight}px` } as React.CSSProperties}
                   >
-                    {PROJECT_CATEGORIES.map((category) => (
-                      <option key={category} value={category}>
-                        {category}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  Group
-                  <select value={currentProject.groupId ?? ""} onChange={(event) => moveProjectToGroup(currentProject.id, event.target.value || null)}>
-                    <option value="">Ungrouped</option>
-                    {groups.map((group) => (
-                      <option key={group.id} value={group.id}>
-                        {group.title}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <div className="readonly-row">
-                  <span>Created</span>
-                  <strong>{currentProject.createdAt}</strong>
-                </div>
-                <label className="check-row">
-                  <input
-                    type="checkbox"
-                    checked={currentProject.pinned}
-                    onChange={(event) => updateCurrentProject((project) => ({ ...project, pinned: event.target.checked }))}
-                  />
-                  Pinned
-                </label>
-                <button className="delete-button" type="button" onClick={deleteCurrentProject}>
-                  <Trash2 size={16} />
-                  Delete Current Project
-                </button>
-                <label>
-                  Storage parent folder
-                  <input value={storageRootInput} onChange={(event) => setStorageRootInput(event.target.value)} />
-                </label>
-                <div className="empty-hint">Choose a parent folder. CheerioFlowData will be created inside it.</div>
-                <button className="action-button" type="button" onClick={() => void applyStorageRoot()}>
-                  <Save size={15} />
-                  Apply Storage Path
-                </button>
-                <div className="readonly-row">
-                  <span>Data directory</span>
-                  <strong className="path-text">{dataDir || "unavailable"}</strong>
-                </div>
-                {backupRestorePanel}
-              </section>
-            )}
-            {!currentProject && !canPersistRef.current && (
-              <section className="project-editor">
-                <div className="editor-title">Storage Recovery</div>
-                <label>
-                  Storage parent folder
-                  <input value={storageRootInput} onChange={(event) => setStorageRootInput(event.target.value)} />
-                </label>
-                <div className="empty-hint">Choose a parent folder. CheerioFlowData will be created inside it.</div>
-                <button className="action-button" type="button" onClick={() => void applyStorageRoot()}>
-                  <Save size={15} />
-                  Switch and Reload
-                </button>
-                <div className="readonly-row">
-                  <span>Data directory</span>
-                  <strong className="path-text">{dataDir || "unavailable"}</strong>
-                </div>
-                {backupRestorePanel}
-              </section>
-            )}
+                    <div
+                      className="storage-drawer-resize-handle"
+                      role="separator"
+                      aria-orientation="horizontal"
+                      aria-label="Resize storage drawer"
+                      onPointerDown={startStorageDrawerResize}
+                    />
+                    <button className="storage-drawer-toggle" type="button" onClick={hideStorageDrawer}>
+                      <ChevronDown size={15} />
+                      Hide Storage
+                    </button>
+                    <div className="project-editor sidebar-utility-scroll">
+                      <div className="editor-title">{canPersistRef.current ? "Storage" : "Storage Recovery"}</div>
+                      {storageRootControls}
+                      {storageRootActions(canPersistRef.current ? "Apply Storage Path" : "Switch and Reload")}
+                      <div className="readonly-row">
+                        <span>Data directory</span>
+                        <strong className="path-text">{dataDir || "unavailable"}</strong>
+                      </div>
+                      {backupRestorePanel}
+                    </div>
+                  </section>
+                ) : (
+                  <button className="storage-drawer-collapsed-button" type="button" onClick={showStorageDrawer}>
+                    <ChevronUp size={15} />
+                    Storage
+                  </button>
+                )}
+              </div>
+            </div>
             <div
               className="sidebar-resizer sidebar-resizer-left"
               role="separator"
@@ -2002,12 +2226,6 @@ function AppShell() {
               <Shapes size={17} />
               Module
             </button>
-            <SidebarButton
-              title={propertiesSidebarCollapsed ? "Show properties" : "Hide properties"}
-              onClick={() => setPropertiesSidebarCollapsed((collapsed) => !collapsed)}
-            >
-              {propertiesSidebarCollapsed ? <PanelRightOpen size={18} /> : <PanelRightClose size={18} />}
-            </SidebarButton>
           </div>
           {shapeMenuOpen && (
             <div className="shape-menu">
@@ -2138,6 +2356,7 @@ function AppShell() {
         selectedArrow={selectedArrow}
         width={rightSidebarWidth}
         onResizeStart={(event) => startSidebarResize(event, "right")}
+        onOpen={() => setPropertiesSidebarCollapsed(false)}
         onClose={() => setPropertiesSidebarCollapsed(true)}
         onUpdateModule={(moduleId, updater) =>
           updateModuleInCurrentProject(moduleId, updater)
@@ -2329,26 +2548,58 @@ function CommandConsole({
 function ProjectListItem({
   project,
   active,
+  menuOpen,
   onSelect,
   onTogglePin,
+  onToggleMenu,
+  onOpenDetails,
 }: {
   project: Project;
   active: boolean;
+  menuOpen: boolean;
   onSelect: () => void;
   onTogglePin: () => void;
+  onToggleMenu: () => void;
+  onOpenDetails: () => void;
 }) {
   const PinIcon = project.pinned ? Pin : PinOff;
   return (
     <div className={`project-item ${active ? "active" : ""}`}>
-      <button type="button" className="project-pick" onClick={onSelect}>
-        <span>{project.title || "Untitled Project"}</span>
-        <small>
-          {project.category} / {project.createdAt}
-        </small>
-      </button>
-      <button type="button" className="tiny-button" title={project.pinned ? "Unpin project" : "Pin project"} onClick={onTogglePin}>
-        <PinIcon size={14} />
-      </button>
+      <div className="project-list-row-main">
+        <button type="button" className="project-pick" onClick={onSelect}>
+          <span>{project.title || "Untitled Project"}</span>
+          <small>
+            {project.category} / {project.createdAt}
+          </small>
+        </button>
+        <button type="button" className="tiny-button" title={project.pinned ? "Unpin project" : "Pin project"} onClick={onTogglePin}>
+          <PinIcon size={14} />
+        </button>
+        <button
+          type="button"
+          className="tiny-button"
+          title="Project actions"
+          onClick={(event) => {
+            event.stopPropagation();
+            onToggleMenu();
+          }}
+        >
+          <MoreHorizontal size={14} />
+        </button>
+      </div>
+      {menuOpen && (
+        <div className="project-row-menu">
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenDetails();
+            }}
+          >
+            Details
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -2360,6 +2611,7 @@ function PropertiesPanel({
   selectedArrow,
   width,
   onResizeStart,
+  onOpen,
   onClose,
   onUpdateModule,
   onUpdateArrow,
@@ -2370,6 +2622,7 @@ function PropertiesPanel({
   selectedArrow: FlowArrow | null;
   width: number;
   onResizeStart: (event: React.PointerEvent) => void;
+  onOpen: () => void;
   onClose: () => void;
   onUpdateModule: (moduleId: string, updater: (module: FlowModule) => FlowModule) => void;
   onUpdateArrow: (arrowId: string, updater: (arrow: FlowArrow) => FlowArrow) => void;
@@ -2391,7 +2644,9 @@ function PropertiesPanel({
   if (collapsed) {
     return (
       <aside className="properties-sidebar collapsed">
-        <PanelRightOpen size={18} />
+        <button type="button" className="icon-button" title="Show properties" aria-label="Show properties" onClick={onOpen}>
+          <PanelRightOpen size={18} />
+        </button>
       </aside>
     );
   }
