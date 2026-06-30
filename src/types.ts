@@ -186,6 +186,31 @@ export interface MigrationDryRunReport {
   blockers: string[];
   warnings: string[];
   dryRunOnly: boolean;
+  alreadyMigrated: boolean;
+}
+
+export interface MigrationApplyReport {
+  migrationId: string;
+  startedAt: string;
+  completedAt: string;
+  sourceDataDir: string;
+  targetDataDir: string;
+  backupId: string;
+  backupDir: string;
+  beforeMigrationDir: string;
+  sourceDataVersion: number;
+  targetDataVersion: number;
+  projectFileCount: number;
+  migratedProjectCount: number;
+  groupedProjectCount: number;
+  ungroupedProjectCount: number;
+  groupCount: number;
+  warnings: string[];
+  blockers: string[];
+  alreadyMigrated: boolean;
+  rollbackAttempted: boolean;
+  rollbackSucceeded: boolean;
+  rollbackMessage?: string | null;
 }
 
 export interface PersistedData {

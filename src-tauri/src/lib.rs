@@ -10,6 +10,8 @@ const BACKUPS_DIR_NAME: &str = "CheerioFlowBackups";
 const GROUPS_FILE: &str = "groups.json";
 const APP_STATE_FILE: &str = "app-state.json";
 const BOOTSTRAP_FILE: &str = "cheerio-flow-bootstrap.json";
+const LEGACY_DATA_VERSION: u32 = 1;
+const CURRENT_DATA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,7 +96,7 @@ struct ProjectGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppState {
-    #[serde(default = "default_data_version")]
+    #[serde(default = "legacy_data_version")]
     data_version: serde_json::Value,
     current_project_id: Option<String>,
     project_sidebar_collapsed: bool,
@@ -249,6 +251,33 @@ struct MigrationDryRunReport {
     blockers: Vec<String>,
     warnings: Vec<String>,
     dry_run_only: bool,
+    already_migrated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrationApplyReport {
+    migration_id: String,
+    started_at: String,
+    completed_at: String,
+    source_data_dir: String,
+    target_data_dir: String,
+    backup_id: String,
+    backup_dir: String,
+    before_migration_dir: String,
+    source_data_version: u32,
+    target_data_version: u32,
+    project_file_count: usize,
+    migrated_project_count: usize,
+    grouped_project_count: usize,
+    ungrouped_project_count: usize,
+    group_count: usize,
+    warnings: Vec<String>,
+    blockers: Vec<String>,
+    already_migrated: bool,
+    rollback_attempted: bool,
+    rollback_succeeded: bool,
+    rollback_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,7 +309,7 @@ struct BootstrapConfig {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            data_version: default_data_version(),
+            data_version: current_data_version(),
             current_project_id: None,
             project_sidebar_collapsed: false,
             properties_sidebar_collapsed: true,
@@ -298,8 +327,12 @@ fn default_enabled() -> bool {
     true
 }
 
-fn default_data_version() -> serde_json::Value {
-    serde_json::Value::from(1)
+fn legacy_data_version() -> serde_json::Value {
+    serde_json::Value::from(LEGACY_DATA_VERSION)
+}
+
+fn current_data_version() -> serde_json::Value {
+    serde_json::Value::from(CURRENT_DATA_VERSION)
 }
 
 fn default_left_sidebar_width() -> f64 {
@@ -421,20 +454,191 @@ fn ensure_data_dirs(data_root: &Path) -> Result<PathBuf, String> {
     Ok(projects_dir)
 }
 
-fn storage_has_any_data(data_root: &Path) -> bool {
-    let projects_dir = data_root.join("projects");
-    let has_project_json = projects_dir
-        .read_dir()
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"));
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DataRootClassification {
+    NewEmptyWorkspace,
+    ExistingV1Workspace,
+    ExistingV2Workspace,
+    ExistingLegacyV1Workspace,
+    ExistingV2LikeWorkspace,
+    AmbiguousLayout,
+    UnsupportedVersion(u32),
+    RecoveryNeeded(String),
+}
 
-    data_root.exists()
-        && (has_project_json
-            || data_root.join(GROUPS_FILE).exists()
-            || data_root.join(APP_STATE_FILE).exists())
+fn count_top_level_project_json_files(projects_dir: &Path) -> Result<usize, String> {
+    if !projects_dir.exists() {
+        return Ok(0);
+    }
+    ensure_directory(projects_dir, "projects directory")?;
+    let mut count = 0;
+    for entry in fs::read_dir(projects_dir).map_err(|err| {
+        format!(
+            "Failed to scan projects directory {}: {err}",
+            projects_dir.display()
+        )
+    })? {
+        let entry =
+            entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| format!("Failed to inspect projects entry {}: {err}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("projects/ contains a symlink: {}", path.display()));
+        }
+        if metadata.file_type().is_file()
+            && path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn count_v2_project_json_files(projects_dir: &Path) -> Result<usize, String> {
+    if !projects_dir.exists() {
+        return Ok(0);
+    }
+    ensure_directory(projects_dir, "projects directory")?;
+    let mut count = 0;
+    let ungrouped_dir = projects_dir.join("ungrouped");
+    if ungrouped_dir.exists() {
+        count += count_project_json_files(&ungrouped_dir, &mut Vec::new())?;
+    }
+    let groups_dir = projects_dir.join("groups");
+    if groups_dir.exists() {
+        ensure_directory(&groups_dir, "project groups directory")?;
+        for entry in fs::read_dir(&groups_dir).map_err(|err| {
+            format!(
+                "Failed to scan project groups directory {}: {err}",
+                groups_dir.display()
+            )
+        })? {
+            let entry =
+                entry.map_err(|err| format!("Failed to read project groups entry: {err}"))?;
+            let group_path = entry.path();
+            let metadata = fs::symlink_metadata(&group_path).map_err(|err| {
+                format!(
+                    "Failed to inspect project group path {}: {err}",
+                    group_path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "Project group path is a symlink: {}",
+                    group_path.display()
+                ));
+            }
+            if metadata.file_type().is_dir() {
+                count += count_project_json_files(&group_path, &mut Vec::new())?;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn classify_data_root(data_root: &Path) -> Result<DataRootClassification, String> {
+    if !data_root.exists() {
+        return Ok(DataRootClassification::NewEmptyWorkspace);
+    }
+    ensure_directory(data_root, "data directory")?;
+
+    let app_state_path = data_root.join(APP_STATE_FILE);
+    if app_state_path.exists() {
+        ensure_regular_file(&app_state_path, APP_STATE_FILE)?;
+        let value = read_json::<serde_json::Value>(&app_state_path)?;
+        let Some(version_value) = value.get("dataVersion") else {
+            return Ok(DataRootClassification::ExistingLegacyV1Workspace);
+        };
+        let Some(version) = version_value
+            .as_u64()
+            .and_then(|item| u32::try_from(item).ok())
+        else {
+            return Ok(DataRootClassification::ExistingLegacyV1Workspace);
+        };
+        return match version {
+            LEGACY_DATA_VERSION => Ok(DataRootClassification::ExistingV1Workspace),
+            CURRENT_DATA_VERSION => Ok(DataRootClassification::ExistingV2Workspace),
+            version => Ok(DataRootClassification::UnsupportedVersion(version)),
+        };
+    }
+
+    let projects_dir = data_root.join("projects");
+    let flat_count = count_top_level_project_json_files(&projects_dir)?;
+    let v2_count = count_v2_project_json_files(&projects_dir)?;
+    if flat_count > 0 && v2_count > 0 {
+        return Ok(DataRootClassification::AmbiguousLayout);
+    }
+    if flat_count > 0 {
+        return Ok(DataRootClassification::ExistingLegacyV1Workspace);
+    }
+    if v2_count > 0 {
+        return Ok(DataRootClassification::ExistingV2LikeWorkspace);
+    }
+
+    let project_json_count = count_project_json_files_readonly(&projects_dir);
+    if project_json_count > 0 {
+        return Ok(DataRootClassification::RecoveryNeeded(
+            "app-state.json is missing and project JSON files exist outside supported v1/v2 layouts"
+                .to_string(),
+        ));
+    }
+
+    Ok(DataRootClassification::NewEmptyWorkspace)
+}
+
+fn classification_error(
+    classification: DataRootClassification,
+    data_root: &Path,
+) -> Option<String> {
+    match classification {
+        DataRootClassification::UnsupportedVersion(version) => Some(format!(
+            "Unsupported dataVersion {} in {}",
+            version,
+            data_root.join(APP_STATE_FILE).display()
+        )),
+        DataRootClassification::ExistingV2LikeWorkspace => Some(format!(
+            "app-state.json is missing but v2-like project files exist under {}; recovery is required before loading or saving",
+            data_root.display()
+        )),
+        DataRootClassification::AmbiguousLayout => Some(format!(
+            "app-state.json is missing and both v1 flat and v2 group-folder project files exist under {}; refusing ambiguous layout",
+            data_root.display()
+        )),
+        DataRootClassification::RecoveryNeeded(message) => Some(message),
+        _ => None,
+    }
+}
+
+fn count_project_json_files_readonly(path: &Path) -> usize {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return 0;
+    }
+
+    let mut count = 0;
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let entry_path = entry.path();
+        let Ok(entry_metadata) = fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        if entry_metadata.file_type().is_symlink() {
+            continue;
+        }
+        if entry_metadata.file_type().is_dir() {
+            count += count_project_json_files_readonly(&entry_path);
+        } else if entry_metadata.file_type().is_file()
+            && entry_path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        {
+            count += 1;
+        }
+    }
+    count
 }
 
 fn build_report(
@@ -456,30 +660,331 @@ fn build_report(
     }
 }
 
-fn load_database_from(
-    app: &tauri::AppHandle,
-    storage_root: PathBuf,
-) -> Result<PersistedData, String> {
-    let bootstrap = bootstrap_path(app)?;
-    let data_root = data_root_for(&storage_root);
-    let projects_dir = data_root.join("projects");
-    let had_data = storage_has_any_data(&data_root);
+fn data_version_from_value(value: &serde_json::Value) -> u32 {
+    value
+        .as_u64()
+        .and_then(|item| u32::try_from(item).ok())
+        .unwrap_or(LEGACY_DATA_VERSION)
+}
 
+fn data_version_from_app_state(app_state: &AppState) -> u32 {
+    data_version_from_value(&app_state.data_version)
+}
+
+fn ensure_project_id_safe(project_id: &str) -> Result<(), String> {
+    validate_path_segment_for_migration(project_id, "project id")
+}
+
+fn ensure_group_id_safe(group_id: &str) -> Result<(), String> {
+    validate_path_segment_for_migration(group_id, "group id")
+}
+
+fn v2_project_path(
+    data_root: &Path,
+    project: &Project,
+    valid_group_ids: &HashSet<String>,
+) -> Result<PathBuf, String> {
+    ensure_project_id_safe(&project.id)?;
+    if let Some(group_id) = project
+        .group_id
+        .as_ref()
+        .filter(|group_id| valid_group_ids.contains(*group_id))
+    {
+        ensure_group_id_safe(group_id)?;
+        Ok(data_root
+            .join("projects")
+            .join("groups")
+            .join(group_id)
+            .join(format!("{}.json", project.id)))
+    } else {
+        Ok(data_root
+            .join("projects")
+            .join("ungrouped")
+            .join(format!("{}.json", project.id)))
+    }
+}
+
+fn register_loaded_project(
+    projects: &mut Vec<Project>,
+    seen_project_ids: &mut HashMap<String, String>,
+    project: Project,
+    relative_path: String,
+) -> Result<(), String> {
+    if let Some(previous_path) = seen_project_ids.insert(project.id.clone(), relative_path.clone())
+    {
+        return Err(format!(
+            "Duplicate project id {} found at {} and {}",
+            project.id, previous_path, relative_path
+        ));
+    }
+    projects.push(project);
+    Ok(())
+}
+
+fn load_project_file(
+    data_root: &Path,
+    path: &Path,
+    projects: &mut Vec<Project>,
+    seen_project_ids: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    ensure_regular_file(path, "project JSON")?;
+    let project = read_json::<Project>(path)?;
+    ensure_project_id_safe(&project.id)?;
+    let relative_path = relative_to_data_root(data_root, path);
+    register_loaded_project(projects, seen_project_ids, project, relative_path)
+}
+
+fn load_v1_project_files(data_root: &Path, projects_dir: &Path) -> Result<Vec<Project>, String> {
     let mut projects = Vec::new();
-    if projects_dir.exists() {
-        for entry in fs::read_dir(&projects_dir).map_err(|err| {
+    let mut seen_project_ids = HashMap::new();
+    if !projects_dir.exists() {
+        return Ok(projects);
+    }
+    ensure_directory(projects_dir, "projects directory")?;
+    for entry in fs::read_dir(projects_dir).map_err(|err| {
+        format!(
+            "Failed to scan projects directory {}: {err}",
+            projects_dir.display()
+        )
+    })? {
+        let entry =
+            entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| format!("Failed to inspect project path {}: {err}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Project path is a symlink: {}",
+                relative_to_data_root(data_root, &path)
+            ));
+        }
+        if !metadata.file_type().is_file()
+            || path.extension().and_then(|ext| ext.to_str()) != Some("json")
+        {
+            continue;
+        }
+        load_project_file(data_root, &path, &mut projects, &mut seen_project_ids)?;
+    }
+    Ok(projects)
+}
+
+fn load_v2_project_files(data_root: &Path, projects_dir: &Path) -> Result<Vec<Project>, String> {
+    let mut projects = Vec::new();
+    let mut seen_project_ids = HashMap::new();
+    if !projects_dir.exists() {
+        return Ok(projects);
+    }
+    ensure_directory(projects_dir, "projects directory")?;
+
+    let ungrouped_dir = projects_dir.join("ungrouped");
+    if ungrouped_dir.exists() {
+        ensure_directory(&ungrouped_dir, "ungrouped projects directory")?;
+        for entry in fs::read_dir(&ungrouped_dir).map_err(|err| {
             format!(
-                "Failed to scan projects directory {}: {err}",
-                projects_dir.display()
+                "Failed to scan ungrouped projects directory {}: {err}",
+                ungrouped_dir.display()
             )
         })? {
-            let entry =
-                entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
+            let entry = entry.map_err(|err| {
+                format!("Failed to read ungrouped projects directory entry: {err}")
+            })?;
             let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                projects.push(read_json::<Project>(&path)?);
+            let metadata = fs::symlink_metadata(&path).map_err(|err| {
+                format!("Failed to inspect project path {}: {err}", path.display())
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "Project path is a symlink: {}",
+                    relative_to_data_root(data_root, &path)
+                ));
+            }
+            if !metadata.file_type().is_file()
+                || path.extension().and_then(|ext| ext.to_str()) != Some("json")
+            {
+                continue;
+            }
+            load_project_file(data_root, &path, &mut projects, &mut seen_project_ids)?;
+        }
+    }
+
+    let grouped_root = projects_dir.join("groups");
+    if grouped_root.exists() {
+        ensure_directory(&grouped_root, "grouped projects directory")?;
+        for group_entry in fs::read_dir(&grouped_root).map_err(|err| {
+            format!(
+                "Failed to scan grouped projects directory {}: {err}",
+                grouped_root.display()
+            )
+        })? {
+            let group_entry = group_entry
+                .map_err(|err| format!("Failed to read grouped directory entry: {err}"))?;
+            let group_path = group_entry.path();
+            let group_metadata = fs::symlink_metadata(&group_path).map_err(|err| {
+                format!(
+                    "Failed to inspect group path {}: {err}",
+                    group_path.display()
+                )
+            })?;
+            if group_metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "Group project path is a symlink: {}",
+                    relative_to_data_root(data_root, &group_path)
+                ));
+            }
+            if !group_metadata.file_type().is_dir() {
+                continue;
+            }
+            let group_id = group_path
+                .file_name()
+                .and_then(|item| item.to_str())
+                .unwrap_or_default();
+            ensure_group_id_safe(group_id)?;
+            for entry in fs::read_dir(&group_path).map_err(|err| {
+                format!(
+                    "Failed to scan group projects directory {}: {err}",
+                    group_path.display()
+                )
+            })? {
+                let entry =
+                    entry.map_err(|err| format!("Failed to read group project entry: {err}"))?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).map_err(|err| {
+                    format!("Failed to inspect project path {}: {err}", path.display())
+                })?;
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "Project path is a symlink: {}",
+                        relative_to_data_root(data_root, &path)
+                    ));
+                }
+                if !metadata.file_type().is_file()
+                    || path.extension().and_then(|ext| ext.to_str()) != Some("json")
+                {
+                    continue;
+                }
+                load_project_file(data_root, &path, &mut projects, &mut seen_project_ids)?;
             }
         }
+    }
+
+    Ok(projects)
+}
+
+fn collect_project_file_paths(path: &Path, results: &mut Vec<PathBuf>) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    ensure_directory(path, "project search directory")?;
+    for entry in fs::read_dir(path).map_err(|err| {
+        format!(
+            "Failed to scan project search directory {}: {err}",
+            path.display()
+        )
+    })? {
+        let entry = entry.map_err(|err| format!("Failed to read project search entry: {err}"))?;
+        let entry_path = entry.path();
+        let metadata = fs::symlink_metadata(&entry_path).map_err(|err| {
+            format!(
+                "Failed to inspect project search path {}: {err}",
+                entry_path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Project search path is a symlink: {}",
+                entry_path.display()
+            ));
+        }
+        if metadata.file_type().is_dir() {
+            collect_project_file_paths(&entry_path, results)?;
+        } else if metadata.file_type().is_file()
+            && entry_path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        {
+            results.push(entry_path);
+        }
+    }
+    Ok(())
+}
+
+fn quarantine_noncanonical_project_files(
+    data_root: &Path,
+    project_id: &str,
+    canonical_path: &Path,
+) -> Result<(), String> {
+    ensure_project_id_safe(project_id)?;
+    let projects_dir = data_root.join("projects");
+    let mut paths = Vec::new();
+    collect_project_file_paths(&projects_dir, &mut paths)?;
+    let mut moved_count = 0usize;
+    let mut quarantine_dir: Option<PathBuf> = None;
+
+    for path in paths {
+        if path == canonical_path {
+            continue;
+        }
+        if path.file_stem().and_then(|item| item.to_str()) != Some(project_id) {
+            continue;
+        }
+        let dir = match &quarantine_dir {
+            Some(dir) => dir.clone(),
+            None => {
+                let dir = data_root
+                    .join(".cheerio")
+                    .join("stale-project-files")
+                    .join(backup_timestamp());
+                fs::create_dir_all(&dir).map_err(|err| {
+                    format!(
+                        "Failed to create stale project quarantine directory {}: {err}",
+                        dir.display()
+                    )
+                })?;
+                quarantine_dir = Some(dir.clone());
+                dir
+            }
+        };
+        let relative = relative_to_data_root(data_root, &path);
+        let target = relative
+            .split('/')
+            .fold(dir.clone(), |target, segment| target.join(segment));
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "Failed to create stale project quarantine parent {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::rename(&path, &target).map_err(|err| {
+            format!(
+                "Failed to move stale project file {} to {}: {err}",
+                path.display(),
+                target.display()
+            )
+        })?;
+        moved_count += 1;
+    }
+
+    if moved_count > 0 {
+        println!(
+            "Cheerio Flow moved {moved_count} stale project file(s) for {project_id} to {}",
+            quarantine_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn load_database_from_paths(
+    storage_root: PathBuf,
+    bootstrap: PathBuf,
+) -> Result<PersistedData, String> {
+    let data_root = data_root_for(&storage_root);
+    let projects_dir = data_root.join("projects");
+    let classification = classify_data_root(&data_root)?;
+    if let Some(error) = classification_error(classification.clone(), &data_root) {
+        return Err(error);
     }
 
     let groups_path = data_root.join(GROUPS_FILE);
@@ -490,14 +995,42 @@ fn load_database_from(
     };
 
     let app_state_path = data_root.join(APP_STATE_FILE);
-    let mut app_state = if app_state_path.exists() {
-        read_json::<AppState>(&app_state_path)?
-    } else {
-        AppState::default()
+    let mut app_state = match &classification {
+        DataRootClassification::NewEmptyWorkspace => AppState::default(),
+        DataRootClassification::ExistingLegacyV1Workspace => {
+            if app_state_path.exists() {
+                read_json::<AppState>(&app_state_path)?
+            } else {
+                let mut legacy_app_state = AppState::default();
+                legacy_app_state.data_version = serde_json::Value::from(LEGACY_DATA_VERSION);
+                legacy_app_state
+            }
+        }
+        DataRootClassification::ExistingV1Workspace
+        | DataRootClassification::ExistingV2Workspace => read_json::<AppState>(&app_state_path)?,
+        DataRootClassification::UnsupportedVersion(_)
+        | DataRootClassification::ExistingV2LikeWorkspace
+        | DataRootClassification::AmbiguousLayout
+        | DataRootClassification::RecoveryNeeded(_) => {
+            unreachable!("blocked classifications returned before load")
+        }
+    };
+    let data_version = data_version_from_app_state(&app_state);
+
+    let mut projects = match data_version {
+        LEGACY_DATA_VERSION => load_v1_project_files(&data_root, &projects_dir)?,
+        CURRENT_DATA_VERSION => load_v2_project_files(&data_root, &projects_dir)?,
+        _ => {
+            return Err(format!(
+                "Unsupported dataVersion {} in {}",
+                data_version,
+                app_state_path.display()
+            ))
+        }
     };
 
     if projects.is_empty() {
-        if had_data {
+        if classification != DataRootClassification::NewEmptyWorkspace {
             return Err(format!(
                 "Storage at {} contains metadata but no valid project JSON files; refusing to overwrite it with an empty project",
                 data_root.display()
@@ -505,8 +1038,12 @@ fn load_database_from(
         }
         let project = default_project();
         app_state.current_project_id = Some(project.id.clone());
-        ensure_data_dirs(&data_root)?;
-        write_json(&projects_dir.join(format!("{}.json", project.id)), &project)?;
+        write_json(
+            &v2_project_path(&data_root, &project, &HashSet::new())?,
+            &project,
+        )?;
+        write_json(&data_root.join(GROUPS_FILE), &groups)?;
+        write_json(&data_root.join(APP_STATE_FILE), &app_state)?;
         projects.push(project);
     }
 
@@ -524,6 +1061,14 @@ fn load_database_from(
     })
 }
 
+fn load_database_from(
+    app: &tauri::AppHandle,
+    storage_root: PathBuf,
+) -> Result<PersistedData, String> {
+    let bootstrap = bootstrap_path(app)?;
+    load_database_from_paths(storage_root, bootstrap)
+}
+
 fn save_database_to(
     app: &tauri::AppHandle,
     storage_root: PathBuf,
@@ -535,10 +1080,36 @@ fn save_database_to(
 
     let bootstrap = bootstrap_path(app)?;
     let data_root = data_root_for(&storage_root);
-    let projects_dir = ensure_data_dirs(&data_root)?;
-
-    for project in &payload.projects {
-        write_json(&projects_dir.join(format!("{}.json", project.id)), project)?;
+    let data_version = data_version_from_app_state(&payload.app_state);
+    match data_version {
+        LEGACY_DATA_VERSION => {
+            let projects_dir = ensure_data_dirs(&data_root)?;
+            for project in &payload.projects {
+                ensure_project_id_safe(&project.id)?;
+                write_json(&projects_dir.join(format!("{}.json", project.id)), project)?;
+            }
+        }
+        CURRENT_DATA_VERSION => {
+            let valid_group_ids = payload
+                .groups
+                .iter()
+                .map(|group| {
+                    ensure_group_id_safe(&group.id)?;
+                    Ok(group.id.clone())
+                })
+                .collect::<Result<HashSet<_>, String>>()?;
+            for project in &payload.projects {
+                let canonical_path = v2_project_path(&data_root, project, &valid_group_ids)?;
+                write_json(&canonical_path, project)?;
+                quarantine_noncanonical_project_files(&data_root, &project.id, &canonical_path)?;
+            }
+        }
+        _ => {
+            return Err(format!(
+                "Refusing to save unsupported dataVersion {}",
+                data_version
+            ))
+        }
     }
     write_json(&data_root.join(GROUPS_FILE), &payload.groups)?;
     write_json(&data_root.join(APP_STATE_FILE), &payload.app_state)?;
@@ -717,7 +1288,11 @@ fn count_project_json_files(
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)
             .map_err(|err| format!("Failed to inspect project path {}: {err}", path.display()))?;
-        if metadata.file_type().is_file()
+        if metadata.file_type().is_symlink() {
+            warnings.push(format!("Skipped symlink {}", path.display()));
+        } else if metadata.file_type().is_dir() {
+            count += count_project_json_files(&path, warnings)?;
+        } else if metadata.file_type().is_file()
             && path.extension().and_then(|ext| ext.to_str()) == Some("json")
         {
             count += 1;
@@ -1241,7 +1816,8 @@ fn validate_data_dir(data_root: &Path) -> Result<usize, String> {
 
     let app_state_path = data_root.join(APP_STATE_FILE);
     ensure_regular_file(&app_state_path, APP_STATE_FILE)?;
-    read_json::<AppState>(&app_state_path)?;
+    let app_state = read_json::<AppState>(&app_state_path)?;
+    let data_version = data_version_from_app_state(&app_state);
 
     let projects_dir = data_root.join("projects");
     if !projects_dir.exists() {
@@ -1252,23 +1828,18 @@ fn validate_data_dir(data_root: &Path) -> Result<usize, String> {
     }
     ensure_directory(&projects_dir, "projects directory")?;
 
-    let mut project_file_count = 0;
-    for entry in fs::read_dir(&projects_dir).map_err(|err| {
-        format!(
-            "Failed to scan projects directory {}: {err}",
-            projects_dir.display()
-        )
-    })? {
-        let entry =
-            entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
+    let projects = match data_version {
+        LEGACY_DATA_VERSION => load_v1_project_files(data_root, &projects_dir)?,
+        CURRENT_DATA_VERSION => load_v2_project_files(data_root, &projects_dir)?,
+        _ => {
+            return Err(format!(
+                "Unsupported dataVersion {} in {}",
+                data_version,
+                app_state_path.display()
+            ))
         }
-        ensure_regular_file(&path, "project JSON")?;
-        read_json::<Project>(&path)?;
-        project_file_count += 1;
-    }
+    };
+    let project_file_count = projects.len();
 
     if project_file_count == 0 {
         return Err(format!(
@@ -1442,6 +2013,174 @@ fn rename_current_data_to_before_restore(data_root: &Path) -> Result<PathBuf, St
     ))
 }
 
+fn allocate_migration_staging_dir(storage_root: &Path) -> Result<PathBuf, String> {
+    let timestamp = backup_timestamp();
+    for index in 0..1000 {
+        let staging_name = if index == 0 {
+            format!(".migration-staging-{timestamp}")
+        } else {
+            format!(".migration-staging-{timestamp}-{index:03}")
+        };
+        let staging_dir = storage_root.join(staging_name);
+        match fs::create_dir(&staging_dir) {
+            Ok(()) => return Ok(staging_dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "Failed to create migration staging directory {}: {err}",
+                    staging_dir.display()
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "Failed to allocate a unique migration staging directory under {}",
+        storage_root.display()
+    ))
+}
+
+fn rename_current_data_to_before_migration(data_root: &Path) -> Result<PathBuf, String> {
+    let parent = data_root.parent().ok_or_else(|| {
+        format!(
+            "Cannot determine parent directory for current data directory {}",
+            data_root.display()
+        )
+    })?;
+    let timestamp = backup_timestamp();
+    for index in 0..1000 {
+        let name = if index == 0 {
+            format!("{DATA_DIR_NAME}.before-migration-{timestamp}")
+        } else {
+            format!("{DATA_DIR_NAME}.before-migration-{timestamp}-{index:03}")
+        };
+        let candidate = parent.join(name);
+        match fs::rename(data_root, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "Failed to move current data directory {} to {}: {err}",
+                    data_root.display(),
+                    candidate.display()
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "Failed to allocate a before-migration directory under {}",
+        parent.display()
+    ))
+}
+
+fn build_v2_staging_data(
+    source_data_root: &Path,
+    staging_data_root: &Path,
+    dry_run: &MigrationDryRunReport,
+) -> Result<(), String> {
+    fs::create_dir_all(staging_data_root).map_err(|err| {
+        format!(
+            "Failed to create staging data directory {}: {err}",
+            staging_data_root.display()
+        )
+    })?;
+
+    let groups_path = source_data_root.join(GROUPS_FILE);
+    ensure_regular_file(&groups_path, GROUPS_FILE)?;
+    fs::copy(&groups_path, staging_data_root.join(GROUPS_FILE)).map_err(|err| {
+        format!("Failed to copy groups.json into migration staging directory: {err}")
+    })?;
+
+    let app_state_path = source_data_root.join(APP_STATE_FILE);
+    ensure_regular_file(&app_state_path, APP_STATE_FILE)?;
+    let mut app_state_value = read_json::<serde_json::Value>(&app_state_path)?;
+    let Some(app_state_object) = app_state_value.as_object_mut() else {
+        return Err(format!(
+            "app-state.json is not an object: {}",
+            app_state_path.display()
+        ));
+    };
+    app_state_object.insert(
+        "dataVersion".to_string(),
+        serde_json::Value::from(CURRENT_DATA_VERSION),
+    );
+    write_json(&staging_data_root.join(APP_STATE_FILE), &app_state_value)?;
+
+    for plan in &dry_run.project_plans {
+        if plan.status == "blocked" || plan.target_relative_path.is_empty() {
+            return Err(format!(
+                "Refusing to stage blocked migration project plan for {}",
+                plan.project_id
+            ));
+        }
+        ensure_project_id_safe(&plan.project_id)?;
+        if let Some(group_id) = &plan.target_group_id {
+            ensure_group_id_safe(group_id)?;
+        }
+        let source_path = data_relative_path(source_data_root, &plan.source_relative_path);
+        ensure_regular_file(&source_path, "source project JSON")?;
+        read_json::<Project>(&source_path)?;
+        let target_path = data_relative_path(staging_data_root, &plan.target_relative_path);
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "Failed to create staging project directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::copy(&source_path, &target_path).map_err(|err| {
+            format!(
+                "Failed to copy project {} to migration staging target {}: {err}",
+                source_path.display(),
+                target_path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn verify_v2_staging_data(
+    staging_data_root: &Path,
+    dry_run: &MigrationDryRunReport,
+) -> Result<(), String> {
+    ensure_directory(staging_data_root, "migration staging data directory")?;
+    let groups_path = staging_data_root.join(GROUPS_FILE);
+    ensure_regular_file(&groups_path, GROUPS_FILE)?;
+    read_json::<Vec<ProjectGroup>>(&groups_path)?;
+
+    let app_state_path = staging_data_root.join(APP_STATE_FILE);
+    ensure_regular_file(&app_state_path, APP_STATE_FILE)?;
+    let app_state = read_json::<AppState>(&app_state_path)?;
+    if data_version_from_app_state(&app_state) != CURRENT_DATA_VERSION {
+        return Err(format!(
+            "Staged app-state.json dataVersion is not {}",
+            CURRENT_DATA_VERSION
+        ));
+    }
+
+    for plan in &dry_run.project_plans {
+        if plan.status == "blocked" || plan.target_relative_path.is_empty() {
+            continue;
+        }
+        let target_path = data_relative_path(staging_data_root, &plan.target_relative_path);
+        ensure_regular_file(&target_path, "staged project JSON")?;
+        read_json::<Project>(&target_path)?;
+    }
+
+    let projects = load_v2_project_files(staging_data_root, &staging_data_root.join("projects"))?;
+    if projects.len() != dry_run.summary.project_file_count {
+        return Err(format!(
+            "Staged project count {} does not match expected {}",
+            projects.len(),
+            dry_run.summary.project_file_count
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn generate_migration_dry_run_plan(app: tauri::AppHandle) -> Result<MigrationDryRunReport, String> {
     let storage_root = active_storage_root(&app)?;
@@ -1452,14 +2191,83 @@ fn generate_migration_dry_run_plan(app: tauri::AppHandle) -> Result<MigrationDry
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
 
+    let source_data_version =
+        read_source_data_version_for_migration(&app_state_path, &mut blockers);
+    if source_data_version == CURRENT_DATA_VERSION {
+        let groups = if groups_path.exists() {
+            match ensure_regular_file(&groups_path, GROUPS_FILE)
+                .and_then(|_| read_json::<Vec<ProjectGroup>>(&groups_path))
+            {
+                Ok(groups) => groups,
+                Err(err) => {
+                    push_unique(&mut blockers, err);
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
+        let projects = match load_v2_project_files(&data_root, &projects_dir) {
+            Ok(projects) => projects,
+            Err(err) => {
+                push_unique(&mut blockers, err);
+                vec![]
+            }
+        };
+        let grouped_project_count = projects
+            .iter()
+            .filter(|project| {
+                project
+                    .group_id
+                    .as_ref()
+                    .is_some_and(|group_id| groups.iter().any(|group| group.id == *group_id))
+            })
+            .count();
+        let ungrouped_project_count = projects.len().saturating_sub(grouped_project_count);
+        return Ok(MigrationDryRunReport {
+            report_version: 1,
+            generated_at: now_string(),
+            source_data_dir: data_root.to_string_lossy().to_string(),
+            source_projects_dir: projects_dir.to_string_lossy().to_string(),
+            current_layout: "group-folder-v2".to_string(),
+            target_layout: "group-folder-v2".to_string(),
+            source_data_version,
+            target_data_version: CURRENT_DATA_VERSION,
+            summary: MigrationDryRunSummary {
+                project_file_count: projects.len(),
+                readable_project_count: projects.len(),
+                grouped_project_count,
+                ungrouped_project_count,
+                group_count: groups.len(),
+                planned_move_count: 0,
+                blocker_count: blockers.len(),
+                warning_count: warnings.len(),
+            },
+            project_plans: vec![],
+            group_plans: vec![],
+            planned_operations: vec![],
+            blockers,
+            warnings,
+            dry_run_only: true,
+            already_migrated: true,
+        });
+    }
+    if source_data_version != LEGACY_DATA_VERSION {
+        push_unique(
+            &mut blockers,
+            format!(
+                "Unsupported source dataVersion {}; only dataVersion 1 can migrate to 2",
+                source_data_version
+            ),
+        );
+    }
+
     let current_layout = inspect_projects_layout_for_migration(
         &data_root,
         &projects_dir,
         &mut blockers,
         &mut warnings,
     )?;
-    let source_data_version =
-        read_source_data_version_for_migration(&app_state_path, &mut blockers);
     let (group_records, groups_metadata_trustworthy) =
         read_groups_for_migration(&groups_path, &mut blockers, &mut warnings);
     let (project_records, source_project_file_count) =
@@ -1801,7 +2609,7 @@ fn generate_migration_dry_run_plan(app: tauri::AppHandle) -> Result<MigrationDry
         current_layout,
         target_layout: "group-folder-v2".to_string(),
         source_data_version,
-        target_data_version: 2,
+        target_data_version: CURRENT_DATA_VERSION,
         summary: MigrationDryRunSummary {
             project_file_count: source_project_file_count,
             readable_project_count: project_records
@@ -1821,6 +2629,161 @@ fn generate_migration_dry_run_plan(app: tauri::AppHandle) -> Result<MigrationDry
         blockers,
         warnings,
         dry_run_only: true,
+        already_migrated: false,
+    })
+}
+
+#[tauri::command]
+fn apply_group_folder_migration(app: tauri::AppHandle) -> Result<MigrationApplyReport, String> {
+    let started_at = now_string();
+    let migration_id = format!("migration-{}", backup_timestamp());
+    let storage_root = active_storage_root(&app)?;
+    let data_root = data_root_for(&storage_root);
+    let dry_run = generate_migration_dry_run_plan(app.clone())?;
+
+    if dry_run.already_migrated || dry_run.source_data_version == CURRENT_DATA_VERSION {
+        return Ok(MigrationApplyReport {
+            migration_id,
+            started_at,
+            completed_at: now_string(),
+            source_data_dir: data_root.to_string_lossy().to_string(),
+            target_data_dir: data_root.to_string_lossy().to_string(),
+            backup_id: String::new(),
+            backup_dir: String::new(),
+            before_migration_dir: String::new(),
+            source_data_version: dry_run.source_data_version,
+            target_data_version: CURRENT_DATA_VERSION,
+            project_file_count: dry_run.summary.project_file_count,
+            migrated_project_count: 0,
+            grouped_project_count: dry_run.summary.grouped_project_count,
+            ungrouped_project_count: dry_run.summary.ungrouped_project_count,
+            group_count: dry_run.summary.group_count,
+            warnings: dry_run.warnings,
+            blockers: vec![],
+            already_migrated: true,
+            rollback_attempted: false,
+            rollback_succeeded: false,
+            rollback_message: None,
+        });
+    }
+
+    if dry_run.source_data_version != LEGACY_DATA_VERSION {
+        return Err(format!(
+            "Cannot migrate unsupported dataVersion {}; only dataVersion 1 can migrate to {}",
+            dry_run.source_data_version, CURRENT_DATA_VERSION
+        ));
+    }
+    if !dry_run.blockers.is_empty() {
+        return Err(format!(
+            "Cannot apply group-folder migration because dry-run found blockers: {}",
+            dry_run.blockers.join(" | ")
+        ));
+    }
+    if dry_run.summary.planned_move_count != dry_run.summary.project_file_count {
+        return Err(format!(
+            "Dry-run planned {} project moves for {} project files; refusing migration",
+            dry_run.summary.planned_move_count, dry_run.summary.project_file_count
+        ));
+    }
+
+    let backup_report = create_full_backup(app.clone())?;
+
+    let staging_dir = allocate_migration_staging_dir(&storage_root)?;
+    let staging_data_dir = staging_dir.join(DATA_DIR_NAME);
+    build_v2_staging_data(&data_root, &staging_data_dir, &dry_run)?;
+    verify_v2_staging_data(&staging_data_dir, &dry_run)?;
+
+    let before_migration_dir = rename_current_data_to_before_migration(&data_root)?;
+    let mut warnings = dry_run.warnings.clone();
+    warnings.push(format!(
+        "Full backup was created before migration at {}",
+        backup_report.backup_dir
+    ));
+
+    if let Err(activation_err) = fs::rename(&staging_data_dir, &data_root) {
+        let mut rollback_attempted = false;
+        let mut rollback_succeeded = false;
+        let rollback_message;
+        if data_root.exists() {
+            rollback_message = Some(format!(
+                "Activation failed after {} appeared; rollback was not attempted to avoid overwriting active data: {activation_err}",
+                data_root.display()
+            ));
+        } else {
+            rollback_attempted = true;
+            match fs::rename(&before_migration_dir, &data_root) {
+                Ok(()) => {
+                    rollback_succeeded = true;
+                    rollback_message = Some(format!(
+                        "Activation failed and rollback restored {} from {}: {activation_err}",
+                        data_root.display(),
+                        before_migration_dir.display()
+                    ));
+                }
+                Err(rollback_err) => {
+                    rollback_message = Some(format!(
+                        "Activation failed and rollback from {} to {} also failed: {activation_err}; rollback error: {rollback_err}",
+                        before_migration_dir.display(),
+                        data_root.display()
+                    ));
+                }
+            }
+        }
+        let blocker = rollback_message
+            .clone()
+            .unwrap_or_else(|| format!("Activation failed: {activation_err}"));
+        return Ok(MigrationApplyReport {
+            migration_id,
+            started_at,
+            completed_at: now_string(),
+            source_data_dir: before_migration_dir.to_string_lossy().to_string(),
+            target_data_dir: data_root.to_string_lossy().to_string(),
+            backup_id: backup_report.backup_id,
+            backup_dir: backup_report.backup_dir,
+            before_migration_dir: before_migration_dir.to_string_lossy().to_string(),
+            source_data_version: dry_run.source_data_version,
+            target_data_version: CURRENT_DATA_VERSION,
+            project_file_count: dry_run.summary.project_file_count,
+            migrated_project_count: 0,
+            grouped_project_count: dry_run.summary.grouped_project_count,
+            ungrouped_project_count: dry_run.summary.ungrouped_project_count,
+            group_count: dry_run.summary.group_count,
+            warnings,
+            blockers: vec![blocker],
+            already_migrated: false,
+            rollback_attempted,
+            rollback_succeeded,
+            rollback_message,
+        });
+    }
+
+    warnings.push(format!(
+        "Previous data directory was preserved at {}",
+        before_migration_dir.display()
+    ));
+
+    Ok(MigrationApplyReport {
+        migration_id,
+        started_at,
+        completed_at: now_string(),
+        source_data_dir: before_migration_dir.to_string_lossy().to_string(),
+        target_data_dir: data_root.to_string_lossy().to_string(),
+        backup_id: backup_report.backup_id,
+        backup_dir: backup_report.backup_dir,
+        before_migration_dir: before_migration_dir.to_string_lossy().to_string(),
+        source_data_version: dry_run.source_data_version,
+        target_data_version: CURRENT_DATA_VERSION,
+        project_file_count: dry_run.summary.project_file_count,
+        migrated_project_count: dry_run.summary.planned_move_count,
+        grouped_project_count: dry_run.summary.grouped_project_count,
+        ungrouped_project_count: dry_run.summary.ungrouped_project_count,
+        group_count: dry_run.summary.group_count,
+        warnings,
+        blockers: vec![],
+        already_migrated: false,
+        rollback_attempted: false,
+        rollback_succeeded: false,
+        rollback_message: None,
     })
 }
 
@@ -2095,7 +3058,7 @@ fn set_storage_root(
             next_root.display()
         )
     })?;
-    save_database_to(&app, next_root.clone(), payload)?;
+    drop(payload);
     let loaded = load_database_from(&app, next_root.clone())?;
     write_bootstrap(&app, &next_root)?;
     Ok(loaded)
@@ -2151,8 +3114,477 @@ pub fn run() {
             create_full_backup,
             list_full_backups,
             restore_full_backup,
-            generate_migration_dry_run_plan
+            generate_migration_dry_run_plan,
+            apply_group_folder_migration
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cheerio-flow-{label}-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp test dir");
+        dir
+    }
+
+    fn sample_project(id: &str, group_id: Option<&str>) -> Project {
+        Project {
+            id: id.to_string(),
+            title: id.to_string(),
+            category: "research".to_string(),
+            created_at: "2026-06-30 00:00:00".to_string(),
+            pinned: false,
+            group_id: group_id.map(|item| item.to_string()),
+            modules: vec![],
+            arrows: vec![],
+        }
+    }
+
+    fn sample_group(id: &str, project_ids: Vec<&str>) -> ProjectGroup {
+        ProjectGroup {
+            id: id.to_string(),
+            title: id.to_string(),
+            created_at: "2026-06-30 00:00:00".to_string(),
+            pinned: false,
+            project_ids: project_ids
+                .into_iter()
+                .map(|item| item.to_string())
+                .collect(),
+        }
+    }
+
+    fn sample_dry_run(data_root: &Path) -> MigrationDryRunReport {
+        MigrationDryRunReport {
+            report_version: 1,
+            generated_at: now_string(),
+            source_data_dir: data_root.to_string_lossy().to_string(),
+            source_projects_dir: data_root.join("projects").to_string_lossy().to_string(),
+            current_layout: "flat".to_string(),
+            target_layout: "group-folder-v2".to_string(),
+            source_data_version: LEGACY_DATA_VERSION,
+            target_data_version: CURRENT_DATA_VERSION,
+            summary: MigrationDryRunSummary {
+                project_file_count: 2,
+                readable_project_count: 2,
+                grouped_project_count: 1,
+                ungrouped_project_count: 1,
+                group_count: 1,
+                planned_move_count: 2,
+                blocker_count: 0,
+                warning_count: 0,
+            },
+            project_plans: vec![
+                ProjectMigrationPlan {
+                    project_id: "project-a".to_string(),
+                    project_title: "project-a".to_string(),
+                    source_relative_path: "projects/project-a.json".to_string(),
+                    target_relative_path: "projects/groups/group-a/project-a.json".to_string(),
+                    current_group_id: Some("group-a".to_string()),
+                    target_group_id: Some("group-a".to_string()),
+                    target_bucket: "grouped".to_string(),
+                    status: "planned".to_string(),
+                    blockers: vec![],
+                    warnings: vec![],
+                },
+                ProjectMigrationPlan {
+                    project_id: "project-b".to_string(),
+                    project_title: "project-b".to_string(),
+                    source_relative_path: "projects/project-b.json".to_string(),
+                    target_relative_path: "projects/ungrouped/project-b.json".to_string(),
+                    current_group_id: None,
+                    target_group_id: None,
+                    target_bucket: "ungrouped".to_string(),
+                    status: "planned".to_string(),
+                    blockers: vec![],
+                    warnings: vec![],
+                },
+            ],
+            group_plans: vec![],
+            planned_operations: vec![],
+            blockers: vec![],
+            warnings: vec![],
+            dry_run_only: true,
+            already_migrated: false,
+        }
+    }
+
+    fn bootstrap_path_for_test(root: &Path) -> PathBuf {
+        root.join("bootstrap.json")
+    }
+
+    #[test]
+    fn app_state_defaults_keep_legacy_missing_version_but_new_default_is_current() {
+        let missing_version: AppState = serde_json::from_value(serde_json::json!({
+            "currentProjectId": null,
+            "projectSidebarCollapsed": false,
+            "propertiesSidebarCollapsed": true,
+            "leftSidebarWidth": 320.0,
+            "rightSidebarWidth": 340.0
+        }))
+        .expect("deserialize legacy app state");
+
+        assert_eq!(
+            data_version_from_app_state(&missing_version),
+            LEGACY_DATA_VERSION
+        );
+        assert_eq!(
+            data_version_from_app_state(&AppState::default()),
+            CURRENT_DATA_VERSION
+        );
+    }
+
+    #[test]
+    fn v1_loader_reads_only_top_level_project_json() {
+        let data_root = temp_test_dir("v1-loader");
+        let projects_dir = data_root.join("projects");
+        write_json(
+            &projects_dir.join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write v1 project");
+        write_json(
+            &projects_dir
+                .join("groups")
+                .join("group-a")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-a")),
+        )
+        .expect("write nested project ignored by v1 loader");
+
+        let projects = load_v1_project_files(&data_root, &projects_dir).expect("load v1");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, "project-a");
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn missing_app_state_with_existing_data_is_treated_as_legacy() {
+        let storage_root = temp_test_dir("missing-app-state");
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        let projects_dir = data_root.join("projects");
+        write_json(
+            &projects_dir.join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write legacy project");
+
+        assert_eq!(
+            classify_data_root(&data_root).expect("classify missing app-state flat workspace"),
+            DataRootClassification::ExistingLegacyV1Workspace
+        );
+        let loaded =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect("load legacy missing app state");
+        assert_eq!(
+            data_version_from_app_state(&loaded.app_state),
+            LEGACY_DATA_VERSION
+        );
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].id, "project-a");
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn missing_data_dir_creates_current_v2_workspace() {
+        let storage_root = temp_test_dir("missing-data-dir");
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        assert!(!data_root.exists());
+        assert_eq!(
+            classify_data_root(&data_root).expect("classify missing data dir"),
+            DataRootClassification::NewEmptyWorkspace
+        );
+
+        let loaded =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect("create missing workspace");
+        assert_eq!(
+            data_version_from_app_state(&loaded.app_state),
+            CURRENT_DATA_VERSION
+        );
+        let project_id = &loaded.projects[0].id;
+        assert!(data_root
+            .join("projects")
+            .join("ungrouped")
+            .join(format!("{project_id}.json"))
+            .exists());
+        assert!(!data_root
+            .join("projects")
+            .join(format!("{project_id}.json"))
+            .exists());
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn empty_data_dir_creates_current_v2_workspace() {
+        let storage_root = temp_test_dir("empty-data-dir");
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        fs::create_dir_all(&data_root).expect("create empty data root");
+        assert_eq!(
+            classify_data_root(&data_root).expect("classify empty data dir"),
+            DataRootClassification::NewEmptyWorkspace
+        );
+
+        let loaded =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect("create empty workspace");
+        assert_eq!(
+            data_version_from_app_state(&loaded.app_state),
+            CURRENT_DATA_VERSION
+        );
+        let project_id = &loaded.projects[0].id;
+        assert!(data_root
+            .join("projects")
+            .join("ungrouped")
+            .join(format!("{project_id}.json"))
+            .exists());
+        assert!(!data_root
+            .join("projects")
+            .join(format!("{project_id}.json"))
+            .exists());
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn existing_app_state_missing_data_version_is_legacy_v1() {
+        let storage_root = temp_test_dir("app-state-missing-version");
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        write_json(
+            &data_root.join("projects").join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write legacy project");
+        write_json(&data_root.join(GROUPS_FILE), &Vec::<ProjectGroup>::new())
+            .expect("write groups");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &serde_json::json!({
+                "currentProjectId": "project-a",
+                "projectSidebarCollapsed": false,
+                "propertiesSidebarCollapsed": true,
+                "leftSidebarWidth": 320.0,
+                "rightSidebarWidth": 340.0
+            }),
+        )
+        .expect("write legacy app state without dataVersion");
+
+        let loaded =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect("load legacy missing dataVersion");
+        assert_eq!(
+            data_version_from_app_state(&loaded.app_state),
+            LEGACY_DATA_VERSION
+        );
+        assert_eq!(loaded.projects.len(), 1);
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn missing_app_state_with_v2_like_projects_is_rejected() {
+        let storage_root = temp_test_dir("missing-app-state-v2-like");
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write v2-like project");
+
+        assert_eq!(
+            classify_data_root(&data_root).expect("classify v2-like missing app-state"),
+            DataRootClassification::ExistingV2LikeWorkspace
+        );
+        let error =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect_err("v2-like missing app-state should be rejected");
+        assert!(error.contains("v2-like project files"));
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn missing_app_state_with_flat_and_v2_projects_is_ambiguous() {
+        let storage_root = temp_test_dir("missing-app-state-ambiguous");
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        write_json(
+            &data_root.join("projects").join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write flat project");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-b.json"),
+            &sample_project("project-b", None),
+        )
+        .expect("write v2 canonical project");
+
+        assert_eq!(
+            classify_data_root(&data_root).expect("classify ambiguous missing app-state"),
+            DataRootClassification::AmbiguousLayout
+        );
+        let error =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect_err("ambiguous missing app-state should be rejected");
+        assert!(error.contains("both v1 flat and v2 group-folder"));
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn unsupported_future_data_version_is_rejected() {
+        let storage_root = temp_test_dir("unsupported-version");
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        write_json(
+            &data_root.join("projects").join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write project");
+        let mut app_state = AppState::default();
+        app_state.data_version = serde_json::Value::from(CURRENT_DATA_VERSION + 1);
+        write_json(&data_root.join(APP_STATE_FILE), &app_state).expect("write future app state");
+
+        let error =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect_err("future dataVersion should be rejected");
+        assert!(error.contains("Unsupported dataVersion"));
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn v2_loader_reads_only_group_folder_layout() {
+        let data_root = temp_test_dir("v2-loader");
+        let projects_dir = data_root.join("projects");
+        write_json(
+            &projects_dir.join("project-flat.json"),
+            &sample_project("project-flat", None),
+        )
+        .expect("write top level project ignored by v2 loader");
+        write_json(
+            &data_root
+                .join(".cheerio")
+                .join("stale-project-files")
+                .join("stamp")
+                .join("projects")
+                .join("project-stale.json"),
+            &sample_project("project-stale", None),
+        )
+        .expect("write stale project ignored by v2 loader");
+        write_json(
+            &projects_dir.join("ungrouped").join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write ungrouped project");
+        write_json(
+            &projects_dir
+                .join("groups")
+                .join("group-a")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-a")),
+        )
+        .expect("write grouped project");
+
+        let mut ids = load_v2_project_files(&data_root, &projects_dir)
+            .expect("load v2")
+            .into_iter()
+            .map(|project| project.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["project-a".to_string(), "project-b".to_string()]);
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn v2_loader_detects_duplicate_project_ids() {
+        let data_root = temp_test_dir("v2-duplicate-loader");
+        let projects_dir = data_root.join("projects");
+        write_json(
+            &projects_dir.join("ungrouped").join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write ungrouped project");
+        write_json(
+            &projects_dir
+                .join("groups")
+                .join("group-a")
+                .join("project-a.json"),
+            &sample_project("project-a", Some("group-a")),
+        )
+        .expect("write duplicate grouped project");
+
+        let result = load_v2_project_files(&data_root, &projects_dir);
+        assert!(result
+            .expect_err("duplicate ids should fail")
+            .contains("Duplicate project id"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn staging_build_updates_version_and_preserves_project_count() {
+        let source_root = temp_test_dir("staging-source");
+        let staging_parent = temp_test_dir("staging-target");
+        let staging_root = staging_parent.join(DATA_DIR_NAME);
+        write_json(
+            &source_root.join("projects").join("project-a.json"),
+            &sample_project("project-a", Some("group-a")),
+        )
+        .expect("write grouped v1 source project");
+        write_json(
+            &source_root.join("projects").join("project-b.json"),
+            &sample_project("project-b", None),
+        )
+        .expect("write ungrouped v1 source project");
+        write_json(
+            &source_root.join(GROUPS_FILE),
+            &vec![sample_group("group-a", vec!["project-a"])],
+        )
+        .expect("write groups");
+        let mut app_state = AppState::default();
+        app_state.data_version = serde_json::Value::from(LEGACY_DATA_VERSION);
+        write_json(&source_root.join(APP_STATE_FILE), &app_state).expect("write app state");
+
+        let dry_run = sample_dry_run(&source_root);
+        build_v2_staging_data(&source_root, &staging_root, &dry_run).expect("build staging");
+        verify_v2_staging_data(&staging_root, &dry_run).expect("verify staging");
+
+        let staged_app_state = read_json::<AppState>(&staging_root.join(APP_STATE_FILE))
+            .expect("read staged app state");
+        assert_eq!(
+            data_version_from_app_state(&staged_app_state),
+            CURRENT_DATA_VERSION
+        );
+        assert!(staging_root
+            .join("projects")
+            .join("groups")
+            .join("group-a")
+            .join("project-a.json")
+            .exists());
+        assert!(staging_root
+            .join("projects")
+            .join("ungrouped")
+            .join("project-b.json")
+            .exists());
+
+        fs::remove_dir_all(source_root).ok();
+        fs::remove_dir_all(staging_parent).ok();
+    }
 }

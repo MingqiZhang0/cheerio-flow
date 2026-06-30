@@ -51,7 +51,7 @@ import {
 } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { scanLightweightIntegrity, type LightweightIntegrityReport } from "./integrity";
-import { chooseStorageRoot, createFullBackup, generateMigrationDryRunPlan, listFullBackups, loadDatabase, persistDatabase, removeProject, restoreFullBackup, switchStorageRoot } from "./storage";
+import { applyGroupFolderMigration, chooseStorageRoot, createFullBackup, generateMigrationDryRunPlan, listFullBackups, loadDatabase, persistDatabase, removeProject, restoreFullBackup, switchStorageRoot } from "./storage";
 import {
   ARROW_TYPES,
   MODULE_SHAPES,
@@ -65,6 +65,7 @@ import {
   type FlowArrowData,
   type FlowModule,
   type FlowModuleData,
+  type MigrationApplyReport,
   type MigrationDryRunReport,
   type ModuleShape,
   type Project,
@@ -95,6 +96,7 @@ type SaveStatus = "saving" | "saved" | "error";
 type BackupStatus = "idle" | "running" | "success" | "error";
 type RestoreStatus = "idle" | "loading" | "running" | "success" | "error";
 type MigrationDryRunStatus = "idle" | "running" | "success" | "error";
+type MigrationApplyStatus = "idle" | "running" | "success" | "error";
 type FolderPickerStatus = "idle" | "opening" | "error";
 type CtrlWheelState = { x: number; y: number } | null;
 type MoveMode = "x" | "y" | "free";
@@ -156,6 +158,10 @@ function isCheerioFlowDataFolder(path: string) {
   const normalized = path.replace(/[\\/]+$/, "");
   const segments = normalized.split(/[\\/]/).filter(Boolean);
   return segments[segments.length - 1] === "CheerioFlowData";
+}
+
+function normalizeWorkspacePath(path: string) {
+  return path.trim().replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
 }
 
 function isResizableShape(shape: ModuleShape) {
@@ -472,10 +478,12 @@ function AppShell() {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dataDir, setDataDir] = useState("");
+  const [loadedStorageRoot, setLoadedStorageRoot] = useState("");
   const [integrityReport, setIntegrityReport] = useState<LightweightIntegrityReport | null>(null);
   const [integrityBannerDismissed, setIntegrityBannerDismissed] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [groups, setGroups] = useState<ProjectGroup[]>([]);
+  const [dataVersion, setDataVersion] = useState(2);
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
   const [isProjectDetailsOpen, setIsProjectDetailsOpen] = useState(false);
   const [projectActionMenuId, setProjectActionMenuId] = useState<string | null>(null);
@@ -515,7 +523,12 @@ function AppShell() {
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [migrationDryRunStatus, setMigrationDryRunStatus] = useState<MigrationDryRunStatus>("idle");
   const [migrationDryRunReport, setMigrationDryRunReport] = useState<MigrationDryRunReport | null>(null);
+  const [migrationDryRunContext, setMigrationDryRunContext] = useState<{ storageRoot: string; dataDir: string } | null>(null);
   const [migrationDryRunError, setMigrationDryRunError] = useState<string | null>(null);
+  const [migrationApplyStatus, setMigrationApplyStatus] = useState<MigrationApplyStatus>("idle");
+  const [migrationApplyReport, setMigrationApplyReport] = useState<MigrationApplyReport | null>(null);
+  const [migrationApplyError, setMigrationApplyError] = useState<string | null>(null);
+  const [migrationConfirmation, setMigrationConfirmation] = useState("");
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [consoleInput, setConsoleInput] = useState("");
   const [consoleMessage, setConsoleMessage] = useState("");
@@ -569,7 +582,7 @@ function AppShell() {
   const projectsRef = useRef<Project[]>([]);
   const groupsRef = useRef<ProjectGroup[]>([]);
   const appStateRef = useRef<AppState>({
-    dataVersion: 1,
+    dataVersion: 2,
     currentProjectId: null,
     projectSidebarCollapsed: false,
     propertiesSidebarCollapsed: true,
@@ -587,16 +600,27 @@ function AppShell() {
     [restoreBackups, selectedBackupId],
   );
 
+  const invalidateMigrationState = useCallback(() => {
+    setMigrationDryRunStatus("idle");
+    setMigrationDryRunReport(null);
+    setMigrationDryRunContext(null);
+    setMigrationDryRunError(null);
+    setMigrationApplyStatus("idle");
+    setMigrationApplyReport(null);
+    setMigrationApplyError(null);
+    setMigrationConfirmation("");
+  }, []);
+
   const appState = useMemo<AppState>(
     () => ({
-      dataVersion: 1,
+      dataVersion,
       currentProjectId: currentProject?.id ?? null,
       projectSidebarCollapsed,
       propertiesSidebarCollapsed,
       leftSidebarWidth: savedLeftSidebarWidth,
       rightSidebarWidth: savedRightSidebarWidth,
     }),
-    [currentProject?.id, projectSidebarCollapsed, propertiesSidebarCollapsed, savedLeftSidebarWidth, savedRightSidebarWidth],
+    [currentProject?.id, dataVersion, projectSidebarCollapsed, propertiesSidebarCollapsed, savedLeftSidebarWidth, savedRightSidebarWidth],
   );
 
   const setFlowNodes = useCallback((nextOrUpdater: ModuleNodeType[] | ((previous: ModuleNodeType[]) => ModuleNodeType[])) => {
@@ -667,6 +691,7 @@ function AppShell() {
 
   const hydrateLoadedData = useCallback(
     (data: PersistedData) => {
+      invalidateMigrationState();
       const normalizedProjects = normalizeProjects(data.projects);
       const loadedGroups = data.groups ?? [];
       const nextIntegrityReport = scanLightweightIntegrity(normalizedProjects, loadedGroups, data.appState);
@@ -684,8 +709,10 @@ function AppShell() {
       groupsRef.current = normalizedGroups;
       hydratedProjectIdRef.current = null;
       setDataDir(data.dataDir);
+      setLoadedStorageRoot(data.storageRoot ?? "");
       setStorageReport(data.report ?? null);
       setStorageRootInput(data.storageRoot ?? "");
+      setDataVersion(data.appState.dataVersion);
       setGroups(normalizedGroups);
       updateProjects(() => nextProjects);
       setCurrentProjectId(data.appState.currentProjectId ?? firstProject.id);
@@ -702,7 +729,7 @@ function AppShell() {
       loadedRef.current = true;
       setLoaded(true);
     },
-    [updateProjects],
+    [invalidateMigrationState, updateProjects],
   );
 
   useEffect(() => {
@@ -724,6 +751,9 @@ function AppShell() {
         skipNextAutosaveRef.current = false;
         canPersistRef.current = false;
         loadedRef.current = false;
+        invalidateMigrationState();
+        setDataDir("");
+        setLoadedStorageRoot("");
         setSaveStatus("error");
         setLoaded(true);
         void refreshBackups();
@@ -731,7 +761,7 @@ function AppShell() {
     return () => {
       cancelled = true;
     };
-  }, [hydrateLoadedData, refreshBackups]);
+  }, [hydrateLoadedData, invalidateMigrationState, refreshBackups]);
 
   useEffect(() => {
     if (!loaded || !canPersistRef.current) return;
@@ -1364,7 +1394,10 @@ function AppShell() {
   const handleStorageRootInputChange = useCallback((value: string) => {
     setStorageRootInput(value);
     setStorageRootInputWarning(isCheerioFlowDataFolder(value) ? "You selected a folder named CheerioFlowData. Choose its parent folder so the app can create/use CheerioFlowData inside it." : null);
-  }, []);
+    if (normalizeWorkspacePath(value) !== normalizeWorkspacePath(loadedStorageRoot)) {
+      invalidateMigrationState();
+    }
+  }, [invalidateMigrationState, loadedStorageRoot]);
 
   const handleBrowseStorageRoot = useCallback(async () => {
     setFolderPickerStatus("opening");
@@ -1383,6 +1416,9 @@ function AppShell() {
         return;
       }
 
+      if (normalizeWorkspacePath(selectedPath) !== normalizeWorkspacePath(loadedStorageRoot)) {
+        invalidateMigrationState();
+      }
       setStorageRootInput(selectedPath);
       setStorageRootInputWarning(isCheerioFlowDataFolder(selectedPath) ? "You selected a folder named CheerioFlowData. Choose its parent folder so the app can create/use CheerioFlowData inside it." : null);
       setFolderPickerStatus("idle");
@@ -1390,7 +1426,7 @@ function AppShell() {
       setFolderPickerStatus("error");
       setFolderPickerError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, []);
+  }, [invalidateMigrationState, loadedStorageRoot]);
 
   const openProjectDetails = useCallback((projectId: string) => {
     setCurrentProjectId(projectId);
@@ -1399,6 +1435,7 @@ function AppShell() {
   }, []);
 
   const applyStorageRoot = useCallback(async () => {
+    invalidateMigrationState();
     setSaveStatus("saving");
     const shouldSaveCurrentData = canPersistRef.current;
     if (saveTimerRef.current) {
@@ -1406,6 +1443,7 @@ function AppShell() {
       saveTimerRef.current = null;
     }
     canPersistRef.current = false;
+    loadedRef.current = false;
     try {
       const data = shouldSaveCurrentData
         ? await chooseStorageRoot(storageRootInput, projectsRef.current, groupsRef.current, appStateRef.current)
@@ -1418,10 +1456,14 @@ function AppShell() {
     } catch (reason: unknown) {
       console.error("Failed to apply storage root", reason);
       loadedRef.current = false;
+      canPersistRef.current = false;
+      invalidateMigrationState();
+      setDataDir("");
+      setLoadedStorageRoot("");
       setSaveStatus("error");
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, [hydrateLoadedData, refreshBackups, storageRootInput]);
+  }, [hydrateLoadedData, invalidateMigrationState, refreshBackups, storageRootInput]);
 
   const handleCreateFullBackup = useCallback(async () => {
     if (!canPersistRef.current) {
@@ -1464,6 +1506,7 @@ function AppShell() {
       window.clearTimeout(saveTimerRef.current);
       saveTimerRef.current = null;
     }
+    invalidateMigrationState();
     canPersistRef.current = false;
     loadedRef.current = false;
     setRestoreStatus("running");
@@ -1481,6 +1524,7 @@ function AppShell() {
     } catch (reason: unknown) {
       setRestoreStatus("error");
       const restoreMessage = reason instanceof Error ? reason.message : String(reason);
+      invalidateMigrationState();
       setRestoreError(restoreMessage);
       setSaveStatus("error");
       try {
@@ -1490,25 +1534,155 @@ function AppShell() {
       } catch (loadReason: unknown) {
         canPersistRef.current = false;
         loadedRef.current = false;
+        invalidateMigrationState();
+        setDataDir("");
+        setLoadedStorageRoot("");
         const loadMessage = loadReason instanceof Error ? loadReason.message : String(loadReason);
         setError(`${restoreMessage} Reload also failed: ${loadMessage}`);
       }
     }
-  }, [hydrateLoadedData, restoreConfirmation, selectedBackupId]);
+  }, [hydrateLoadedData, invalidateMigrationState, restoreConfirmation, selectedBackupId]);
 
   const handleGenerateMigrationDryRunPlan = useCallback(async () => {
+    invalidateMigrationState();
+    if (!loadedRef.current || !canPersistRef.current) {
+      setMigrationDryRunStatus("error");
+      setMigrationDryRunError("Load failed. Fix or restore the workspace before running migration dry-run.");
+      return;
+    }
     setMigrationDryRunStatus("running");
     setMigrationDryRunError(null);
     try {
       const report = await generateMigrationDryRunPlan();
       setMigrationDryRunReport(report);
+      setMigrationDryRunContext({ storageRoot: loadedStorageRoot, dataDir });
       setMigrationDryRunStatus("success");
     } catch (reason: unknown) {
       setMigrationDryRunReport(null);
+      setMigrationDryRunContext(null);
       setMigrationDryRunStatus("error");
       setMigrationDryRunError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, []);
+  }, [dataDir, invalidateMigrationState, loadedStorageRoot]);
+
+  const isCurrentMigrationReport = useCallback(
+    (report: MigrationDryRunReport | null) => {
+      if (!report || !migrationDryRunContext || !loadedRef.current || !canPersistRef.current) return false;
+      return (
+        normalizeWorkspacePath(migrationDryRunContext.storageRoot) === normalizeWorkspacePath(loadedStorageRoot) &&
+        normalizeWorkspacePath(migrationDryRunContext.dataDir) === normalizeWorkspacePath(dataDir) &&
+        normalizeWorkspacePath(report.sourceDataDir) === normalizeWorkspacePath(dataDir)
+      );
+    },
+    [dataDir, loadedStorageRoot, migrationDryRunContext],
+  );
+
+  const handleApplyGroupFolderMigration = useCallback(async () => {
+    if (!migrationDryRunReport) {
+      setMigrationApplyStatus("error");
+      setMigrationApplyError("Run a migration dry-run before applying migration.");
+      return;
+    }
+    if (!isCurrentMigrationReport(migrationDryRunReport)) {
+      setMigrationApplyStatus("error");
+      setMigrationApplyError("Run dry-run again for the current workspace.");
+      setMigrationConfirmation("");
+      return;
+    }
+    if (!loadedRef.current || !canPersistRef.current) {
+      setMigrationApplyStatus("error");
+      setMigrationApplyError("Load failed. Fix or restore the workspace before applying migration.");
+      setMigrationConfirmation("");
+      return;
+    }
+    if (migrationApplyStatus === "running" || restoreStatus === "running" || saveStatus === "saving") {
+      setMigrationApplyStatus("error");
+      setMigrationApplyError("Wait for the current storage operation to finish, then run dry-run again.");
+      setMigrationConfirmation("");
+      return;
+    }
+    if (migrationDryRunReport.alreadyMigrated || migrationDryRunReport.sourceDataVersion === 2) {
+      setMigrationApplyStatus("success");
+      setMigrationApplyError(null);
+      return;
+    }
+    if (migrationDryRunReport.sourceDataVersion !== 1 || migrationDryRunReport.targetDataVersion !== 2) {
+      setMigrationApplyStatus("error");
+      setMigrationApplyError("Only dataVersion 1 can be migrated to dataVersion 2.");
+      return;
+    }
+    if (migrationDryRunReport.summary.blockerCount > 0) {
+      setMigrationApplyStatus("error");
+      setMigrationApplyError("Resolve dry-run blockers before applying migration.");
+      return;
+    }
+    if (migrationConfirmation !== "MIGRATE") {
+      setMigrationApplyStatus("error");
+      setMigrationApplyError("Type MIGRATE to confirm this migration.");
+      return;
+    }
+
+    if (saveTimerRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    invalidateMigrationState();
+    canPersistRef.current = false;
+    loadedRef.current = false;
+    setMigrationApplyStatus("running");
+    setMigrationApplyError(null);
+    setMigrationApplyReport(null);
+    try {
+      const report = await applyGroupFolderMigration();
+      if (report.blockers.length > 0) {
+        throw new Error(report.blockers.join(" | "));
+      }
+      let data: PersistedData;
+      try {
+        data = await loadDatabase();
+      } catch (loadReason: unknown) {
+        canPersistRef.current = false;
+        loadedRef.current = false;
+        invalidateMigrationState();
+        setDataDir("");
+        setLoadedStorageRoot("");
+        const loadMessage = loadReason instanceof Error ? loadReason.message : String(loadReason);
+        setSaveStatus("error");
+        setMigrationApplyStatus("error");
+        setMigrationApplyError(`Migration applied, but reload failed: ${loadMessage}`);
+        setError(`Migration applied, but reload failed: ${loadMessage}`);
+        return;
+      }
+      hydrateLoadedData(data);
+      void refreshBackups();
+      setMigrationApplyReport(report);
+      setMigrationConfirmation("");
+      setSaveStatus("saved");
+      setError(null);
+      setMigrationApplyStatus("success");
+    } catch (reason: unknown) {
+      const migrationMessage = reason instanceof Error ? reason.message : String(reason);
+      invalidateMigrationState();
+      setSaveStatus("error");
+      try {
+        const data = await loadDatabase();
+        hydrateLoadedData(data);
+        setError(migrationMessage);
+        setMigrationApplyStatus("error");
+        setMigrationApplyError(migrationMessage);
+      } catch (loadReason: unknown) {
+        canPersistRef.current = false;
+        loadedRef.current = false;
+        invalidateMigrationState();
+        setDataDir("");
+        setLoadedStorageRoot("");
+        const loadMessage = loadReason instanceof Error ? loadReason.message : String(loadReason);
+        setMigrationApplyStatus("error");
+        setMigrationApplyError(`${migrationMessage} Reload also failed: ${loadMessage}`);
+        setError(`${migrationMessage} Reload also failed: ${loadMessage}`);
+      }
+    }
+  }, [hydrateLoadedData, invalidateMigrationState, isCurrentMigrationReport, migrationApplyStatus, migrationConfirmation, migrationDryRunReport, refreshBackups, restoreStatus, saveStatus]);
 
   const createModuleAt = useCallback(
     (shape: ModuleShape, clientX: number, clientY: number) => {
@@ -1781,9 +1955,21 @@ function AppShell() {
     [groups, projects],
   );
   const showIntegrityBanner = Boolean(integrityReport && !integrityReport.ok && !integrityBannerDismissed);
-  const migrationBlockerPreview = migrationDryRunReport ? getPreviewItems(migrationDryRunReport.blockers, 10) : null;
-  const migrationWarningPreview = migrationDryRunReport ? getPreviewItems(migrationDryRunReport.warnings, 10) : null;
-  const migrationOperationPreview = migrationDryRunReport ? getPreviewItems(migrationDryRunReport.plannedOperations, 20) : null;
+  const currentMigrationDryRunReport = isCurrentMigrationReport(migrationDryRunReport) ? migrationDryRunReport : null;
+  const migrationBlockerPreview = currentMigrationDryRunReport ? getPreviewItems(currentMigrationDryRunReport.blockers, 10) : null;
+  const migrationWarningPreview = currentMigrationDryRunReport ? getPreviewItems(currentMigrationDryRunReport.warnings, 10) : null;
+  const migrationOperationPreview = currentMigrationDryRunReport ? getPreviewItems(currentMigrationDryRunReport.plannedOperations, 20) : null;
+  const migrationStorageOperationRunning = migrationApplyStatus === "running" || restoreStatus === "running" || saveStatus === "saving";
+  const migrationCanRunDryRun = loadedRef.current && canPersistRef.current && !migrationStorageOperationRunning;
+  const migrationCanUseDryRun = Boolean(
+    currentMigrationDryRunReport &&
+      !currentMigrationDryRunReport.alreadyMigrated &&
+      currentMigrationDryRunReport.sourceDataVersion === 1 &&
+      currentMigrationDryRunReport.targetDataVersion === 2 &&
+      currentMigrationDryRunReport.summary.blockerCount === 0 &&
+      migrationCanRunDryRun,
+  );
+  const migrationCanApply = migrationCanUseDryRun && migrationConfirmation === "MIGRATE";
   const effectiveStorageDrawerHeight = clampStorageDrawerHeight(storageDrawerHeight);
   const storageRootControls = (
     <>
@@ -1918,36 +2104,43 @@ function AppShell() {
         <div className="restore-title-row">
           <strong>Migration dry-run</strong>
         </div>
-        <div className="empty-hint">Dry-run only. No files were moved, copied, deleted, repaired, or written.</div>
-        <button className="action-button" type="button" onClick={() => void handleGenerateMigrationDryRunPlan()} disabled={migrationDryRunStatus === "running"}>
+        <div className="empty-hint">Dry-run is read-only. Apply creates a full backup first, stages the v2 layout, verifies it, then activates by rename.</div>
+        <button className="action-button" type="button" onClick={() => void handleGenerateMigrationDryRunPlan()} disabled={migrationDryRunStatus === "running" || !migrationCanRunDryRun}>
           <GitBranch size={15} />
           {migrationDryRunStatus === "running" ? "Previewing..." : "Preview group-folder migration"}
         </button>
+        {migrationDryRunStatus !== "running" && !currentMigrationDryRunReport && (
+          <div className="empty-hint">
+            {canPersistRef.current ? "Run dry-run to preview migration for the current workspace." : "Load failed. Fix or restore the workspace before running migration dry-run."}
+          </div>
+        )}
         {migrationDryRunStatus === "error" && migrationDryRunError && (
           <div className="backup-result backup-result-error">
             <strong>Migration dry-run failed: {migrationDryRunError}</strong>
           </div>
         )}
-        {migrationDryRunStatus === "success" && migrationDryRunReport && (
+        {migrationDryRunStatus === "success" && currentMigrationDryRunReport && (
           <div className="migration-report">
-            <div className={migrationDryRunReport.summary.blockerCount > 0 ? "backup-result backup-result-warning" : "backup-result backup-result-success"}>
+            <div className={currentMigrationDryRunReport.summary.blockerCount > 0 ? "backup-result backup-result-warning" : "backup-result backup-result-success"}>
               <strong>
-                {migrationDryRunReport.summary.blockerCount > 0
+                {currentMigrationDryRunReport.alreadyMigrated
+                  ? "This workspace is already migrated to the group-folder layout."
+                  : currentMigrationDryRunReport.summary.blockerCount > 0
                   ? "Migration preview found blocking issues. Real migration should not run until these are resolved."
                   : "Migration preview found no blocking issues."}
               </strong>
               <span>This is a dry-run report only.</span>
-              <span>No dataVersion change was made.</span>
+              <span>dataVersion: {currentMigrationDryRunReport.sourceDataVersion} -&gt; {currentMigrationDryRunReport.targetDataVersion}</span>
               <span>No folders were created.</span>
             </div>
             <div className="migration-summary-grid">
-              <span>Project files: {migrationDryRunReport.summary.projectFileCount}</span>
-              <span>Grouped: {migrationDryRunReport.summary.groupedProjectCount}</span>
-              <span>Ungrouped: {migrationDryRunReport.summary.ungroupedProjectCount}</span>
-              <span>Groups: {migrationDryRunReport.summary.groupCount}</span>
-              <span>Planned moves: {migrationDryRunReport.summary.plannedMoveCount}</span>
-              <span>Blockers: {migrationDryRunReport.summary.blockerCount}</span>
-              <span>Warnings: {migrationDryRunReport.summary.warningCount}</span>
+              <span>Project files: {currentMigrationDryRunReport.summary.projectFileCount}</span>
+              <span>Grouped: {currentMigrationDryRunReport.summary.groupedProjectCount}</span>
+              <span>Ungrouped: {currentMigrationDryRunReport.summary.ungroupedProjectCount}</span>
+              <span>Groups: {currentMigrationDryRunReport.summary.groupCount}</span>
+              <span>Planned moves: {currentMigrationDryRunReport.summary.plannedMoveCount}</span>
+              <span>Blockers: {currentMigrationDryRunReport.summary.blockerCount}</span>
+              <span>Warnings: {currentMigrationDryRunReport.summary.warningCount}</span>
             </div>
             {migrationBlockerPreview && migrationBlockerPreview.visible.length > 0 && (
               <div className="backup-result backup-result-error">
@@ -1978,6 +2171,56 @@ function AppShell() {
                 {migrationOperationPreview.remaining > 0 && <span>+{migrationOperationPreview.remaining} more</span>}
               </div>
             )}
+            {currentMigrationDryRunReport.alreadyMigrated && (
+              <div className="backup-result backup-result-success">
+                <strong>Already migrated</strong>
+                <span>No migration is needed for dataVersion 2.</span>
+              </div>
+            )}
+            {!currentMigrationDryRunReport.alreadyMigrated && (
+              <div className="migration-apply-panel">
+                <div className="backup-result backup-result-warning">
+                  <strong>Apply Migration will modify saved local data and is not reversible through normal undo.</strong>
+                  <span>A full backup will be created first. If needed, restore that backup from Storage Recovery.</span>
+                  <span>The current CheerioFlowData folder will be preserved as a before-migration directory.</span>
+                </div>
+                <label>
+                  Type MIGRATE to confirm
+                  <input value={migrationConfirmation} onChange={(event) => setMigrationConfirmation(event.target.value)} disabled={migrationApplyStatus === "running" || !migrationCanUseDryRun} />
+                </label>
+                <button
+                  className="action-button restore-button"
+                  type="button"
+                  onClick={() => void handleApplyGroupFolderMigration()}
+                  disabled={!migrationCanApply}
+                >
+                  <GitBranch size={15} />
+                  {migrationApplyStatus === "running" ? "Migrating..." : "Apply Migration"}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+        {migrationApplyStatus === "running" && (
+          <div className="backup-result">
+            <span>Applying migration...</span>
+          </div>
+        )}
+        {migrationApplyStatus === "success" && migrationApplyReport && (
+          <div className="backup-result backup-result-success">
+            <strong>{migrationApplyReport.alreadyMigrated ? "Already migrated" : "Migration applied and reloaded"}</strong>
+            {migrationApplyReport.backupDir && <span className="backup-path">Backup: {migrationApplyReport.backupDir}</span>}
+            {migrationApplyReport.beforeMigrationDir && <span className="backup-path">Before migration: {migrationApplyReport.beforeMigrationDir}</span>}
+            <span>
+              Migrated {migrationApplyReport.migratedProjectCount} of {migrationApplyReport.projectFileCount} project files to dataVersion {migrationApplyReport.targetDataVersion}.
+            </span>
+            {migrationApplyReport.warnings.length > 0 && <span>Warnings: {migrationApplyReport.warnings.join(" | ")}</span>}
+          </div>
+        )}
+        {migrationApplyStatus === "error" && migrationApplyError && (
+          <div className="backup-result backup-result-error">
+            <strong>Migration failed: {migrationApplyError}</strong>
+            {migrationApplyReport?.rollbackMessage && <span>{migrationApplyReport.rollbackMessage}</span>}
           </div>
         )}
       </div>

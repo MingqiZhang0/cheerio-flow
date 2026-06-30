@@ -13,7 +13,7 @@ import type {
 import { ARROW_TYPES, MODULE_SHAPES, MODULE_TYPES, PROJECT_CATEGORIES } from "./types";
 
 export const DEFAULT_APP_STATE: AppState = {
-  dataVersion: 1,
+  dataVersion: 2,
   currentProjectId: null,
   projectSidebarCollapsed: false,
   propertiesSidebarCollapsed: true,

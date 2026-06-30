@@ -669,7 +669,8 @@ button {
 }
 
 .migration-dry-run-panel,
-.migration-report {
+.migration-report,
+.migration-apply-panel {
   min-width: 0;
   display: grid;
   gap: 9px;

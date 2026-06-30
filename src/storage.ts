@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppState, BackupReport, BackupSummary, MigrationDryRunReport, PersistedData, Project, ProjectGroup, RestoreReport, StorageReport } from "./types";
+import type { AppState, BackupReport, BackupSummary, MigrationApplyReport, MigrationDryRunReport, PersistedData, Project, ProjectGroup, RestoreReport, StorageReport } from "./types";
 import { DEFAULT_APP_STATE, createEmptyProject, normalizeProjects } from "./utils";
 
 const LOCAL_STORAGE_KEY = "cheerio-flow-browser-fallback";
+const LEGACY_DATA_VERSION = 1;
 
 function isProbablyNotTauriError(reason: unknown) {
   const message = reason instanceof Error ? reason.message : String(reason);
@@ -28,8 +29,8 @@ function createBrowserReport(data: PersistedData): StorageReport {
   };
 }
 
-function normalizeAppStateDataVersion(dataVersion: unknown) {
-  return typeof dataVersion === "number" && Number.isFinite(dataVersion) && dataVersion > 0 ? dataVersion : DEFAULT_APP_STATE.dataVersion;
+function normalizeAppStateDataVersion(dataVersion: unknown, fallback = LEGACY_DATA_VERSION) {
+  return typeof dataVersion === "number" && Number.isFinite(dataVersion) && dataVersion > 0 ? dataVersion : fallback;
 }
 
 function normalizePersistedData(data: PersistedData): PersistedData {
@@ -38,6 +39,7 @@ function normalizePersistedData(data: PersistedData): PersistedData {
   const appState = {
     ...DEFAULT_APP_STATE,
     ...data.appState,
+    dataVersion: normalizeAppStateDataVersion(data.appState?.dataVersion, LEGACY_DATA_VERSION),
   };
   const normalized = {
     ...data,
@@ -177,6 +179,18 @@ export async function generateMigrationDryRunPlan(): Promise<MigrationDryRunRepo
       throw reason;
     }
     throw new Error("Migration dry-run requires the desktop app.");
+  }
+}
+
+export async function applyGroupFolderMigration(): Promise<MigrationApplyReport> {
+  try {
+    return await invoke<MigrationApplyReport>("apply_group_folder_migration");
+  } catch (reason: unknown) {
+    if (!isProbablyNotTauriError(reason)) {
+      console.error("Failed to apply group-folder migration", reason);
+      throw reason;
+    }
+    throw new Error("Group-folder migration requires the desktop app.");
   }
 }
 
