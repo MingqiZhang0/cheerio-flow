@@ -638,6 +638,15 @@ Possible future extensions:
 * More node types for academic writing and experiment tracking.
 * Better diagnostics and repair tools.
 
+## Future Data Reliability
+
+Cheerio Flow aims to evolve from v0.1.4 Data Safety Foundation toward professional-grade local data reliability for research workflow projects.
+
+See:
+
+- `docs/DATA_RELIABILITY_ROADMAP.md`
+- `docs/IDEAS_DUAL_PLANE_LOCAL_DATA_MODEL.md`
+
 ## Development notes
 
 This project was developed with AI-assisted coding support.
