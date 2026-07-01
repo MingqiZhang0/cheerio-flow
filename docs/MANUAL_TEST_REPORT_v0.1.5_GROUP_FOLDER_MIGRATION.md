@@ -2,8 +2,8 @@
 
 ## Document Status
 
-- **Version:** 1.0
-- **Date:** 2026-06-30
+- **Version:** 1.1
+- **Date:** 2026-07-01
 - **Scope:** Manual acceptance testing for v0.1.5 Group Folder Migration
 - **Test type:** Human-operated manual testing (NOT automated CI)
 
@@ -26,6 +26,8 @@ Because this migration rewrites the on-disk layout of user project files, it req
 5. **Already-migrated workspaces are safe.** Dry-run on v2 must report "already migrated" and show planned moves = 0.
 6. **Bad data is not migrated.** Corrupted workspaces must block migration and must not be altered.
 7. **Stale migration UI must not mislead.** Switching workspaces must clear old migration previews.
+8. **Duplicate project IDs block migration.** Two files with the same `project.id` must block load/migration and leave disk unchanged.
+9. **Restore old v1 backup after migration works correctly.** Restored v1 backup returns to v1 layout and does not auto-migrate.
 
 ---
 
@@ -35,7 +37,8 @@ Because this migration rewrites the on-disk layout of user project files, it req
 |---|---|
 | **Application** | Cheerio Flow v0.1.5 (development build) |
 | **Branch** | `v0.1.5-group-folder-migration` |
-| **HEAD (final)** | `8a06381` |
+| **HEAD (initial)** | `8a06381` |
+| **HEAD (final, post Ctrl fix)** | `77d8c71` |
 | **v0.1.4 tag** | `e7f4994` (untouched) |
 | **Platform** | Windows 11 Home 10.0.26200 |
 | **Shell** | PowerShell 5.1 |
@@ -50,7 +53,7 @@ Because this migration rewrites the on-disk layout of user project files, it req
 
 ## Git State at Test Time
 
-### Pre-test check
+### Pre-test check (Tests A-H)
 
 ```powershell
 git status --short
@@ -66,12 +69,12 @@ git show --no-patch --oneline v0.1.4
 # e7f4994 v0.1.4: Fix backup result panel sizing
 ```
 
-### Post-test final state
+### Post-Test I/J / Ctrl fix state
 
 ```text
 git status --short   → (clean)
 branch               → v0.1.5-group-folder-migration
-HEAD                 → 8a06381
+HEAD                 → 77d8c71
 v0.1.4 tag           → e7f4994 (untouched, unmoved)
 ```
 
@@ -110,6 +113,18 @@ E:\CF_TEST\
       app-state.json        (dataVersion: 1)
       projects/
         project-xxx.json    (valid JSON)
+
+  duplicate_parent\         ← Test I: v1 workspace with duplicate project.id
+    CheerioFlowData\
+      app-state.json        (dataVersion: 1)
+      projects/
+        project-xxx.json
+        duplicate-copy.json (same project.id as another file)
+
+  restore_j_parent\         ← Test J: v2 workspace restored from old v1 backup
+    CheerioFlowData\        (dataVersion 2 → restored to v1)
+    CheerioFlowData.before-restore-*  (preserved by restore)
+    CheerioFlowBackups\     (including pre-restore backup)
 ```
 
 **Important:** The "storage parent folder" is the folder *containing* `CheerioFlowData`. For example, `E:\CF_TEST\v1_legacy_parent` is the storage parent folder, and the actual data lives at `E:\CF_TEST\v1_legacy_parent\CheerioFlowData`.
@@ -128,20 +143,28 @@ E:\CF_TEST\
 | **Test F** | v2 project group move rewrites canonical path safely | ✅ Passed |
 | **Test G** | Already migrated v2 workspace reports no migration needed | ✅ Passed |
 | **Test H** | Bad JSON / stale migration preview: bug found, fixed, and re-tested | ✅ Passed (H2 + H3) |
-| **Test I** | Duplicate project ID blocker | ❌ Not yet run |
-| **Test J** | Restore old backup after migration | ❌ Not yet run |
+| **Test I** | Duplicate project ID blocks migration and leaves disk unchanged | ✅ Passed |
+| **Test J** | Restore old v1 backup after migration returns to v1 without auto-migrate | ✅ Passed |
+
+### Post A-J Manual Finding / UI Fix
+
+| Item | Description | Result |
+|---|---|---|
+| **Ctrl radial menu scope bug** | Ctrl radial menu should only open over canvas, not sidebar/topbar/status bar/etc. | ✅ Fixed and manually tested |
 
 ---
 
 ## Manual Testing Statement
 
-> **All Test A-H checks in this report were performed manually by the project owner/operator.**
+> **All Test A-J checks in this report were performed manually by the project owner/operator.**
 >
-> The desktop app UI actions (opening Storage drawer, switching storage roots, typing MIGRATE, clicking Apply Migration, editing project titles and module content, waiting for autosave, closing and re-opening the app) were all performed manually.
+> The desktop app UI actions (opening Storage drawer, switching storage roots, typing MIGRATE, clicking Apply Migration, editing project titles and module content, waiting for autosave, closing and re-opening the app, restoring backups) were all performed manually.
 >
 > The PowerShell verification commands (reading `app-state.json`, listing project files, checking for `projects/ungrouped` and `projects/groups`, inspecting `CheerioFlowData.before-migration-*` directories and `CheerioFlowBackups` directories) were executed manually.
 >
 > The results were manually inspected and interpreted against the expected outcomes.
+>
+> The Ctrl radial menu scope fix was also manually verified by the operator.
 >
 > Codex / Claude / ChatGPT assisted with test planning, prompt generation, code edits, and report drafting, but did **not** replace manual acceptance testing. No AI agent clicked buttons, typed confirmation strings, or verified disk state on the test machine.
 >
@@ -151,9 +174,9 @@ E:\CF_TEST\
 
 ```text
 本报告记录的是人工验收测试，不是自动化测试报告。
-所有 UI 操作、路径切换、dry-run、migration apply、PowerShell 磁盘检查均由人工执行。
-AI 工具仅用于辅助制定测试流程、解释结果、修复代码和整理文档，
-不替代人工测试验收。
+Test A-J 的 UI 操作、路径切换、dry-run、migration apply、restore、autosave 检查、PowerShell 磁盘检查均由人工执行。
+Ctrl 模块创建轮盘作用域修复也由人工验证。
+AI 工具仅用于辅助制定流程、解释结果、修复代码和整理文档，不替代人工验收。
 ```
 
 ---
@@ -939,33 +962,376 @@ Dry-run remained read-only — no files or directories were created on disk.
 
 ---
 
-## Tests Not Yet Run
+## Test I — Duplicate Project ID Blocker
 
-### Test I — Duplicate Project ID Blocker
+### Goal
 
-**Status:** ❌ Not yet run.
+Verify that when a v1 workspace has two different project JSON files in `projects/` with the same internal `project.id`, the system blocks loading or blocks migration. No migration, no v2 layout creation, no backup creation, and no before-migration directory creation must occur.
 
-**Planned scenario:** Create a v1 workspace where two project JSON files have the same `"id"` field (or where `groups.json` contains duplicate project IDs). Run dry-run. Expected: the dry-run must report blockers (duplicate project IDs) and block migration apply.
+### Test directory
 
-**Why not yet run:** Tests A-H focused on the happy path, error path (bad JSON), and stale UI cleanup. The duplicate-ID blocker path exercises a different branch of the migration engine's validation logic.
+```text
+E:\CF_TEST\duplicate_parent
+```
 
-**Recommended:** Run Test I after this report is committed and reviewed.
+### Preparing the duplicate project.id fixture
 
-### Test J — Restore Old Backup After Migration
+The fixture was constructed by copying the migration-before v1 before-migration data, then duplicating one project JSON file under a different filename, so that `projects/` contains two different files with the same internal `project.id`.
 
-**Status:** ❌ Not yet run.
+```powershell
+$src = Get-ChildItem E:\CF_TEST\v1_legacy_parent -Directory |
+  Where-Object {$_.Name -like "CheerioFlowData.before-migration*"} |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
 
-**Planned scenario:** After a v1 → v2 migration (Test D), restore a v1 backup (created before migration). Expected: the restored v1 workspace should load correctly as v1 with flat layout, and the app should not confuse it with the migrated v2 workspace.
+Remove-Item E:\CF_TEST\duplicate_parent\CheerioFlowData -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item E:\CF_TEST\duplicate_parent\CheerioFlowBackups -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item E:\CF_TEST\duplicate_parent\CheerioFlowData.before-migration-* -Recurse -Force -ErrorAction SilentlyContinue
 
-**Why not yet run:** Restore-from-backup tests involve additional complexity (managing multiple backup directories, verifying the app correctly handles the post-restore dataVersion). Tests A-H already verified the core migration engine behavior.
+New-Item -ItemType Directory -Path E:\CF_TEST\duplicate_parent -Force | Out-Null
 
-**Recommended:** Run Test J after Test I, before final v0.1.5 tag.
+Copy-Item $src.FullName E:\CF_TEST\duplicate_parent\CheerioFlowData -Recurse
+
+$project = Get-ChildItem E:\CF_TEST\duplicate_parent\CheerioFlowData\projects -Filter *.json | Select-Object -First 1
+
+Copy-Item $project.FullName (Join-Path $project.DirectoryName "duplicate-copy.json")
+```
+
+### Initial disk check
+
+```powershell
+Get-Content E:\CF_TEST\duplicate_parent\CheerioFlowData\app-state.json | Select-String "dataVersion"
+
+Get-ChildItem E:\CF_TEST\duplicate_parent\CheerioFlowData\projects -Filter *.json | Select-Object FullName
+
+Test-Path E:\CF_TEST\duplicate_parent\CheerioFlowData\projects\ungrouped
+Test-Path E:\CF_TEST\duplicate_parent\CheerioFlowData\projects\groups
+
+Get-ChildItem E:\CF_TEST\duplicate_parent -Directory | Where-Object {$_.Name -like "CheerioFlowData.before-migration*"}
+
+Get-ChildItem E:\CF_TEST\duplicate_parent\CheerioFlowBackups -Directory -ErrorAction SilentlyContinue
+```
+
+### Observed initial disk state
+
+```text
+"dataVersion": 1
+
+E:\CF_TEST\duplicate_parent\CheerioFlowData\projects\duplicate-copy.json
+E:\CF_TEST\duplicate_parent\CheerioFlowData\projects\project-1782832556296332000.json
+E:\CF_TEST\duplicate_parent\CheerioFlowData\projects\project-1782832568397-aorc9z.json
+
+projects/ungrouped = False
+projects/groups = False
+no CheerioFlowData.before-migration-*
+no CheerioFlowBackups backup
+```
+
+### Manual UI test
+
+1. Launched Cheerio Flow.
+2. Opened Storage drawer.
+3. Used **Switch and Reload** to point to `E:\CF_TEST\duplicate_parent`.
+4. Observed the app behavior.
+5. Ran disk verification.
+
+### Observed UI result
+
+The app entered a **load failed** state:
+
+```text
+Data directory: unavailable
+Disk 2/5/3
+Modules 5 / Arrows 3
+Save failed
+Duplicate project id project-1782832556296332000 found at projects/duplicate-copy.json and projects/project-1782832556296332000.json
+```
+
+- Dry-run was not available.
+- Apply Migration was unavailable.
+
+**UX observation:**
+
+> The bottom status bar displayed "Save failed", but the actual scenario is closer to "Load failed / Storage load failed". This does not affect the Test I data safety conclusion, but is noted as a potential future wording improvement.
+
+### Post-test disk check
+
+```powershell
+Get-Content E:\CF_TEST\duplicate_parent\CheerioFlowData\app-state.json | Select-String "dataVersion"
+# "dataVersion": 1
+
+Get-ChildItem E:\CF_TEST\duplicate_parent\CheerioFlowData\projects -Filter *.json | Select-Object FullName
+# duplicate-copy.json
+# project-1782832556296332000.json
+# project-1782832568397-aorc9z.json
+
+Test-Path E:\CF_TEST\duplicate_parent\CheerioFlowData\projects\ungrouped
+# False
+
+Test-Path E:\CF_TEST\duplicate_parent\CheerioFlowData\projects\groups
+# False
+```
+
+No `CheerioFlowData.before-migration-*` directories were created.
+No `CheerioFlowBackups` directories were created.
+
+### Conclusion
+
+```text
+Test I passed.
+Duplicate project id was detected during load.
+Migration dry-run could not run.
+Apply Migration was unavailable.
+The workspace stayed dataVersion 1 and remained in flat v1 layout.
+No v2 folders, backup, or before-migration directory were created.
+
+This was a manual test. The UI operation and PowerShell disk checks were performed by the human operator.
+```
+
+---
+
+## Test J — Restore Old v1 Backup After Migration
+
+### Goal
+
+Verify that a migrated v2 workspace can be restored from an old v1 backup. After restore, the workspace must be at `dataVersion: 1` with a flat `projects/` layout. Normal autosave after restore must not auto-migrate to v2. An optional dry-run should correctly identify the workspace as `1 -> 2`.
+
+### Test directory
+
+```text
+E:\CF_TEST\restore_j_parent
+```
+
+### Initial state
+
+Test J started from a valid migrated v2 workspace, cloned from the Test D v1_legacy_parent:
+
+```powershell
+Remove-Item E:\CF_TEST\restore_j_parent -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path E:\CF_TEST\restore_j_parent -Force | Out-Null
+
+Copy-Item E:\CF_TEST\v1_legacy_parent\CheerioFlowData E:\CF_TEST\restore_j_parent\CheerioFlowData -Recurse
+Copy-Item E:\CF_TEST\v1_legacy_parent\CheerioFlowBackups E:\CF_TEST\restore_j_parent\CheerioFlowBackups -Recurse
+```
+
+### Initial disk check
+
+```powershell
+Get-Content E:\CF_TEST\restore_j_parent\CheerioFlowData\app-state.json | Select-String "dataVersion"
+
+Get-ChildItem E:\CF_TEST\restore_j_parent\CheerioFlowData\projects -Recurse -Filter *.json | Select-Object FullName
+
+Get-ChildItem E:\CF_TEST\restore_j_parent\CheerioFlowData\projects -Filter *.json | Select-Object FullName
+```
+
+### Observed initial state
+
+```text
+"dataVersion": 2
+
+E:\CF_TEST\restore_j_parent\CheerioFlowData\projects\groups\group-1782832570061-eivrdw\project-1782832556296332000.json
+E:\CF_TEST\restore_j_parent\CheerioFlowData\projects\ungrouped\project-1782832568397-aorc9z.json
+
+top-level projects/*.json had no output
+```
+
+Test J started from a valid migrated v2 workspace.
+
+### Restore operation
+
+1. Launched Cheerio Flow.
+2. Opened Storage drawer.
+3. Used **Switch and Reload** to point to `E:\CF_TEST\restore_j_parent`.
+4. In the **Storage Recovery / Backups** section, selected the old v1 backup: `backup-20260630-164511`.
+5. Clicked **Restore**.
+
+### Restore UI output
+
+```text
+Restored: backup-20260630-164511
+Pre-restore backup: E:\CF_TEST\restore_j_parent\CheerioFlowBackups\backup-20260701-042923-pre-restore
+Restored data: E:\CF_TEST\restore_j_parent\CheerioFlowData
+Warnings: Previous data directory was preserved at E:\CF_TEST\restore_j_parent\CheerioFlowData.before-restore-20260701-042923 | Pre-restore backup was created at E:\CF_TEST\restore_j_parent\CheerioFlowBackups\backup-20260701-042923-pre-restore
+```
+
+### Post-restore disk check
+
+```powershell
+Get-Content E:\CF_TEST\restore_j_parent\CheerioFlowData\app-state.json | Select-String "dataVersion"
+
+Get-ChildItem E:\CF_TEST\restore_j_parent\CheerioFlowData\projects -Filter *.json | Select-Object FullName
+
+Test-Path E:\CF_TEST\restore_j_parent\CheerioFlowData\projects\ungrouped
+Test-Path E:\CF_TEST\restore_j_parent\CheerioFlowData\projects\groups
+```
+
+### Observed post-restore disk state
+
+```text
+"dataVersion": 1
+
+E:\CF_TEST\restore_j_parent\CheerioFlowData\projects\project-1782832556296332000.json
+E:\CF_TEST\restore_j_parent\CheerioFlowData\projects\project-1782832568397-aorc9z.json
+
+projects/ungrouped = False
+projects/groups = False
+```
+
+### Restore protective backup check
+
+```powershell
+Get-ChildItem E:\CF_TEST\restore_j_parent\CheerioFlowBackups -Directory | Select-Object Name, LastWriteTime
+```
+
+Observed:
+
+```text
+backup-20260630-164422
+backup-20260630-164511
+backup-20260701-042923-pre-restore
+```
+
+Restore created a pre-restore backup (`backup-20260701-042923-pre-restore`) before replacing the active data directory. The previous active v2 `CheerioFlowData` was preserved as `CheerioFlowData.before-restore-20260701-042923`.
+
+### Post-restore normal save check
+
+After restore, the operator:
+
+1. Edited a project title.
+2. Edited module content.
+3. Waited for autosave.
+4. Closed and re-opened the app.
+5. Ran disk verification.
+
+Result:
+
+```text
+"dataVersion": 1
+
+projects/ 下仍是：
+project-1782832556296332000.json
+project-1782832568397-aorc9z.json
+
+projects/ungrouped = False
+projects/groups = False
+```
+
+Restoring an old v1 backup followed by normal autosave kept the workspace at `dataVersion: 1` with flat project layout. Auto-migration did not occur.
+
+### Optional dry-run check
+
+After restore, the operator manually ran a dry-run. The UI output:
+
+```text
+Migration preview found no blocking issues.
+This is a dry-run report only.
+dataVersion: 1 -> 2
+No folders were created.
+Project files: 2
+Grouped: 1
+Ungrouped: 1
+Groups: 1
+Planned moves: 2
+Blockers: 0
+Warnings: 0
+Planned operations
+createDirectory: (new directory) -> projects/ungrouped [planned]
+moveProjectFile: projects/project-1782832556296332000.json -> projects/ungrouped/project-1782832556296332000.json [planned]
+createDirectory: (new directory) -> projects/groups/group-1782832570061-eivrdw [planned]
+moveProjectFile: projects/project-1782832568397-aorc9z.json -> projects/groups/group-1782832570061-eivrdw/project-1782832568397-aorc9z.json [planned]
+```
+
+The restored workspace is a healthy v1 workspace. It does not auto-migrate, but a manual dry-run correctly previews `v1 -> v2` migration with 0 blockers and 2 planned moves.
+
+### Conclusion
+
+```text
+Test J passed.
+Restoring an old v1 backup after migration returned the workspace to dataVersion 1 and flat v1 project layout.
+Restore created a pre-restore backup and preserved the previous active data directory as before-restore.
+Normal autosave after restore did not auto-migrate the workspace to v2.
+A manual dry-run correctly identified the restored workspace as dataVersion 1 -> 2 with blockers 0 and planned moves 2.
+
+This was a manual restore test. The restore operation, UI inspection, autosave check, and PowerShell verification were performed by the human operator.
+```
+
+---
+
+## Post A-J Manual Finding / UI Fix — Ctrl Radial Menu Scope
+
+### Discovery
+
+After Test A-J, the operator found a UI scope bug: when the mouse pointer was outside the canvas (e.g., sidebar, topbar, status bar, Storage drawer, or Properties panel), pressing `Ctrl` could still open the module creation radial menu.
+
+> A-J 测试后，人工发现一个 UI 作用域漏洞：当鼠标位于画布区域之外，例如侧栏、顶栏、底栏、Storage drawer 或 Properties panel 时，按 `Ctrl` 仍可能弹出模块创建轮盘。
+
+### Risk
+
+This was not a data migration failure, but it was a release-blocking UI scope bug because the radial menu should only belong to the canvas interaction context. Allowing it to trigger from non-canvas regions could cause unintended module creation, interfere with other UI interactions, and degrade the user experience.
+
+### Fix target
+
+The Ctrl radial menu should only open when the pointer is over the React Flow canvas / viewport. It should not open from sidebar, topbar, status bar, Storage drawer, Properties panel, buttons, inputs, textarea, select, or contenteditable elements.
+
+### Fix summary
+
+The fix was applied in commit `77d8c71` (`fix: scope Ctrl radial menu to canvas`) and touched one file: `src/App.tsx`.
+
+| Change | Purpose |
+|---|---|
+| Expanded `isEditableTarget` guard | Now checks `Element` (not just `HTMLElement`), includes `isContentEditable`, and covers `button`, `[contenteditable='plaintext-only']`, `[role='button']`, `[role='dialog']`, `dialog`, `[aria-modal='true']` |
+| Added `isReactFlowTarget` guard | Returns `true` only if the pointer target is inside a `.react-flow` element |
+| Added `isPointerOverCanvas` state | Tracks whether the pointer is currently over the canvas via `onMouseEnter`/`onMouseLeave` on the canvas wrap div |
+| Added `lastPointerTargetRef` | Captures the last pointer event target on every `pointermove` |
+| Added canvas scope check in Ctrl keydown handler | Before opening the radial menu, verifies `isPointerOverCanvas`, `isReactFlowTarget(lastPointerTargetRef.current)`, and `!isEditableTarget(lastPointerTargetRef.current)` |
+| Clears `ctrlWheel` on mouse leave from canvas | When the pointer leaves the canvas region, any open radial menu is dismissed |
+
+### Manual test result
+
+```text
+Manual test result: passed.
+```
+
+The operator manually tested the relevant canvas and non-canvas regions:
+
+1. Pointer over canvas + Ctrl → radial menu appears ✅
+2. Pointer over sidebar + Ctrl → radial menu does not appear ✅
+3. Pointer over Properties panel + Ctrl → radial menu does not appear ✅
+4. Pointer over status bar + Ctrl → radial menu does not appear ✅
+5. Pointer over topbar / toolbar + Ctrl → radial menu does not appear ✅
+6. Pointer over Storage drawer + Ctrl → radial menu does not appear ✅
+7. Focus inside input / textarea + Ctrl → radial menu does not appear ✅
+8. Moving from canvas to non-canvas region correctly disables the radial menu trigger ✅
+9. Moving back to canvas restores normal radial menu behavior ✅
+
+The operator reported that the manual Ctrl scope test passed with no observed issue.
+
+### Conclusion
+
+```text
+Post A-J Ctrl radial menu scope fix passed manual verification.
+This fix does not require rerunning Test A-J because it is an independent UI interaction scope fix
+and does not alter migration, restore, backup, or dataVersion logic.
+```
+
+---
+
+## Remaining Release Checks
+
+At the time of this report update, Test A-J manual validation has been completed. No additional migration manual test case from the original A-J checklist remains open.
+
+Before tagging v0.1.5, perform final review / release closeout:
+
+- confirm git status is clean;
+- confirm v0.1.4 tag is unchanged (`e7f4994`);
+- run final build/test validation if needed;
+- optionally request a read-only review of the final branch.
 
 ---
 
 ## Closeout Validation
 
-After the H fix was applied to `src/App.tsx`, the following validation commands were executed:
+After the H fix and Ctrl radial menu scope fix were applied, the following validation commands were executed:
 
 ```powershell
 cd E:\科研流程规划
@@ -987,14 +1353,14 @@ cd ..
 pnpm desktop:build            # ✅ MSI + NSIS installers produced
 ```
 
-### Final commit
+### Final commits
 
 ```text
-git add src/App.tsx
-git commit --amend --no-edit
+8a06381 v0.1.5: Add group folder migration
+aa63654 docs: add v0.1.5 manual test report
+77d8c71 fix: scope Ctrl radial menu to canvas
 
-HEAD: 8a06381
-Message: v0.1.5: Add group folder migration
+HEAD: 77d8c71
 ```
 
 ### Final git state
@@ -1002,7 +1368,7 @@ Message: v0.1.5: Add group folder migration
 ```text
 git status --short   → (clean)
 branch               → v0.1.5-group-folder-migration
-HEAD                 → 8a06381
+HEAD                 → 77d8c71
 v0.1.4 tag           → e7f4994 (untouched)
 ```
 
@@ -1010,27 +1376,50 @@ v0.1.4 tag           → e7f4994 (untouched)
 
 ## Scope of Changes in v0.1.5
 
-The amended commit `8a06381` contains the following files:
+The v0.1.5 branch contains the following files across three commits:
 
 | File | Change type |
 |---|---|
 | `src-tauri/src/lib.rs` | Rust backend: classification engine, v1/v2 load/save paths, migration engine, 12 unit tests |
-| `src/App.tsx` | Frontend: migration UI, stale report invalidation, storage-root-aware guards (H fix) |
+| `src/App.tsx` | Frontend: migration UI, stale report invalidation, storage-root-aware guards (H fix), Ctrl radial menu canvas scope (Ctrl fix) |
 | `src/storage.ts` | `applyGroupFolderMigration` Tauri command wrapper |
 | `src/types.ts` | `MigrationApplyReport` TypeScript type |
 | `src/utils.ts` | `dataVersion` default updated |
 | `package.json` | Version number |
 
-Only `src/App.tsx` was modified in the final H fix amend. All other files were part of the original v0.1.5 commit.
+Only `src/App.tsx` was modified in the H fix amend and the Ctrl fix follow-up commit. All other files were part of the original v0.1.5 commit.
 
 ---
 
 ## Recommendations
 
-1. **Run Test I and Test J** before tagging v0.1.5. These cover additional safety paths not exercised by Tests A-H.
-2. **Consider UX wording improvement** for load-failure scenarios. The bottom bar currently shows "Save failed" even when the root cause is a load failure. A future version could display "Load failed" or "Storage load failed" for load errors.
-3. **Do not tag v0.1.5** until Test I, Test J, and final review are complete.
-4. **Do not merge to main** until the tag decision is made.
+1. **Test I and Test J are now complete.** No further migration manual test cases remain from the A-J checklist.
+2. **Consider UX wording improvement** for load-failure scenarios. The bottom bar currently shows "Save failed" even when the root cause is a load failure (observed in both Test H2 and Test I). A future version could display "Load failed" or "Storage load failed" for load errors.
+3. **Do not merge to main** until the tag decision is made and final review is complete.
+4. **Ctrl radial menu scope fix** is confirmed working and does not require migration test rerun.
+
+---
+
+## Final Conclusion
+
+The v0.1.5 Group Folder Migration manual test checklist A-J has passed.
+
+The manual validation covered:
+
+- fresh v2 workspace initialization;
+- v1 load/save compatibility;
+- dry-run migration planning;
+- explicit migration apply;
+- v2 post-migration save behavior;
+- group reassignment path safety;
+- already migrated behavior;
+- bad JSON / stale preview handling;
+- duplicate project id blocking;
+- restoring an old v1 backup after migration.
+
+A post-A-J UI scope bug involving Ctrl radial menu triggering outside the canvas was also fixed and manually verified.
+
+The report does not claim protection against physical disk failure or intentional deletion of all local and backup data. It records professional-grade local data reliability validation within the tested software-level failure scenarios.
 
 ---
 
@@ -1046,6 +1435,8 @@ Only `src/App.tsx` was modified in the final H fix amend. All other files were p
 | **Canonical path** | The expected file path for a project based on its `groupId` and `dataVersion` |
 | **Stale project files** | Project JSON files at non-canonical paths, moved to `.cheerio/stale-project-files/` |
 | **Before-migration** | `CheerioFlowData.before-migration-*` — the pre-migration data directory preserved by rename |
+| **Before-restore** | `CheerioFlowData.before-restore-*` — the pre-restore data directory preserved by rename |
+| **Pre-restore backup** | A backup created by the restore operation before replacing the active data directory |
 | **Persistence gate** | `loadedRef` + `canPersistRef` — blocks autosave after failed load |
 | **Stale migration report** | A dry-run or apply report from a previous workspace still displayed after switching |
 
