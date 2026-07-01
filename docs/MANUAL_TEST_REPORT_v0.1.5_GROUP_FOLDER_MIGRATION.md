@@ -2,7 +2,7 @@
 
 ## Document Status
 
-- **Version:** 1.1
+- **Version:** 1.2
 - **Date:** 2026-07-01
 - **Scope:** Manual acceptance testing for v0.1.5 Group Folder Migration
 - **Test type:** Human-operated manual testing (NOT automated CI)
@@ -38,7 +38,8 @@ Because this migration rewrites the on-disk layout of user project files, it req
 | **Application** | Cheerio Flow v0.1.5 (development build) |
 | **Branch** | `v0.1.5-group-folder-migration` |
 | **HEAD (initial)** | `8a06381` |
-| **HEAD (final, post Ctrl fix)** | `77d8c71` |
+| **HEAD (post Ctrl fix)** | `77d8c71` |
+| **HEAD (post error label fix)** | `d25e208` |
 | **v0.1.4 tag** | `e7f4994` (untouched) |
 | **Platform** | Windows 11 Home 10.0.26200 |
 | **Shell** | PowerShell 5.1 |
@@ -75,6 +76,15 @@ git show --no-patch --oneline v0.1.4
 git status --short   → (clean)
 branch               → v0.1.5-group-folder-migration
 HEAD                 → 77d8c71
+v0.1.4 tag           → e7f4994 (untouched, unmoved)
+```
+
+### Post storage error label fix state
+
+```text
+git status --short   → (clean)
+branch               → v0.1.5-group-folder-migration
+HEAD                 → d25e208
 v0.1.4 tag           → e7f4994 (untouched, unmoved)
 ```
 
@@ -151,6 +161,7 @@ E:\CF_TEST\
 | Item | Description | Result |
 |---|---|---|
 | **Ctrl radial menu scope bug** | Ctrl radial menu should only open over canvas, not sidebar/topbar/status bar/etc. | ✅ Fixed and manually tested |
+| **Storage error type label fix** | Load failures were mislabeled as "Save failed"; now correctly shows Load/Save/Restore/Migration failed | ✅ Fixed and manually tested |
 
 ---
 
@@ -166,6 +177,8 @@ E:\CF_TEST\
 >
 > The Ctrl radial menu scope fix was also manually verified by the operator.
 >
+> The storage error type label fix was also manually checked by the operator.
+>
 > Codex / Claude / ChatGPT assisted with test planning, prompt generation, code edits, and report drafting, but did **not** replace manual acceptance testing. No AI agent clicked buttons, typed confirmation strings, or verified disk state on the test machine.
 >
 > This document records **human-operated validation**, not automated CI coverage.
@@ -176,6 +189,7 @@ E:\CF_TEST\
 本报告记录的是人工验收测试，不是自动化测试报告。
 Test A-J 的 UI 操作、路径切换、dry-run、migration apply、restore、autosave 检查、PowerShell 磁盘检查均由人工执行。
 Ctrl 模块创建轮盘作用域修复也由人工验证。
+Load failed / Save failed 错误类型修复也由人工复测确认。
 AI 工具仅用于辅助制定流程、解释结果、修复代码和整理文档，不替代人工验收。
 ```
 
@@ -1314,6 +1328,119 @@ This fix does not require rerunning Test A-J because it is an independent UI int
 and does not alter migration, restore, backup, or dataVersion logic.
 ```
 
+### Storage Error Type Label Fix
+
+#### Discovery
+
+During manual testing of bad JSON and duplicate project id workspaces (Test H2 and Test I), the app correctly blocked loading and prevented migration. However, the bottom status bar displayed "Save failed" even though the failure happened during workspace loading.
+
+> 在 bad JSON 和 duplicate project id 的人工测试中，应用正确阻止了加载并阻止了 migration，但底栏状态曾显示 "Save failed"。实际失败发生在 workspace load 阶段，因此该文案会误导用户，以为应用尝试保存并失败。
+
+This was a **UI/status classification issue**, not a migration data-loss issue.
+
+> 这是 UI 状态分类问题，不是 migration 数据破坏问题。
+
+#### Risk
+
+For a data-safety-oriented workflow, error type labels must be accurate. Displaying load failures as save failures can mislead users about whether the app attempted to write to disk.
+
+> 对于以数据安全为目标的本地生产力工具，错误类型必须准确。把 load failed 显示成 save failed 会误导用户，让用户误以为程序尝试写盘失败。
+
+#### Fix summary
+
+The fix was applied in commit `d25e208` (`fix: distinguish load errors from save errors`) and touched one file: `src/App.tsx`.
+
+| Change | Purpose |
+|---|---|
+| Added `StorageErrorKind` type | `"load" \| "save" \| "restore" \| "migration" \| null` — classifies the last storage error |
+| Added `storageErrorKind` state | Tracks which kind of storage operation most recently failed |
+| Added `storageStatusLabel` computed variable | Maps error kind to label: `load → "Load failed"`, `save → "Save failed"`, `restore → "Restore failed"`, `migration → "Migration failed"` |
+| Successful load/save clears `storageErrorKind` | `hydrateLoadedData` and `saveAllNow` set `storageErrorKind` to `null` on success |
+| `loadDatabase` failure path sets `"load"` | Load failures are now classified correctly as load errors |
+| `saveAllNow` failure path sets `"save"` | Save errors remain classified as save errors |
+| `restoreFullBackup` failure paths set `"restore"` | Restore errors are now classified correctly |
+| `applyGroupFolderMigration` failure paths set `"migration"` | Migration errors are now classified correctly |
+| Footer uses `storageStatusLabel` | Bottom status bar renders the label based on `storageErrorKind` instead of a hardcoded ternary |
+
+**Key behavioral guarantees:**
+
+- Normal load/save success clears `storageErrorKind` — a previously errored workspace returns to normal status when switched to a healthy one.
+- `load failed` keeps `canPersistRef = false` — autosave does not run and cannot overwrite the load error as a save error.
+- Switching back to a normal workspace clears the previous load error state.
+
+> 修复后，正常加载 / 保存成功会清空 storageErrorKind。load failed 后 canPersistRef=false，autosave 不会运行，也不会把 load error 覆盖成 save error。切回正常 workspace 后，上一轮 Load failed 状态会被清除。
+
+This fix did **not** change migration, restore, backup, dataVersion, or v1/v2 layout logic.
+
+#### Manual re-test
+
+The following checks were manually verified by the operator.
+
+> 以下检查由人工操作并人工确认。
+
+##### bad_json_parent
+
+Test directory: `E:\CF_TEST\bad_json_parent`
+
+```text
+The bad JSON fixture remained dataVersion 1.
+The workspace remained in flat projects/*.json layout.
+projects/ungrouped and projects/groups were not created.
+The error path is now classified as Load failed, not Save failed.
+```
+
+##### duplicate_parent
+
+Test directory: `E:\CF_TEST\duplicate_parent`
+
+```text
+The duplicate project id fixture remained dataVersion 1.
+duplicate-copy.json remained present.
+projects/ungrouped and projects/groups were not created.
+The error path is now classified as Load failed, not Save failed.
+```
+
+##### normal workspace save
+
+```text
+For a normal workspace, save/autosave failures are still classified as Save failed.
+Successful load/save clears the previous error type and returns to normal saved status.
+```
+
+##### bad → normal switch
+
+```text
+After switching from a load-failed workspace back to a normal workspace,
+the previous Load failed state is cleared and normal save status resumes.
+```
+
+#### Validation commands
+
+The following validation commands were run after the fix:
+
+```powershell
+git diff --check              # ✅ No whitespace errors
+pnpm exec tsc --noEmit        # ✅ Passed
+pnpm build                    # ✅ Passed
+cd src-tauri
+cargo fmt --check             # ✅ Passed
+cargo check                   # ✅ Passed
+cargo test                    # ✅ 12 passed, 0 failed
+cd ..
+pnpm desktop:build            # ✅ MSI + NSIS installers produced
+```
+
+#### Conclusion
+
+```text
+Storage error type label fix passed manual verification.
+Load failed, Save failed, Restore failed, and Migration failed are now correctly distinguished
+in the bottom status bar.
+
+This fix does not require rerunning Test A-J because it is an independent UI/status classification fix
+and does not alter migration, restore, backup, or dataVersion logic.
+```
+
 ---
 
 ## Remaining Release Checks
@@ -1331,7 +1458,7 @@ Before tagging v0.1.5, perform final review / release closeout:
 
 ## Closeout Validation
 
-After the H fix and Ctrl radial menu scope fix were applied, the following validation commands were executed:
+After the H fix, Ctrl radial menu scope fix, and storage error type label fix were applied, the following validation commands were executed:
 
 ```powershell
 cd E:\科研流程规划
@@ -1359,8 +1486,10 @@ pnpm desktop:build            # ✅ MSI + NSIS installers produced
 8a06381 v0.1.5: Add group folder migration
 aa63654 docs: add v0.1.5 manual test report
 77d8c71 fix: scope Ctrl radial menu to canvas
+c7a8148 docs: complete v0.1.5 manual test report
+d25e208 fix: distinguish load errors from save errors
 
-HEAD: 77d8c71
+HEAD: d25e208
 ```
 
 ### Final git state
@@ -1368,7 +1497,7 @@ HEAD: 77d8c71
 ```text
 git status --short   → (clean)
 branch               → v0.1.5-group-folder-migration
-HEAD                 → 77d8c71
+HEAD                 → d25e208
 v0.1.4 tag           → e7f4994 (untouched)
 ```
 
@@ -1376,27 +1505,27 @@ v0.1.4 tag           → e7f4994 (untouched)
 
 ## Scope of Changes in v0.1.5
 
-The v0.1.5 branch contains the following files across three commits:
+The v0.1.5 branch contains the following files across five commits:
 
 | File | Change type |
 |---|---|
 | `src-tauri/src/lib.rs` | Rust backend: classification engine, v1/v2 load/save paths, migration engine, 12 unit tests |
-| `src/App.tsx` | Frontend: migration UI, stale report invalidation, storage-root-aware guards (H fix), Ctrl radial menu canvas scope (Ctrl fix) |
+| `src/App.tsx` | Frontend: migration UI, stale report invalidation, storage-root-aware guards (H fix), Ctrl radial menu canvas scope (Ctrl fix), storage error type labels (error label fix) |
 | `src/storage.ts` | `applyGroupFolderMigration` Tauri command wrapper |
 | `src/types.ts` | `MigrationApplyReport` TypeScript type |
 | `src/utils.ts` | `dataVersion` default updated |
 | `package.json` | Version number |
 
-Only `src/App.tsx` was modified in the H fix amend and the Ctrl fix follow-up commit. All other files were part of the original v0.1.5 commit.
+Only `src/App.tsx` was modified in the H fix amend, the Ctrl fix, and the error label fix commits. All other files were part of the original v0.1.5 commit.
 
 ---
 
 ## Recommendations
 
 1. **Test I and Test J are now complete.** No further migration manual test cases remain from the A-J checklist.
-2. **Consider UX wording improvement** for load-failure scenarios. The bottom bar currently shows "Save failed" even when the root cause is a load failure (observed in both Test H2 and Test I). A future version could display "Load failed" or "Storage load failed" for load errors.
+2. **Storage error type label fix** has addressed the "Save failed" mislabeling observed in Test H2 and Test I. Load/Save/Restore/Migration failures are now correctly distinguished in the bottom status bar.
 3. **Do not merge to main** until the tag decision is made and final review is complete.
-4. **Ctrl radial menu scope fix** is confirmed working and does not require migration test rerun.
+4. **Ctrl radial menu scope fix** and **storage error type label fix** are confirmed working and do not require migration test rerun.
 
 ---
 
@@ -1418,6 +1547,10 @@ The manual validation covered:
 - restoring an old v1 backup after migration.
 
 A post-A-J UI scope bug involving Ctrl radial menu triggering outside the canvas was also fixed and manually verified.
+
+A post-A-J UI/status classification issue where load failures were displayed as "Save failed" was also fixed and manually verified. The bottom status bar now correctly distinguishes Load failed, Save failed, Restore failed, and Migration failed.
+
+> A-J 之后发现的 load failed 被误显示为 Save failed 的 UI/状态分类问题也已修复，并由人工复测确认。
 
 The report does not claim protection against physical disk failure or intentional deletion of all local and backup data. It records professional-grade local data reliability validation within the tested software-level failure scenarios.
 
