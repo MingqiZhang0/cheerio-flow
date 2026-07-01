@@ -341,60 +341,121 @@ Desktop development and desktop packaging require a working Rust/Tauri environme
 | Storage Operation Console     | Implemented in v0.1.6 | Read-only modal, in-memory event log                         |
 | Storage event buffer          | Implemented in v0.1.6 | Frontend ring buffer, capacity 512                           |
 
-## Data Safety Demo
+## Data Safety Architecture
 
-Cheerio Flow treats local data safety as a first-class design goal.
+Cheerio Flow treats local data safety as a first-class design goal. The diagram below shows the layered data safety architecture as of v0.1.6.
 
-v0.1.4 focused on preventing accidental local data loss caused by failed loads, broken JSON files, unsafe saves, restore failures, or future storage migrations.
-
-v0.1.5 adds the real migration engine with backup enforcement, staging, verification, and rollback, plus duplicate project ID detection, storage error type labels, and Ctrl radial menu canvas scoping. v0.1.6 strengthens active JSON save reliability through atomic writes and adds observability through the Storage Operation Console.
+v0.1.6 strengthens the **active JSON save path** with atomic writes (write-temp → flush → sync_all → verify → rename → verify). The Storage Console adds read-only observability. Backup, restore, migration, and quarantine remain on the v0.1.5 safety model.
 
 ```mermaid
 flowchart TD
-    A[Local CheerioFlowData] --> B[Load database]
+    subgraph UX["1. Frontend"]
+        direction LR
+        UE["User Edit"]
+        AT["Autosave ~2s"]
+        SB["Status Bar → Console"]
+    end
 
-    B -->|Valid data| C[Hydrate app state]
-    C --> D[Enable persistence gate]
-    D --> E[Normal save allowed]
+    subgraph GATE["2. Load Gate"]
+        L["Load"]
+        L -->|bad JSON| BJ["Block"]
+        L -->|dup ID| DI["Block"]
+        L -->|ok| PG["canPersist = true"]
+        BJ --> NG["autosave disabled<br/>disk untouched"]
+        DI --> NG
+    end
 
-    B -->|Bad project JSON / load failure| F[Load failed]
-    F --> G[Disable persistence gate]
-    G --> H[Autosave blocked]
-    H --> I[Existing project files preserved]
+    subgraph SAVE["3. Active Save — v0.1.6 Atomic Write"]
+        TW[".tmp write"]
+        FS["flush + sync_all"]
+        VT["verify temp"]
+        RN["rename"]
+        VF["verify target"]
+        TW --> FS --> VT --> RN --> VF
+        TW -->|pre-rename fail| OLD["old target preserved"]
+        RN -->|post-rename fail| ERR["error, no rollback"]
+    end
 
-    A --> J[Read-only startup integrity scan]
-    J --> K[Report warnings / blockers]
-    K --> L[No automatic repair]
-    L --> I
+    subgraph DISK["4. Active Data + Layout"]
+        V1["v1 flat<br/>projects/*.json"]
+        V2["v2 grouped<br/>projects/ungrouped/<br/>projects/groups/"]
+        NM["no silent<br/>v1→v2 migration"]
+    end
 
-    A --> M[Manual full backup]
-    M --> N[CheerioFlowBackups / backup timestamp]
-    N --> O[Backup manifest]
+    subgraph OLD["5. Safety Paths — v0.1.5 model"]
+        direction LR
+        BK["Backup"]
+        RS["Restore"]
+        MG["Migration"]
+        SQ["Stale Quarantine"]
+    end
 
-    N --> P[Restore selected backup]
-    P --> Q[Create pre-restore backup]
-    Q --> R[Copy into staging directory]
-    R --> S[Rename current data to before-restore]
-    S --> T[Activate restored CheerioFlowData]
-    T --> U[Reload database]
+    subgraph CONSOLE["6. Storage Console — v0.1.6"]
+        direction LR
+        SC["Read-only modal"]
+        CP["Copy Log"]
+        CL["Clear / Close / Esc"]
+        CR["Ctrl-scoped"]
+    end
 
-    R -->|Failure| V[Rollback attempted]
-    S -->|Failure| V
-    V --> I
+    subgraph FUT["7. Deferred — not in v0.1.6"]
+        direction LR
+        D1["single-writer lock"]
+        D2["checksum manifest"]
+        D3["recovery center"]
+        D4[".tmp auto-cleanup"]
+        D5["kill-process test"]
+    end
 
-    A --> W[Migration dry-run]
-    W --> X[Analyze future group-folder layout]
-    X --> Y[Generate report only]
-    Y --> Z[No files created, moved, deleted, or rewritten]
+    UE --> AT --> L
+    PG --> TW
+    VF --> V1
+    VF --> V2
+    V1 --> NM
+    V2 --> NM
+    SB --> SC
+
+    SC -.->|observes| SAVE
+    SC -.->|observes| GATE
+    SC -.->|observes| OLD
+
+    style UX fill:#ede7f6,stroke:#7c4dff
+    style GATE fill:#fff3e0,stroke:#ff9800
+    style SAVE fill:#c8e6c9,stroke:#388e3c
+    style DISK fill:#e3f2fd,stroke:#1976d2
+    style OLD fill:#e8f4f8,stroke:#5b9bd5
+    style CONSOLE fill:#e8f5e9,stroke:#4caf50
+    style FUT fill:#f5f5f5,stroke:#999,stroke-dasharray: 5 5
 ```
 
-The diagram above shows the intended v0.1.4 safety model:
+### How to read this diagram
 
-- failed loads disable persistence instead of saving empty state;
-- startup integrity scanning is read-only;
-- full backup copies the active data folder before risky operations;
-- restore uses pre-restore backup, staging, rename, and rollback;
-- migration dry-run produces a report only and does not modify files.
+**Layers 1–4 (active path, v0.1.6 enhanced):**
+
+- User edits trigger autosave (~2s debounce), which goes through the Load Gate first.
+- A failed load (bad JSON or duplicate project ID) disables the persistence gate — autosave is blocked and existing files are left untouched on disk.
+- A successful load opens the gate; the Active Save path writes project JSON, `groups.json`, and `app-state.json` through Atomic Write.
+- Atomic Write: write `.tmp` → flush → `sync_all` → verify temp JSON → rename into place → verify target JSON.
+- **Pre-rename failure** preserves the old target file. **Post-rename verify failure** is detected and reported, but v0.1.6 does not implement post-rename rollback.
+- Active data stays in its native layout: v1 flat or v2 group-folder. v1 autosave does **not** silently migrate to v2.
+
+**Layer 5 (existing safety paths, v0.1.5 model — not rewritten in v0.1.6):**
+
+- Backup, Restore, Migration, and Stale Quarantine all remain on the v0.1.5 staging/rename/rollback model.
+- These paths were intentionally excluded from the Slice 4 atomic-write scope.
+
+**Layer 6 (Storage Console, v0.1.6 — read-only observability):**
+
+- Opened from the status bar. Displays in-memory storage events. Supports Copy Log, Clear, Close, Escape.
+- Ctrl radial menu is suppressed while the console is open.
+- The Console is read-only — it has no Restore, Migration, Delete, or Repair functionality.
+
+**Layer 7 (deferred — not in v0.1.6):**
+
+- Single-writer workspace lock, checksum manifest, recovery center, automatic `.tmp` cleanup, directory fsync hardening, and kill-process-during-save validation are **not implemented** in v0.1.6.
+- The kill-process interrupted-save test was not run in Slice 5.
+
+**Summary:** v0.1.6 improves local-first active JSON save reliability (atomic write for the active save path) and storage operation observability (in-memory console). It does **not** claim zero data loss, crash-proof guarantees, or hardware failure protection.
 
 ## Data safety features
 
