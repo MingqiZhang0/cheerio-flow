@@ -1576,6 +1576,29 @@ button {
   font-weight: 850;
 }
 
+.save-status-button {
+  border: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.save-status-button:hover {
+  text-decoration: underline;
+}
+
+.save-status-button:focus-visible {
+  outline: 2px solid #6f9f96;
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.save-status-button.save-status-error {
+  color: #9b382d;
+}
+
 .save-status-saving {
   color: #8a6724;
 }
@@ -1600,6 +1623,155 @@ button {
   align-items: center;
   gap: 6px;
   min-width: 0;
+}
+
+.storage-console-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 55;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(24 35 37 / 22%);
+}
+
+.storage-console {
+  width: min(880px, 100%);
+  max-height: min(680px, calc(100% - 24px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #9bbdb6;
+  border-radius: 8px;
+  background: #f8fbfa;
+  box-shadow: 0 22px 60px rgb(22 38 40 / 26%);
+}
+
+.storage-console-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 16px;
+  border-bottom: 1px solid #d4dfdc;
+}
+
+.storage-console-header h2 {
+  margin: 0;
+  color: #1f383b;
+  font-size: 17px;
+}
+
+.storage-console-header p {
+  margin: 4px 0 0;
+  color: #66797b;
+  font-size: 12px;
+}
+
+.storage-console-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.storage-console-actions button {
+  border: 1px solid #b7cac6;
+  border-radius: 6px;
+  padding: 7px 10px;
+  color: #27484c;
+  background: #ffffff;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.storage-console-actions button:hover {
+  background: #edf4f2;
+}
+
+.storage-console-actions button:focus-visible {
+  outline: 2px solid #6f9f96;
+  outline-offset: 2px;
+}
+
+.storage-console-body {
+  flex: 1;
+  min-height: 260px;
+  overflow: auto;
+  padding: 10px 12px;
+  background: #ffffff;
+}
+
+.storage-console-empty {
+  display: grid;
+  min-height: 220px;
+  place-items: center;
+  color: #6f7f81;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.storage-console-row {
+  display: grid;
+  grid-template-columns: 76px 78px 150px minmax(180px, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 9px 0;
+  border-bottom: 1px solid #edf2f0;
+  color: #263f42;
+  font-size: 12px;
+}
+
+.storage-console-row time,
+.storage-console-operation,
+.storage-console-details {
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.storage-console-severity {
+  justify-self: start;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.storage-console-severity-info {
+  color: #2f6c58;
+  background: #dceee8;
+}
+
+.storage-console-severity-warning {
+  color: #8a6724;
+  background: #f7edcf;
+}
+
+.storage-console-severity-error {
+  color: #9b382d;
+  background: #f3ddd9;
+}
+
+.storage-console-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 650;
+}
+
+.storage-console-details {
+  grid-column: 4;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #788688;
+  font-size: 11px;
+}
+
+.storage-console-footer {
+  padding: 10px 16px;
+  border-top: 1px solid #d4dfdc;
+  color: #607477;
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .error-text {

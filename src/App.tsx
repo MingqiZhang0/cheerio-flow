@@ -74,6 +74,7 @@ import {
   type RestoreReport,
   type SelectedElement,
   type PersistedData,
+  type StorageEvent,
   type StorageReport,
 } from "./types";
 import {
@@ -401,6 +402,35 @@ function isConsoleToggle(event: KeyboardEvent) {
   return event.key === "~" || event.key === "`" || event.code === "Backquote";
 }
 
+async function copyTextToClipboard(text: string) {
+  let clipboardError: unknown = null;
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch (err) {
+      clipboardError = err;
+    }
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+
+  try {
+    if (!document.execCommand("copy")) {
+      throw clipboardError instanceof Error ? clipboardError : new Error("Clipboard copy failed.");
+    }
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
 function normalizeHandle(value: string | undefined, fallback: "top" | "bottom") {
   if (!value) return fallback;
   const normalized = value.toLowerCase();
@@ -539,6 +569,7 @@ function AppShell() {
   const [migrationApplyError, setMigrationApplyError] = useState<string | null>(null);
   const [migrationConfirmation, setMigrationConfirmation] = useState("");
   const [consoleOpen, setConsoleOpen] = useState(false);
+  const [storageConsoleOpen, setStorageConsoleOpen] = useState(false);
   const [consoleInput, setConsoleInput] = useState("");
   const [consoleMessage, setConsoleMessage] = useState("");
   const [consoleError, setConsoleError] = useState("");
@@ -602,7 +633,12 @@ function AppShell() {
   });
   const lastPointerRef = useRef({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
   const lastPointerTargetRef = useRef<EventTarget | null>(null);
-  const { append: appendStorageEvent } = useStorageOperationLog();
+  const {
+    events: storageEvents,
+    append: appendStorageEvent,
+    clear: clearStorageEvents,
+    copyText: copyStorageEventsText,
+  } = useStorageOperationLog();
 
   const currentProject = useMemo(
     () => projects.find((project) => project.id === currentProjectId) ?? projects[0] ?? null,
@@ -897,12 +933,16 @@ function AppShell() {
       }
 
       if (event.key === "Escape") {
+        if (storageConsoleOpen) {
+          setStorageConsoleOpen(false);
+          return;
+        }
         resetInteractionStateRef.current({ clearPlacement: true });
         setPropertiesSidebarCollapsed(true);
         return;
       }
 
-      if (event.key === "Control" && !event.repeat && !consoleOpen && !isEditableTarget(event.target)) {
+      if (event.key === "Control" && !event.repeat && !consoleOpen && !storageConsoleOpen && !isEditableTarget(event.target)) {
         if (!isPointerOverCanvas || !isReactFlowTarget(lastPointerTargetRef.current) || isEditableTarget(lastPointerTargetRef.current)) return;
         setCtrlWheel({ ...lastPointerRef.current });
       }
@@ -919,7 +959,7 @@ function AppShell() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [consoleOpen, isPointerOverCanvas]);
+  }, [consoleOpen, isPointerOverCanvas, storageConsoleOpen]);
 
   useEffect(() => {
     if (!loaded || projects.length === 0) return;
@@ -2209,6 +2249,26 @@ function AppShell() {
       : storageErrorKind === "migration"
       ? "Migration failed"
       : "Save failed";
+  const copyStorageConsoleLog = useCallback(async () => {
+    try {
+      const text = copyStorageEventsText();
+      await copyTextToClipboard(text);
+      appendStorageEvent({
+        severity: "info",
+        operation: "console",
+        phase: "committed",
+        message: "Console log copied.",
+      });
+    } catch (err) {
+      appendStorageEvent({
+        severity: "error",
+        operation: "console",
+        phase: "failed",
+        message: "Console log copy failed.",
+        details: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }, [appendStorageEvent, copyStorageEventsText]);
   const effectiveStorageDrawerHeight = clampStorageDrawerHeight(storageDrawerHeight);
   const storageRootControls = (
     <>
@@ -2777,6 +2837,14 @@ function AppShell() {
               onExecute={executeConsoleCommand}
             />
           )}
+          {storageConsoleOpen && (
+            <StorageOperationConsole
+              events={storageEvents}
+              onCopyLog={() => void copyStorageConsoleLog()}
+              onClear={clearStorageEvents}
+              onClose={() => setStorageConsoleOpen(false)}
+            />
+          )}
           <ReactFlow
             nodes={flowNodes}
             edges={flowEdges}
@@ -2833,7 +2901,15 @@ function AppShell() {
             </span>
           )}
           {pendingShape ? <strong>Click the canvas to create a {pendingShape} module. Esc cancels.</strong> : <span>Modules {flowNodes.length} / Arrows {flowEdges.length}</span>}
-          <span className={`save-status save-status-${saveStatus}`}>{storageStatusLabel}</span>
+          <button
+            className={`save-status save-status-button save-status-${saveStatus}`}
+            type="button"
+            title="Open storage operation console"
+            aria-label="Open storage operation console"
+            onClick={() => setStorageConsoleOpen(true)}
+          >
+            {storageStatusLabel}
+          </button>
           {error && <span className="error-text">{error}</span>}
         </footer>
       </section>
@@ -3030,6 +3106,73 @@ function CommandConsole({
         />
       </div>
       <div className="command-feedback">{error ? <span className="command-error">{error}</span> : message ? <span>{message}</span> : <span>~ toggles console. Enter runs. Tab completes.</span>}</div>
+    </div>
+  );
+}
+
+function formatStorageConsoleTime(timestamp: string) {
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) return timestamp;
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  return `${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`;
+}
+
+function StorageOperationConsole({
+  events,
+  onCopyLog,
+  onClear,
+  onClose,
+}: {
+  events: StorageEvent[];
+  onCopyLog: () => void;
+  onClear: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="storage-console-overlay" role="presentation">
+      <section className="storage-console" role="dialog" aria-modal="true" aria-labelledby="storage-console-title">
+        <header className="storage-console-header">
+          <div>
+            <h2 id="storage-console-title">Storage Operation Console</h2>
+            <p>In-memory log. Cleared on app restart.</p>
+          </div>
+          <div className="storage-console-actions">
+            <button type="button" onClick={onCopyLog}>
+              Copy Log
+            </button>
+            <button type="button" onClick={onClear}>
+              Clear
+            </button>
+            <button type="button" onClick={onClose} aria-label="Close storage operation console">
+              Close
+            </button>
+          </div>
+        </header>
+        <div className="storage-console-body">
+          {events.length === 0 ? (
+            <div className="storage-console-empty">No storage events yet.</div>
+          ) : (
+            events.map((event) => (
+              <article className={`storage-console-row storage-console-row-${event.severity}`} key={event.id}>
+                <time dateTime={event.timestamp}>{formatStorageConsoleTime(event.timestamp)}</time>
+                <span className={`storage-console-severity storage-console-severity-${event.severity}`}>{event.severity}</span>
+                <span className="storage-console-operation">
+                  {event.operation} / {event.phase}
+                </span>
+                <span className="storage-console-message">{event.message}</span>
+                {(event.details || event.relatedPath) && (
+                  <span className="storage-console-details">
+                    {event.relatedPath ? `related=${event.relatedPath}` : ""}
+                    {event.relatedPath && event.details ? " " : ""}
+                    {event.details ? event.details : ""}
+                  </span>
+                )}
+              </article>
+            ))
+          )}
+        </div>
+        <footer className="storage-console-footer">This console is read-only and does not perform restore, migration, or repair actions.</footer>
+      </section>
     </div>
   );
 }
