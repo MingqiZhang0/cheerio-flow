@@ -502,6 +502,20 @@ where
     verify(&target_json)
 }
 
+fn atomic_write_project_json(target: &Path, project: &Project) -> Result<(), String> {
+    atomic_write_json(target, project, |value| {
+        verify_project_json_value(&project.id, value)
+    })
+}
+
+fn atomic_write_app_state_json(target: &Path, app_state: &AppState) -> Result<(), String> {
+    atomic_write_json(target, app_state, verify_app_state_json_value)
+}
+
+fn atomic_write_groups_json(target: &Path, groups: &[ProjectGroup]) -> Result<(), String> {
+    atomic_write_json(target, &groups, verify_any_json_value)
+}
+
 fn default_project() -> Project {
     Project {
         id: format!(
@@ -607,6 +621,9 @@ fn count_top_level_project_json_files(projects_dir: &Path) -> Result<usize, Stri
         let entry =
             entry.map_err(|err| format!("Failed to read projects directory entry: {err}"))?;
         let path = entry.path();
+        if is_storage_temp_file(&path) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path)
             .map_err(|err| format!("Failed to inspect projects entry {}: {err}", path.display()))?;
         if metadata.file_type().is_symlink() {
@@ -1164,12 +1181,12 @@ fn load_database_from_paths(
         }
         let project = default_project();
         app_state.current_project_id = Some(project.id.clone());
-        write_json(
+        atomic_write_project_json(
             &v2_project_path(&data_root, &project, &HashSet::new())?,
             &project,
         )?;
-        write_json(&data_root.join(GROUPS_FILE), &groups)?;
-        write_json(&data_root.join(APP_STATE_FILE), &app_state)?;
+        atomic_write_groups_json(&data_root.join(GROUPS_FILE), &groups)?;
+        atomic_write_app_state_json(&data_root.join(APP_STATE_FILE), &app_state)?;
         projects.push(project);
     }
 
@@ -1200,11 +1217,19 @@ fn save_database_to(
     storage_root: PathBuf,
     payload: DatabasePayload,
 ) -> Result<StorageReport, String> {
+    let bootstrap = bootstrap_path(app)?;
+    save_database_to_paths(storage_root, bootstrap, payload)
+}
+
+fn save_database_to_paths(
+    storage_root: PathBuf,
+    bootstrap: PathBuf,
+    payload: DatabasePayload,
+) -> Result<StorageReport, String> {
     if payload.projects.is_empty() {
         return Err("Refusing to save empty project list because it could overwrite or orphan existing project files".to_string());
     }
 
-    let bootstrap = bootstrap_path(app)?;
     let data_root = data_root_for(&storage_root);
     let data_version = data_version_from_app_state(&payload.app_state);
     match data_version {
@@ -1212,7 +1237,10 @@ fn save_database_to(
             let projects_dir = ensure_data_dirs(&data_root)?;
             for project in &payload.projects {
                 ensure_project_id_safe(&project.id)?;
-                write_json(&projects_dir.join(format!("{}.json", project.id)), project)?;
+                atomic_write_project_json(
+                    &projects_dir.join(format!("{}.json", project.id)),
+                    project,
+                )?;
             }
         }
         CURRENT_DATA_VERSION => {
@@ -1226,7 +1254,7 @@ fn save_database_to(
                 .collect::<Result<HashSet<_>, String>>()?;
             for project in &payload.projects {
                 let canonical_path = v2_project_path(&data_root, project, &valid_group_ids)?;
-                write_json(&canonical_path, project)?;
+                atomic_write_project_json(&canonical_path, project)?;
                 quarantine_noncanonical_project_files(&data_root, &project.id, &canonical_path)?;
             }
         }
@@ -1237,8 +1265,8 @@ fn save_database_to(
             ))
         }
     }
-    write_json(&data_root.join(GROUPS_FILE), &payload.groups)?;
-    write_json(&data_root.join(APP_STATE_FILE), &payload.app_state)?;
+    atomic_write_groups_json(&data_root.join(GROUPS_FILE), &payload.groups)?;
+    atomic_write_app_state_json(&data_root.join(APP_STATE_FILE), &payload.app_state)?;
 
     let report = build_report(&storage_root, &data_root, &bootstrap, &payload.projects);
     println!(
@@ -3288,6 +3316,29 @@ mod tests {
         }
     }
 
+    fn sample_app_state(version: u32, current_project_id: &str) -> AppState {
+        let mut app_state = AppState::default();
+        app_state.data_version = serde_json::Value::from(version);
+        app_state.current_project_id = Some(current_project_id.to_string());
+        app_state
+    }
+
+    fn sample_payload(
+        projects: Vec<Project>,
+        groups: Vec<ProjectGroup>,
+        version: u32,
+    ) -> DatabasePayload {
+        let current_project_id = projects
+            .first()
+            .map(|project| project.id.clone())
+            .unwrap_or_else(|| "project-a".to_string());
+        DatabasePayload {
+            projects,
+            groups,
+            app_state: sample_app_state(version, &current_project_id),
+        }
+    }
+
     fn sample_dry_run(data_root: &Path) -> MigrationDryRunReport {
         MigrationDryRunReport {
             report_version: 1,
@@ -3483,6 +3534,179 @@ mod tests {
         .expect_err("target without parent");
 
         assert!(error.contains("no parent directory"));
+    }
+
+    #[test]
+    fn atomic_write_app_state_json_verify_failure_preserves_old_target() {
+        let dir = temp_test_dir("atomic-app-state-wrapper-failure");
+        let target = dir.join(APP_STATE_FILE);
+        let old_app_state = sample_app_state(CURRENT_DATA_VERSION, "project-a");
+        write_json(&target, &old_app_state).expect("write old app state");
+        let new_app_state = sample_app_state(CURRENT_DATA_VERSION + 1, "project-a");
+
+        let error = atomic_write_app_state_json(&target, &new_app_state)
+            .expect_err("unsupported app-state dataVersion");
+
+        assert!(error.contains("not supported"));
+        let value = read_json::<serde_json::Value>(&target).expect("old target remains readable");
+        assert_eq!(value["dataVersion"], CURRENT_DATA_VERSION);
+        assert!(atomic_temp_path(&target).expect("temp path").exists());
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn save_database_to_paths_v1_uses_atomic_project_writes_and_keeps_flat_layout() {
+        let storage_root = temp_test_dir("save-v1-atomic");
+        let bootstrap = bootstrap_path_for_test(&storage_root);
+        let project = sample_project("project-a", None);
+
+        save_database_to_paths(
+            storage_root.clone(),
+            bootstrap,
+            sample_payload(vec![project], vec![], LEGACY_DATA_VERSION),
+        )
+        .expect("save v1");
+
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        assert!(data_root.join("projects").join("project-a.json").exists());
+        assert!(!data_root.join("projects").join("ungrouped").exists());
+        assert!(!data_root.join("projects").join("groups").exists());
+        assert!(!data_root
+            .join("projects")
+            .join(".project-a.json.tmp")
+            .exists());
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn save_database_to_paths_v2_uses_atomic_project_writes_and_keeps_group_folder_layout() {
+        let storage_root = temp_test_dir("save-v2-atomic");
+        let bootstrap = bootstrap_path_for_test(&storage_root);
+        let grouped_project = sample_project("project-a", Some("group-a"));
+        let ungrouped_project = sample_project("project-b", None);
+        let group = sample_group("group-a", vec!["project-a"]);
+
+        save_database_to_paths(
+            storage_root.clone(),
+            bootstrap,
+            sample_payload(
+                vec![grouped_project, ungrouped_project],
+                vec![group],
+                CURRENT_DATA_VERSION,
+            ),
+        )
+        .expect("save v2");
+
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        assert!(data_root
+            .join("projects")
+            .join("groups")
+            .join("group-a")
+            .join("project-a.json")
+            .exists());
+        assert!(data_root
+            .join("projects")
+            .join("ungrouped")
+            .join("project-b.json")
+            .exists());
+        assert!(!data_root.join("projects").join("project-a.json").exists());
+        assert!(!data_root
+            .join("projects")
+            .join("groups")
+            .join("group-a")
+            .join(".project-a.json.tmp")
+            .exists());
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn save_database_to_paths_v2_writes_groups_and_app_state_atomically() {
+        let storage_root = temp_test_dir("save-v2-groups-app-state");
+        let bootstrap = bootstrap_path_for_test(&storage_root);
+        let project = sample_project("project-a", Some("group-a"));
+        let group = sample_group("group-a", vec!["project-a"]);
+
+        save_database_to_paths(
+            storage_root.clone(),
+            bootstrap,
+            sample_payload(vec![project], vec![group], CURRENT_DATA_VERSION),
+        )
+        .expect("save v2");
+
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        let groups =
+            read_json::<Vec<ProjectGroup>>(&data_root.join(GROUPS_FILE)).expect("read groups");
+        let app_state =
+            read_json::<AppState>(&data_root.join(APP_STATE_FILE)).expect("read app state");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "group-a");
+        assert_eq!(
+            data_version_from_app_state(&app_state),
+            CURRENT_DATA_VERSION
+        );
+        assert!(!data_root.join(".groups.json.tmp").exists());
+        assert!(!data_root.join(".app-state.json.tmp").exists());
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn save_database_to_paths_v2_group_move_still_quarantines_stale_project_file() {
+        let storage_root = temp_test_dir("save-v2-stale-quarantine");
+        let bootstrap = bootstrap_path_for_test(&storage_root);
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        let stale_path = data_root.join("projects").join("project-a.json");
+        write_json(&stale_path, &sample_project("project-a", None)).expect("write stale project");
+
+        save_database_to_paths(
+            storage_root.clone(),
+            bootstrap,
+            sample_payload(
+                vec![sample_project("project-a", Some("group-a"))],
+                vec![sample_group("group-a", vec!["project-a"])],
+                CURRENT_DATA_VERSION,
+            ),
+        )
+        .expect("save v2");
+
+        assert!(!stale_path.exists());
+        assert!(data_root
+            .join("projects")
+            .join("groups")
+            .join("group-a")
+            .join("project-a.json")
+            .exists());
+        assert!(data_root
+            .join(".cheerio")
+            .join("stale-project-files")
+            .exists());
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn storage_temp_files_are_not_loaded_as_project_json() {
+        let data_root = temp_test_dir("temp-files-not-loaded");
+        let projects_dir = data_root.join("projects");
+        write_json(
+            &projects_dir.join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write project");
+        fs::write(
+            projects_dir.join(".project-b.json.tmp"),
+            r#"{"id":"project-b","title":"Temp"}"#,
+        )
+        .expect("write temp project");
+
+        let projects = load_v1_project_files(&data_root, &projects_dir).expect("load v1");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, "project-a");
+
+        fs::remove_dir_all(data_root).ok();
     }
 
     fn bootstrap_path_for_test(root: &Path) -> PathBuf {
