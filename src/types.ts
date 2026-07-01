@@ -87,6 +87,45 @@ export interface StorageReport {
   arrowCount: number;
 }
 
+export type StorageEventSeverity = "info" | "warning" | "error";
+
+export type StorageOperation =
+  | "load"
+  | "save"
+  | "backup"
+  | "restore"
+  | "migration"
+  | "atomic-write"
+  | "storage-root"
+  | "console";
+
+export type StoragePhase =
+  | "started"
+  | "temp-written"
+  | "fsynced"
+  | "renamed"
+  | "verified"
+  | "committed"
+  | "failed"
+  | "blocked"
+  | "rollback";
+
+export type StorageEventErrorKind = "load" | "save" | "restore" | "migration" | "backup" | "storage-root";
+
+export interface StorageEvent {
+  id: string;
+  timestamp: string;
+  severity: StorageEventSeverity;
+  operation: StorageOperation;
+  phase: StoragePhase;
+  message: string;
+  details?: string;
+  relatedPath?: string;
+  errorKind?: StorageEventErrorKind;
+  workspaceId?: string;
+  dataVersion?: number;
+}
+
 export interface BackupReport {
   backupId: string;
   createdAt: string;

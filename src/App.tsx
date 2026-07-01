@@ -52,6 +52,7 @@ import {
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { scanLightweightIntegrity, type LightweightIntegrityReport } from "./integrity";
 import { applyGroupFolderMigration, chooseStorageRoot, createFullBackup, generateMigrationDryRunPlan, listFullBackups, loadDatabase, persistDatabase, removeProject, restoreFullBackup, switchStorageRoot } from "./storage";
+import { useStorageOperationLog } from "./storageOperationLog";
 import {
   ARROW_TYPES,
   MODULE_SHAPES,
@@ -588,6 +589,7 @@ function AppShell() {
   const loadedRef = useRef(false);
   const canPersistRef = useRef(false);
   const skipNextAutosaveRef = useRef(false);
+  const dataDirRef = useRef("");
   const projectsRef = useRef<Project[]>([]);
   const groupsRef = useRef<ProjectGroup[]>([]);
   const appStateRef = useRef<AppState>({
@@ -600,6 +602,7 @@ function AppShell() {
   });
   const lastPointerRef = useRef({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
   const lastPointerTargetRef = useRef<EventTarget | null>(null);
+  const { append: appendStorageEvent } = useStorageOperationLog();
 
   const currentProject = useMemo(
     () => projects.find((project) => project.id === currentProjectId) ?? projects[0] ?? null,
@@ -662,11 +665,34 @@ function AppShell() {
   }, [groups]);
 
   useEffect(() => {
+    dataDirRef.current = dataDir;
+  }, [dataDir]);
+
+  useEffect(() => {
     appStateRef.current = appState;
   }, [appState]);
 
   const saveAllNow = useCallback(async (projectsOverride?: Project[]) => {
-    if (!loadedRef.current || !canPersistRef.current) return;
+    if (!loadedRef.current || !canPersistRef.current) {
+      appendStorageEvent({
+        severity: "warning",
+        operation: "save",
+        phase: "blocked",
+        message: "Save blocked because local data is not loaded safely.",
+        errorKind: "save",
+        relatedPath: dataDirRef.current || undefined,
+        dataVersion: appStateRef.current.dataVersion,
+      });
+      return;
+    }
+    appendStorageEvent({
+      severity: "info",
+      operation: "save",
+      phase: "started",
+      message: "Save started.",
+      relatedPath: dataDirRef.current || undefined,
+      dataVersion: appStateRef.current.dataVersion,
+    });
     setSaveStatus("saving");
     setStorageErrorKind(null);
     try {
@@ -680,13 +706,32 @@ function AppShell() {
       console.info("Cheerio Flow saved to", report);
       setSaveStatus("saved");
       setStorageErrorKind(null);
+      appendStorageEvent({
+        severity: "info",
+        operation: "save",
+        phase: "committed",
+        message: "Save committed.",
+        relatedPath: report.dataDir,
+        dataVersion: currentAppState.dataVersion,
+      });
     } catch (reason: unknown) {
+      const message = reason instanceof Error ? reason.message : String(reason);
       console.error("Failed to save Cheerio Flow data", reason);
       setSaveStatus("error");
       setStorageErrorKind("save");
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(message);
+      appendStorageEvent({
+        severity: "error",
+        operation: "save",
+        phase: "failed",
+        message: "Save failed.",
+        details: message,
+        errorKind: "save",
+        relatedPath: dataDirRef.current || undefined,
+        dataVersion: appStateRef.current.dataVersion,
+      });
     }
-  }, []);
+  }, [appendStorageEvent]);
 
   const refreshBackups = useCallback(async () => {
     setRestoreStatus("loading");
@@ -748,15 +793,30 @@ function AppShell() {
 
   useEffect(() => {
     let cancelled = false;
+    appendStorageEvent({
+      severity: "info",
+      operation: "load",
+      phase: "started",
+      message: "Load started.",
+    });
     loadDatabase()
       .then((data) => {
         if (cancelled) return;
         hydrateLoadedData(data);
+        appendStorageEvent({
+          severity: "info",
+          operation: "load",
+          phase: "committed",
+          message: "Load committed.",
+          relatedPath: data.dataDir,
+          dataVersion: data.appState.dataVersion,
+        });
         void refreshBackups();
       })
       .catch((reason: unknown) => {
+        const message = reason instanceof Error ? reason.message : String(reason);
         console.error("Failed to load Cheerio Flow data", reason);
-        setError(reason instanceof Error ? reason.message : String(reason));
+        setError(message);
         setIntegrityReport(null);
         if (saveTimerRef.current) {
           window.clearTimeout(saveTimerRef.current);
@@ -771,12 +831,21 @@ function AppShell() {
         setSaveStatus("error");
         setStorageErrorKind("load");
         setLoaded(true);
+        appendStorageEvent({
+          severity: "error",
+          operation: "load",
+          phase: "failed",
+          message: "Load failed.",
+          details: message,
+          errorKind: "load",
+          relatedPath: dataDirRef.current || undefined,
+        });
         void refreshBackups();
       });
     return () => {
       cancelled = true;
     };
-  }, [hydrateLoadedData, invalidateMigrationState, refreshBackups]);
+  }, [appendStorageEvent, hydrateLoadedData, invalidateMigrationState, refreshBackups]);
 
   useEffect(() => {
     if (!loaded || !canPersistRef.current) return;
@@ -1457,6 +1526,14 @@ function AppShell() {
     setSaveStatus("saving");
     setStorageErrorKind(null);
     const shouldSaveCurrentData = canPersistRef.current;
+    appendStorageEvent({
+      severity: "info",
+      operation: "storage-root",
+      phase: "started",
+      message: shouldSaveCurrentData ? "Storage root apply started." : "Storage root switch started.",
+      relatedPath: storageRootInput || undefined,
+      dataVersion: appStateRef.current.dataVersion,
+    });
     if (saveTimerRef.current) {
       window.clearTimeout(saveTimerRef.current);
       saveTimerRef.current = null;
@@ -1472,8 +1549,17 @@ function AppShell() {
       setSaveStatus("saved");
       setStorageErrorKind(null);
       setError(null);
+      appendStorageEvent({
+        severity: "info",
+        operation: "storage-root",
+        phase: "committed",
+        message: shouldSaveCurrentData ? "Storage root applied." : "Storage root switched.",
+        relatedPath: data.dataDir,
+        dataVersion: data.appState.dataVersion,
+      });
       console.info(shouldSaveCurrentData ? "Cheerio Flow storage root set" : "Cheerio Flow storage root switched", data.report);
     } catch (reason: unknown) {
+      const message = reason instanceof Error ? reason.message : String(reason);
       console.error("Failed to apply storage root", reason);
       loadedRef.current = false;
       canPersistRef.current = false;
@@ -1482,30 +1568,76 @@ function AppShell() {
       setLoadedStorageRoot("");
       setSaveStatus("error");
       setStorageErrorKind("load");
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(message);
+      appendStorageEvent({
+        severity: "error",
+        operation: "storage-root",
+        phase: "failed",
+        message: shouldSaveCurrentData ? "Storage root apply failed." : "Storage root switch failed.",
+        details: message,
+        errorKind: "storage-root",
+        relatedPath: storageRootInput || undefined,
+        dataVersion: appStateRef.current.dataVersion,
+      });
     }
-  }, [hydrateLoadedData, invalidateMigrationState, refreshBackups, storageRootInput]);
+  }, [appendStorageEvent, hydrateLoadedData, invalidateMigrationState, refreshBackups, storageRootInput]);
 
   const handleCreateFullBackup = useCallback(async () => {
     if (!canPersistRef.current) {
       setBackupStatus("error");
       setBackupReport(null);
       setBackupError("Cannot create backup because local data did not load successfully.");
+      appendStorageEvent({
+        severity: "warning",
+        operation: "backup",
+        phase: "blocked",
+        message: "Backup blocked because local data is not loaded safely.",
+        errorKind: "backup",
+        relatedPath: dataDirRef.current || undefined,
+        dataVersion: appStateRef.current.dataVersion,
+      });
       return;
     }
 
     setBackupStatus("running");
     setBackupError(null);
+    appendStorageEvent({
+      severity: "info",
+      operation: "backup",
+      phase: "started",
+      message: "Backup started.",
+      relatedPath: dataDirRef.current || undefined,
+      dataVersion: appStateRef.current.dataVersion,
+    });
     try {
       const report = await createFullBackup();
       setBackupReport(report);
       setBackupStatus("success");
+      appendStorageEvent({
+        severity: "info",
+        operation: "backup",
+        phase: "committed",
+        message: "Backup committed.",
+        relatedPath: report.backupDir,
+        dataVersion: appStateRef.current.dataVersion,
+      });
     } catch (reason: unknown) {
+      const message = reason instanceof Error ? reason.message : String(reason);
       setBackupReport(null);
       setBackupStatus("error");
-      setBackupError(reason instanceof Error ? reason.message : String(reason));
+      setBackupError(message);
+      appendStorageEvent({
+        severity: "error",
+        operation: "backup",
+        phase: "failed",
+        message: "Backup failed.",
+        details: message,
+        errorKind: "backup",
+        relatedPath: dataDirRef.current || undefined,
+        dataVersion: appStateRef.current.dataVersion,
+      });
     }
-  }, []);
+  }, [appendStorageEvent]);
 
   const handleRefreshFullBackups = useCallback(async () => {
     await refreshBackups();
@@ -1534,6 +1666,14 @@ function AppShell() {
     setRestoreError(null);
     setRestoreReport(null);
     setStorageErrorKind(null);
+    appendStorageEvent({
+      severity: "info",
+      operation: "restore",
+      phase: "started",
+      message: "Restore started.",
+      relatedPath: selectedBackupId,
+      dataVersion: appStateRef.current.dataVersion,
+    });
     try {
       const report = await restoreFullBackup(selectedBackupId);
       setRestoreReport(report);
@@ -1544,6 +1684,14 @@ function AppShell() {
       setStorageErrorKind(null);
       setError(null);
       setRestoreStatus("success");
+      appendStorageEvent({
+        severity: "info",
+        operation: "restore",
+        phase: "committed",
+        message: "Restore committed.",
+        relatedPath: report.restoredDataDir,
+        dataVersion: data.appState.dataVersion,
+      });
     } catch (reason: unknown) {
       setRestoreStatus("error");
       const restoreMessage = reason instanceof Error ? reason.message : String(reason);
@@ -1551,6 +1699,16 @@ function AppShell() {
       setRestoreError(restoreMessage);
       setSaveStatus("error");
       setStorageErrorKind("restore");
+      appendStorageEvent({
+        severity: "error",
+        operation: "restore",
+        phase: "failed",
+        message: "Restore failed.",
+        details: restoreMessage,
+        errorKind: "restore",
+        relatedPath: selectedBackupId,
+        dataVersion: appStateRef.current.dataVersion,
+      });
       try {
         const data = await loadDatabase();
         hydrateLoadedData(data);
@@ -1567,29 +1725,66 @@ function AppShell() {
         setStorageErrorKind("restore");
       }
     }
-  }, [hydrateLoadedData, invalidateMigrationState, restoreConfirmation, selectedBackupId]);
+  }, [appendStorageEvent, hydrateLoadedData, invalidateMigrationState, restoreConfirmation, selectedBackupId]);
 
   const handleGenerateMigrationDryRunPlan = useCallback(async () => {
     invalidateMigrationState();
     if (!loadedRef.current || !canPersistRef.current) {
       setMigrationDryRunStatus("error");
       setMigrationDryRunError("Load failed. Fix or restore the workspace before running migration dry-run.");
+      appendStorageEvent({
+        severity: "warning",
+        operation: "migration",
+        phase: "blocked",
+        message: "Migration dry-run blocked because local data is not loaded safely.",
+        errorKind: "migration",
+        relatedPath: dataDirRef.current || undefined,
+        dataVersion: appStateRef.current.dataVersion,
+      });
       return;
     }
     setMigrationDryRunStatus("running");
     setMigrationDryRunError(null);
+    appendStorageEvent({
+      severity: "info",
+      operation: "migration",
+      phase: "started",
+      message: "Migration dry-run started.",
+      relatedPath: dataDirRef.current || undefined,
+      dataVersion: appStateRef.current.dataVersion,
+    });
     try {
       const report = await generateMigrationDryRunPlan();
       setMigrationDryRunReport(report);
       setMigrationDryRunContext({ storageRoot: loadedStorageRoot, dataDir });
       setMigrationDryRunStatus("success");
+      appendStorageEvent({
+        severity: report.summary.blockerCount > 0 ? "warning" : "info",
+        operation: "migration",
+        phase: "committed",
+        message: "Migration dry-run committed.",
+        details: `${report.summary.projectFileCount} project file(s), ${report.summary.blockerCount} blocker(s), ${report.summary.warningCount} warning(s).`,
+        relatedPath: report.sourceDataDir,
+        dataVersion: report.sourceDataVersion,
+      });
     } catch (reason: unknown) {
+      const message = reason instanceof Error ? reason.message : String(reason);
       setMigrationDryRunReport(null);
       setMigrationDryRunContext(null);
       setMigrationDryRunStatus("error");
-      setMigrationDryRunError(reason instanceof Error ? reason.message : String(reason));
+      setMigrationDryRunError(message);
+      appendStorageEvent({
+        severity: "error",
+        operation: "migration",
+        phase: "failed",
+        message: "Migration dry-run failed.",
+        details: message,
+        errorKind: "migration",
+        relatedPath: dataDirRef.current || undefined,
+        dataVersion: appStateRef.current.dataVersion,
+      });
     }
-  }, [dataDir, invalidateMigrationState, loadedStorageRoot]);
+  }, [appendStorageEvent, dataDir, invalidateMigrationState, loadedStorageRoot]);
 
   const isCurrentMigrationReport = useCallback(
     (report: MigrationDryRunReport | null) => {
