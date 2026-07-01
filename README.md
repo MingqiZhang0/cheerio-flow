@@ -4,20 +4,38 @@ Local-first desktop research workflow planning tool built with Tauri, React, Typ
 
 Cheerio Flow is designed for researchers, students, and technical writers who need to plan complex research processes visually: concepts, equations, assumptions, datasets, experiments, arguments, dependencies, and presentation structure can be arranged as editable nodes and arrows on a local canvas.
 
-The project is currently in early prototype stage, but v0.1.4 establishes an important data-safety foundation before future storage migrations.
+The project is in active development, with v0.1.5 completing the first real storage migration and v0.1.4 having established the data-safety foundation.
 
 ## Current version
 
 ```text
-v0.1.4 — Data Safety Foundation
+v0.1.5 — Group Folder Migration
 ```
 
-This version focuses on local data integrity, backup, restore, startup scanning, and migration preparation.
+v0.1.5 introduces Cheerio Flow's first formal data version migration: **dataVersion 1 → dataVersion 2 (group-folder layout)**.
+
+### Version highlights
+
+- Introduces **dataVersion 2**.
+- New project storage layout:
+
+```text
+CheerioFlowData/projects/ungrouped/{project-id}.json
+CheerioFlowData/projects/groups/{group-id}/{project-id}.json
+```
+
+- Fresh workspaces initialize as `dataVersion: 2` with group-folder layout.
+- Existing v1 workspaces remain fully supported — they load and save in flat layout without change.
+- v1 workspaces are **not** automatically migrated during normal load, save, or autosave.
+- v1 → v2 migration requires explicit dry-run, zero blockers, and typed confirmation **MIGRATE**.
+- Migration creates a full backup, stages the v2 layout, verifies staged data, activates by rename, and preserves the previous data directory as `CheerioFlowData.before-migration-*`.
+- Restoring an old v1 backup after migration returns the workspace to v1 without auto-migrating.
+- Duplicate project IDs and bad JSON block loading and migration — no migration artifacts are created.
 
 The next planned development line is:
 
 ```text
-v0.1.5 — Real Group Folder Migration
+v0.1.6 — Atomic Save Layer
 ```
 
 ## What this project does
@@ -226,7 +244,7 @@ Desktop development and desktop packaging require a working Rust/Tauri environme
 * Always back up important project data.
 * Do not manually edit project JSON files while the app is running.
 * Do not use browser localStorage data as long-term storage.
-* Do not rely on migration dry-run as a real migration. It is only a preview report.
+* Migration dry-run is a read-only preview. Real migration requires typing MIGRATE and clicking Apply Migration.
 * Do not choose `CheerioFlowData` itself as the storage parent folder. Choose its parent folder instead.
 * If startup reports data integrity issues, create a backup before attempting manual repair.
 * If restore fails, inspect the generated error message and the `before-restore` directory before retrying.
@@ -261,13 +279,15 @@ Desktop development and desktop packaging require a working Rust/Tauri environme
 | CSV preview                     |       Not implemented | Planned future extension                      |
 | Image asset import              |       Not implemented | Planned future extension                      |
 | Presentation mode               |       Not implemented | Planned future extension                      |
-| Real group-folder migration     |       Not implemented | Planned for v0.1.5                            |
+| Real group-folder migration     | Implemented in v0.1.5 | Dry-run + MIGRATE confirmation + backup + staging + rollback |
 
 ## Data Safety Demo
 
 Cheerio Flow treats local data safety as a first-class design goal.
 
-v0.1.4 focuses on preventing accidental local data loss caused by failed loads, broken JSON files, unsafe saves, restore failures, or future storage migrations.
+v0.1.4 focused on preventing accidental local data loss caused by failed loads, broken JSON files, unsafe saves, restore failures, or future storage migrations.
+
+v0.1.5 adds the real migration engine with backup enforcement, staging, verification, and rollback, plus duplicate project ID detection, storage error type labels, and Ctrl radial menu canvas scoping.
 
 ```mermaid
 flowchart TD
@@ -320,7 +340,7 @@ The diagram above shows the intended v0.1.4 safety model:
 
 | Safety feature               | Description                                             |
 | ---------------------------- | ------------------------------------------------------- |
-| `dataVersion`                | App state records the storage format version.           |
+| `dataVersion`                | App state records the storage format version (1 or 2).  |
 | Load-failed persistence gate | Prevents autosave after failed load.                    |
 | Empty-save rejection         | Rust save path refuses empty project-list payloads.     |
 | Read-only startup scan       | Detects integrity issues without writing to disk.       |
@@ -330,9 +350,16 @@ The diagram above shows the intended v0.1.4 safety model:
 | Pre-restore backup           | Creates backup before restoring another backup.         |
 | Staging restore              | Restores into staging first, then renames.              |
 | Rollback handling            | Attempts rollback if final replacement fails.           |
-| Path traversal defense       | Backup IDs are validated before restore.                |
-| Migration dry-run            | Previews future layout without modifying files.         |
-| Symlink avoidance            | Backup/restore/dry-run avoid following unsafe symlinks. |
+| Path traversal defense       | Backup IDs and project/group IDs are validated.         |
+| Migration dry-run            | Previews migration plan without modifying files.        |
+| Migration staging + verify   | Writes v2 layout to staging, verifies before activation.|
+| Before-migration preservation| Preserves pre-migration data as `CheerioFlowData.before-migration-*`. |
+| v1/v2 classification         | Workspace layout is classified before load/save routing.|
+| Duplicate project ID guard   | Two files with same `project.id` block load and migration.|
+| Stale migration report guard | Old dry-run reports are cleared when switching workspaces.|
+| Storage error type labels    | Distinguishes Load/Save/Restore/Migration failed in status bar.|
+| Ctrl radial menu scope       | Module creation radial menu only opens over the canvas. |
+| Symlink avoidance            | All file operations reject and skip symlinks.           |
 
 ## Storage model
 
@@ -358,7 +385,21 @@ Choose its parent folder.
 
 ## Current data layout
 
-Current v0.1.4 data layout:
+v0.1.5 data layout (dataVersion 2, group-folder):
+
+```text
+CheerioFlowData/
+  projects/
+    ungrouped/
+      {project-id}.json
+    groups/
+      {group-id}/
+        {project-id}.json
+  groups.json
+  app-state.json
+```
+
+Legacy v1 data layout (dataVersion 1, still supported for loading and saving):
 
 ```text
 CheerioFlowData/
@@ -375,29 +416,23 @@ CheerioFlowBackups/
   backup-YYYYMMDD-HHMMSS/
     CheerioFlowData/
       projects/
-        {project-id}.json
+        ...
       groups.json
       app-state.json
     backup-manifest.json
 ```
 
-Future planned v0.1.5 group-folder layout:
+Before-migration preservation (created by v1 → v2 migration):
 
 ```text
-CheerioFlowData/
+CheerioFlowData.before-migration-YYYYMMDD-HHMMSS/
   projects/
-    ungrouped/
-      {project-id}.json
-    groups/
-      {group-id}/
-        {project-id}.json
+    ...
   groups.json
   app-state.json
 ```
 
-v0.1.4 does not perform this migration.
-
-It only provides a dry-run preview.
+v0.1.5 performs this migration only through explicit user action (dry-run + MIGRATE confirmation).
 
 ## Backup and restore
 
@@ -537,6 +572,7 @@ Important command categories:
 | Backup listing         | List existing backups read-only.                        |
 | Restore                | Restore selected full backup with staging and rollback. |
 | Migration dry-run      | Generate read-only migration preview.                   |
+| Migration apply        | Execute group-folder migration with staging and rollback.|
 
 Normal save paths do not perform stale project cleanup.
 
@@ -546,30 +582,66 @@ Project file deletion is reserved for explicit project deletion.
 
 Cheerio Flow writes only to the selected local storage area.
 
-| Local path                                         | Purpose                                          |
-| -------------------------------------------------- | ------------------------------------------------ |
-| `CheerioFlowData/projects/{project-id}.json`       | Individual project files.                        |
-| `CheerioFlowData/groups.json`                      | Group list and project membership metadata.      |
-| `CheerioFlowData/app-state.json`                   | UI/app state, including `dataVersion`.           |
-| `CheerioFlowBackups/backup-*/CheerioFlowData/`     | Full backup copy of data folder.                 |
-| `CheerioFlowBackups/backup-*/backup-manifest.json` | Backup metadata.                                 |
-| `CheerioFlowData.before-restore-*`                 | Previous data folder moved aside during restore. |
+| Local path                                               | Purpose                                          |
+| -------------------------------------------------------- | ------------------------------------------------ |
+| `CheerioFlowData/projects/ungrouped/{id}.json`           | Ungrouped project files (v2 layout).             |
+| `CheerioFlowData/projects/groups/{gid}/{id}.json`        | Grouped project files (v2 layout).               |
+| `CheerioFlowData/projects/{project-id}.json`             | Legacy v1 flat project files (still supported).  |
+| `CheerioFlowData/groups.json`                            | Group list and project membership metadata.      |
+| `CheerioFlowData/app-state.json`                         | UI/app state, including `dataVersion`.           |
+| `CheerioFlowData/.cheerio/stale-project-files/`          | Quarantined stale project files after group move.|
+| `CheerioFlowBackups/backup-*/CheerioFlowData/`           | Full backup copy of data folder.                 |
+| `CheerioFlowBackups/backup-*/backup-manifest.json`       | Backup metadata.                                 |
+| `CheerioFlowData.before-migration-*`                     | Pre-migration data preserved by migration.       |
+| `CheerioFlowData.before-restore-*`                       | Previous data folder moved aside during restore. |
 
 Cheerio Flow does not require a server for these operations.
 
 ## Validation
 
-v0.1.4 release closeout validation passed:
+### v0.1.5 validation
+
+Build validation passed:
 
 ```text
-cargo fmt
-cargo check
-tsc --noEmit
-pnpm build
-pnpm desktop:build
+git diff --check              # No whitespace errors
+pnpm exec tsc --noEmit        # Passed
+pnpm build                    # Passed
+cargo fmt --check             # Passed
+cargo check                   # Passed
+cargo test                    # 12 passed, 0 failed
+pnpm desktop:build            # MSI + NSIS installers produced
 ```
 
 Desktop packaging produced Windows installer outputs through Tauri build.
+
+Manual acceptance testing — Test A-J all passed. These are human-operated manual tests, not automated CI:
+
+- **Test A:** Fresh workspace initializes as `dataVersion: 2` with group-folder layout.
+- **Test B:** v1 load + autosave does not fake-upgrade to v2.
+- **Test C:** v1 dry-run produces correct 1 → 2 migration plan.
+- **Test D:** Explicit migration applies v2 layout with backup and before-migration copy.
+- **Test E:** v2 normal save preserves group-folder layout.
+- **Test F:** v2 project group move rewrites canonical path safely.
+- **Test G:** Already migrated v2 workspace reports no migration needed.
+- **Test H:** Bad JSON / stale migration preview — bug found, fixed, and re-tested.
+- **Test I:** Duplicate project ID blocks migration and leaves disk unchanged.
+- **Test J:** Restore old v1 backup after migration returns to v1 without auto-migrate.
+
+Post A-J manual findings fixed and verified:
+
+- Ctrl radial menu scoped to canvas only.
+- Load failures shown as Load failed, not Save failed (storage error type labels).
+
+v0.1.5-rc1 smoke test passed.
+
+Final read-only review found no P0/P1 blockers.
+
+Full manual test report: `docs/MANUAL_TEST_REPORT_v0.1.5_GROUP_FOLDER_MIGRATION.md`
+
+### v0.1.4 validation
+
+v0.1.4 release closeout validation passed (same build checks as above).
 
 v0.1.4 safety validation covered:
 
@@ -591,7 +663,6 @@ Current limitations:
 * CSV import and data-table preview are not implemented.
 * Image node asset import is not implemented.
 * Presentation mode is not implemented.
-* Real group-folder migration is not implemented yet.
 * Browser localStorage fallback is for development convenience, not production storage.
 * The app is not a collaborative editor.
 * There is no cloud sync.
@@ -603,26 +674,11 @@ Current limitations:
 
 Planned directions:
 
-### v0.1.5 — Real Group Folder Migration
+### v0.1.6 — Atomic Save Layer
 
-Use the v0.1.4 dry-run foundation to implement the real migration:
+Next planned development line. Build on the v0.1.5 migration foundation to introduce atomic save: write to temp file, fsync, then rename — so that interrupted saves never leave a partially written project file on disk.
 
-```text
-projects/{project-id}.json
-→ projects/ungrouped/{project-id}.json
-→ projects/groups/{group-id}/{project-id}.json
-```
-
-Required safety expectations:
-
-* Require full backup before migration.
-* Run dry-run before migration.
-* Block on unresolved blockers.
-* Use staging.
-* Use rollback.
-* Preserve `dataVersion`.
-* Write migration result clearly.
-* Never silently delete project files.
+A Storage Operation Console / Activity Console is planned as a future observability enhancement, likely around the Atomic Save work.
 
 ### Future features
 
@@ -640,7 +696,7 @@ Possible future extensions:
 
 ## Future Data Reliability
 
-Cheerio Flow aims to evolve from v0.1.4 Data Safety Foundation toward professional-grade local data reliability for research workflow projects.
+Cheerio Flow has evolved from the v0.1.4 Data Safety Foundation through v0.1.5 Group Folder Migration toward professional-grade local data reliability for research workflow projects.
 
 See:
 
@@ -664,19 +720,21 @@ AI assistance was used for implementation support, review prompts, and release o
 
 ## Git tags
 
-Important v0.1.4 tags:
+Release tags:
 
 ```text
+v0.1.5       Group Folder Migration
+v0.1.5-rc1   Group Folder Migration release candidate
 v0.1.4       Data Safety Foundation
-v0.1.4-rc1   First release candidate
 v0.1.4-rc2   Final release candidate with backup result panel sizing fix
+v0.1.4-rc1   First release candidate
 ```
 
 Note:
 
-The `v0.1.4` tag points to the release commit.
+Each `vX.Y.Z` tag points to its release commit.
 
-Later repository maintenance commits, such as adding `LICENSE`, may exist on `main` after the release tag. This is normal and does not change the v0.1.4 release snapshot.
+Later repository maintenance commits, such as adding `LICENSE` or updating documentation, may exist on `main` or on the release branch after the release tag. This is normal and does not change the release snapshot.
 
 ## License
 
