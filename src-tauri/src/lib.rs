@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 use time::{format_description, OffsetDateTime};
@@ -374,6 +376,130 @@ where
     let text = serde_json::to_string_pretty(value)
         .map_err(|err| format!("Failed to serialize JSON for {}: {err}", path.display()))?;
     fs::write(path, text).map_err(|err| format!("Failed to write file {}: {err}", path.display()))
+}
+
+fn atomic_temp_path(target: &Path) -> Result<PathBuf, String> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Atomic write target has no parent directory: {}",
+                target.display()
+            )
+        })?;
+    let file_name = target
+        .file_name()
+        .filter(|file_name| !file_name.is_empty())
+        .ok_or_else(|| format!("Atomic write target has no file name: {}", target.display()))?;
+
+    let mut temp_name = OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(".tmp");
+    Ok(parent.join(temp_name))
+}
+
+fn is_storage_temp_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|file_name| file_name.to_str())
+        .map(|file_name| file_name.starts_with('.') && file_name.ends_with(".tmp"))
+        .unwrap_or(false)
+}
+
+fn verify_any_json_value(value: &serde_json::Value) -> Result<(), String> {
+    if value.is_null() {
+        Err("JSON value must not be null".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_project_json_value(
+    expected_project_id: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Project JSON must be an object".to_string())?;
+    let actual_project_id = object
+        .get("id")
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| "Project JSON must include a string id".to_string())?;
+    if actual_project_id != expected_project_id {
+        return Err(format!(
+            "Project JSON id {actual_project_id} does not match expected {expected_project_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_app_state_json_value(value: &serde_json::Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "App state JSON must be an object".to_string())?;
+    if let Some(data_version) = object.get("dataVersion") {
+        let version = data_version
+            .as_u64()
+            .ok_or_else(|| "App state dataVersion must be 1 or 2".to_string())?;
+        if version != u64::from(LEGACY_DATA_VERSION) && version != u64::from(CURRENT_DATA_VERSION) {
+            return Err(format!("App state dataVersion {version} is not supported"));
+        }
+    }
+    Ok(())
+}
+
+// AtomicWriteHelper protects the old target for failures before activation.
+// Post-rename verification failure is detected and reported, but this first
+// helper does not implement rollback after replacement.
+fn atomic_write_json<T, F>(target: &Path, value: &T, verify: F) -> Result<(), String>
+where
+    T: Serialize,
+    F: Fn(&serde_json::Value) -> Result<(), String>,
+{
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Atomic write target has no parent directory: {}",
+                target.display()
+            )
+        })?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("Failed to create directory {}: {err}", parent.display()))?;
+
+    let temp = atomic_temp_path(target)?;
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|err| format!("Failed to serialize JSON for {}: {err}", target.display()))?;
+    let mut file = fs::File::create(&temp)
+        .map_err(|err| format!("Failed to create temp file {}: {err}", temp.display()))?;
+    file.write_all(text.as_bytes())
+        .map_err(|err| format!("Failed to write temp file {}: {err}", temp.display()))?;
+    file.flush()
+        .map_err(|err| format!("Failed to flush temp file {}: {err}", temp.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("Failed to sync temp file {}: {err}", temp.display()))?;
+    drop(file);
+
+    let temp_text = fs::read_to_string(&temp)
+        .map_err(|err| format!("Failed to read temp file {}: {err}", temp.display()))?;
+    let temp_json = serde_json::from_str::<serde_json::Value>(&temp_text)
+        .map_err(|err| format!("Failed to parse temp JSON {}: {err}", temp.display()))?;
+    verify(&temp_json)?;
+
+    fs::rename(&temp, target).map_err(|err| {
+        format!(
+            "Failed to activate atomic write {} -> {}: {err}",
+            temp.display(),
+            target.display()
+        )
+    })?;
+
+    let target_text = fs::read_to_string(target)
+        .map_err(|err| format!("Failed to read target file {}: {err}", target.display()))?;
+    let target_json = serde_json::from_str::<serde_json::Value>(&target_text)
+        .map_err(|err| format!("Failed to parse target JSON {}: {err}", target.display()))?;
+    verify(&target_json)
 }
 
 fn default_project() -> Project {
@@ -3215,6 +3341,148 @@ mod tests {
             dry_run_only: true,
             already_migrated: false,
         }
+    }
+
+    #[test]
+    fn atomic_temp_path_keeps_temp_in_same_directory() {
+        let dir = temp_test_dir("atomic-temp-same-dir");
+        let target = dir.join("project-a.json");
+        let temp = atomic_temp_path(&target).expect("temp path");
+
+        assert_eq!(temp.parent(), Some(dir.as_path()));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn atomic_temp_path_creates_leading_dot_tmp_filename() {
+        let dir = temp_test_dir("atomic-temp-name");
+        let target = dir.join("project-a.json");
+        let temp = atomic_temp_path(&target).expect("temp path");
+
+        assert_eq!(
+            temp.file_name().and_then(|item| item.to_str()),
+            Some(".project-a.json.tmp")
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn is_storage_temp_file_detects_atomic_temp_file() {
+        assert!(is_storage_temp_file(Path::new(".project-a.json.tmp")));
+    }
+
+    #[test]
+    fn is_storage_temp_file_does_not_classify_project_json() {
+        assert!(!is_storage_temp_file(Path::new("project-a.json")));
+    }
+
+    #[test]
+    fn atomic_write_json_success_writes_valid_json() {
+        let dir = temp_test_dir("atomic-write-success");
+        let target = dir.join("project-a.json");
+
+        atomic_write_json(
+            &target,
+            &serde_json::json!({ "id": "project-a", "title": "Project A" }),
+            verify_any_json_value,
+        )
+        .expect("atomic write");
+
+        let value = read_json::<serde_json::Value>(&target).expect("read target");
+        assert_eq!(value["id"], "project-a");
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn atomic_write_json_overwrites_existing_target_with_valid_new_json() {
+        let dir = temp_test_dir("atomic-write-overwrite");
+        let target = dir.join("project-a.json");
+        fs::write(&target, r#"{"id":"project-a","title":"Old"}"#).expect("write old target");
+
+        atomic_write_json(
+            &target,
+            &serde_json::json!({ "id": "project-a", "title": "New" }),
+            |value| verify_project_json_value("project-a", value),
+        )
+        .expect("atomic overwrite");
+
+        let value = read_json::<serde_json::Value>(&target).expect("read target");
+        assert_eq!(value["title"], "New");
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn verify_project_json_value_passes_matching_id() {
+        let value = serde_json::json!({ "id": "project-a" });
+
+        verify_project_json_value("project-a", &value).expect("matching project id");
+    }
+
+    #[test]
+    fn verify_project_json_value_rejects_mismatched_id() {
+        let value = serde_json::json!({ "id": "project-b" });
+
+        let error = verify_project_json_value("project-a", &value).expect_err("mismatched id");
+        assert!(error.contains("does not match expected"));
+    }
+
+    #[test]
+    fn verify_app_state_json_value_allows_missing_data_version() {
+        let value = serde_json::json!({
+            "currentProjectId": "project-a",
+            "projectSidebarCollapsed": false,
+            "propertiesSidebarCollapsed": true
+        });
+
+        verify_app_state_json_value(&value).expect("missing dataVersion remains compatible");
+    }
+
+    #[test]
+    fn verify_app_state_json_value_rejects_unsupported_data_version() {
+        let value = serde_json::json!({ "dataVersion": 99 });
+
+        let error = verify_app_state_json_value(&value).expect_err("unsupported dataVersion");
+        assert!(error.contains("not supported"));
+    }
+
+    #[test]
+    fn atomic_write_json_verify_failure_before_rename_preserves_old_target() {
+        let dir = temp_test_dir("atomic-write-verify-failure");
+        let target = dir.join("project-a.json");
+        fs::write(&target, r#"{"id":"project-a","title":"Old"}"#).expect("write old target");
+
+        let error = atomic_write_json(
+            &target,
+            &serde_json::json!({ "id": "project-b", "title": "New" }),
+            |value| verify_project_json_value("project-a", value),
+        )
+        .expect_err("verify failure");
+
+        assert!(error.contains("does not match expected"));
+        let value = read_json::<serde_json::Value>(&target).expect("old target remains readable");
+        assert_eq!(value["id"], "project-a");
+        assert_eq!(value["title"], "Old");
+        assert!(atomic_temp_path(&target).expect("temp path").exists());
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn atomic_write_json_rejects_target_without_parent() {
+        let target = Path::new("project-a.json");
+
+        let error = atomic_write_json(
+            target,
+            &serde_json::json!({ "id": "project-a" }),
+            verify_any_json_value,
+        )
+        .expect_err("target without parent");
+
+        assert!(error.contains("no parent directory"));
     }
 
     fn bootstrap_path_for_test(root: &Path) -> PathBuf {
