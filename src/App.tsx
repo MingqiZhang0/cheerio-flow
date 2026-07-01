@@ -93,6 +93,7 @@ import {
 type ModuleNodeType = Node<FlowModuleData, "module">;
 type ArrowEdgeType = Edge<FlowArrowData>;
 type SaveStatus = "saving" | "saved" | "error";
+type StorageErrorKind = "load" | "save" | "restore" | "migration" | null;
 type BackupStatus = "idle" | "running" | "success" | "error";
 type RestoreStatus = "idle" | "loading" | "running" | "success" | "error";
 type MigrationDryRunStatus = "idle" | "running" | "success" | "error";
@@ -513,6 +514,7 @@ function AppShell() {
   const [flowEdges, setFlowEdges] = useState<ArrowEdgeType[]>([]);
   const [viewport, setViewportState] = useState({ x: 0, y: 0, zoom: 1 });
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
+  const [storageErrorKind, setStorageErrorKind] = useState<StorageErrorKind>(null);
   const [storageReport, setStorageReport] = useState<StorageReport | null>(null);
   const [storageRootInput, setStorageRootInput] = useState("");
   const [folderPickerStatus, setFolderPickerStatus] = useState<FolderPickerStatus>("idle");
@@ -666,6 +668,7 @@ function AppShell() {
   const saveAllNow = useCallback(async (projectsOverride?: Project[]) => {
     if (!loadedRef.current || !canPersistRef.current) return;
     setSaveStatus("saving");
+    setStorageErrorKind(null);
     try {
       const currentProjects = projectsOverride ?? projectsRef.current;
       const currentGroups = groupsRef.current;
@@ -676,9 +679,11 @@ function AppShell() {
       setStorageRootInput(report.storageRoot);
       console.info("Cheerio Flow saved to", report);
       setSaveStatus("saved");
+      setStorageErrorKind(null);
     } catch (reason: unknown) {
       console.error("Failed to save Cheerio Flow data", reason);
       setSaveStatus("error");
+      setStorageErrorKind("save");
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   }, []);
@@ -736,6 +741,7 @@ function AppShell() {
       canPersistRef.current = true;
       loadedRef.current = true;
       setLoaded(true);
+      setStorageErrorKind(null);
     },
     [invalidateMigrationState, updateProjects],
   );
@@ -763,6 +769,7 @@ function AppShell() {
         setDataDir("");
         setLoadedStorageRoot("");
         setSaveStatus("error");
+        setStorageErrorKind("load");
         setLoaded(true);
         void refreshBackups();
       });
@@ -1370,6 +1377,7 @@ function AppShell() {
     removeProject(projectId).catch((reason: unknown) => {
       console.error("Failed to delete project", reason);
       setSaveStatus("error");
+      setStorageErrorKind("save");
       setError(reason instanceof Error ? reason.message : String(reason));
     });
   }, [currentProject, projects, resetInteractionState, updateProjects]);
@@ -1447,6 +1455,7 @@ function AppShell() {
   const applyStorageRoot = useCallback(async () => {
     invalidateMigrationState();
     setSaveStatus("saving");
+    setStorageErrorKind(null);
     const shouldSaveCurrentData = canPersistRef.current;
     if (saveTimerRef.current) {
       window.clearTimeout(saveTimerRef.current);
@@ -1461,6 +1470,7 @@ function AppShell() {
       hydrateLoadedData(data);
       void refreshBackups();
       setSaveStatus("saved");
+      setStorageErrorKind(null);
       setError(null);
       console.info(shouldSaveCurrentData ? "Cheerio Flow storage root set" : "Cheerio Flow storage root switched", data.report);
     } catch (reason: unknown) {
@@ -1471,6 +1481,7 @@ function AppShell() {
       setDataDir("");
       setLoadedStorageRoot("");
       setSaveStatus("error");
+      setStorageErrorKind("load");
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   }, [hydrateLoadedData, invalidateMigrationState, refreshBackups, storageRootInput]);
@@ -1522,6 +1533,7 @@ function AppShell() {
     setRestoreStatus("running");
     setRestoreError(null);
     setRestoreReport(null);
+    setStorageErrorKind(null);
     try {
       const report = await restoreFullBackup(selectedBackupId);
       setRestoreReport(report);
@@ -1529,6 +1541,7 @@ function AppShell() {
       hydrateLoadedData(data);
       setRestoreConfirmation("");
       setSaveStatus("saved");
+      setStorageErrorKind(null);
       setError(null);
       setRestoreStatus("success");
     } catch (reason: unknown) {
@@ -1537,10 +1550,12 @@ function AppShell() {
       invalidateMigrationState();
       setRestoreError(restoreMessage);
       setSaveStatus("error");
+      setStorageErrorKind("restore");
       try {
         const data = await loadDatabase();
         hydrateLoadedData(data);
         setError(restoreMessage);
+        setStorageErrorKind("restore");
       } catch (loadReason: unknown) {
         canPersistRef.current = false;
         loadedRef.current = false;
@@ -1549,6 +1564,7 @@ function AppShell() {
         setLoadedStorageRoot("");
         const loadMessage = loadReason instanceof Error ? loadReason.message : String(loadReason);
         setError(`${restoreMessage} Reload also failed: ${loadMessage}`);
+        setStorageErrorKind("restore");
       }
     }
   }, [hydrateLoadedData, invalidateMigrationState, restoreConfirmation, selectedBackupId]);
@@ -1642,6 +1658,7 @@ function AppShell() {
     setMigrationApplyStatus("running");
     setMigrationApplyError(null);
     setMigrationApplyReport(null);
+    setStorageErrorKind(null);
     try {
       const report = await applyGroupFolderMigration();
       if (report.blockers.length > 0) {
@@ -1658,6 +1675,7 @@ function AppShell() {
         setLoadedStorageRoot("");
         const loadMessage = loadReason instanceof Error ? loadReason.message : String(loadReason);
         setSaveStatus("error");
+        setStorageErrorKind("migration");
         setMigrationApplyStatus("error");
         setMigrationApplyError(`Migration applied, but reload failed: ${loadMessage}`);
         setError(`Migration applied, but reload failed: ${loadMessage}`);
@@ -1668,16 +1686,19 @@ function AppShell() {
       setMigrationApplyReport(report);
       setMigrationConfirmation("");
       setSaveStatus("saved");
+      setStorageErrorKind(null);
       setError(null);
       setMigrationApplyStatus("success");
     } catch (reason: unknown) {
       const migrationMessage = reason instanceof Error ? reason.message : String(reason);
       invalidateMigrationState();
       setSaveStatus("error");
+      setStorageErrorKind("migration");
       try {
         const data = await loadDatabase();
         hydrateLoadedData(data);
         setError(migrationMessage);
+        setStorageErrorKind("migration");
         setMigrationApplyStatus("error");
         setMigrationApplyError(migrationMessage);
       } catch (loadReason: unknown) {
@@ -1690,6 +1711,7 @@ function AppShell() {
         setMigrationApplyStatus("error");
         setMigrationApplyError(`${migrationMessage} Reload also failed: ${loadMessage}`);
         setError(`${migrationMessage} Reload also failed: ${loadMessage}`);
+        setStorageErrorKind("migration");
       }
     }
   }, [hydrateLoadedData, invalidateMigrationState, isCurrentMigrationReport, migrationApplyStatus, migrationConfirmation, migrationDryRunReport, refreshBackups, restoreStatus, saveStatus]);
@@ -1980,6 +2002,18 @@ function AppShell() {
       migrationCanRunDryRun,
   );
   const migrationCanApply = migrationCanUseDryRun && migrationConfirmation === "MIGRATE";
+  const storageStatusLabel =
+    saveStatus === "saving"
+      ? "Saving..."
+      : saveStatus === "saved"
+      ? "Saved"
+      : storageErrorKind === "load"
+      ? "Load failed"
+      : storageErrorKind === "restore"
+      ? "Restore failed"
+      : storageErrorKind === "migration"
+      ? "Migration failed"
+      : "Save failed";
   const effectiveStorageDrawerHeight = clampStorageDrawerHeight(storageDrawerHeight);
   const storageRootControls = (
     <>
@@ -2604,7 +2638,7 @@ function AppShell() {
             </span>
           )}
           {pendingShape ? <strong>Click the canvas to create a {pendingShape} module. Esc cancels.</strong> : <span>Modules {flowNodes.length} / Arrows {flowEdges.length}</span>}
-          <span className={`save-status save-status-${saveStatus}`}>{saveStatus === "saving" ? "Saving..." : saveStatus === "saved" ? "Saved" : "Save failed"}</span>
+          <span className={`save-status save-status-${saveStatus}`}>{storageStatusLabel}</span>
           {error && <span className="error-text">{error}</span>}
         </footer>
       </section>
