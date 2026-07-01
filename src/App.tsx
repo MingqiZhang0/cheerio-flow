@@ -385,8 +385,14 @@ const nodeTypes = {
 };
 
 function isEditableTarget(target: EventTarget | null) {
-  if (!(target instanceof HTMLElement)) return false;
-  return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+  if (!(target instanceof Element)) return false;
+  if (target instanceof HTMLElement && target.isContentEditable) return true;
+  return Boolean(target.closest("input, textarea, select, button, [contenteditable='true'], [contenteditable='plaintext-only'], [role='button'], [role='dialog'], dialog, [aria-modal='true']"));
+}
+
+function isReactFlowTarget(target: EventTarget | null) {
+  if (!(target instanceof Element)) return false;
+  return Boolean(target.closest(".react-flow"));
 }
 
 function isConsoleToggle(event: KeyboardEvent) {
@@ -534,6 +540,7 @@ function AppShell() {
   const [consoleMessage, setConsoleMessage] = useState("");
   const [consoleError, setConsoleError] = useState("");
   const [ctrlWheel, setCtrlWheel] = useState<CtrlWheelState>(null);
+  const [isPointerOverCanvas, setIsPointerOverCanvas] = useState(false);
   const consoleInputRef = useRef<HTMLInputElement | null>(null);
   const projectSidebarBodyRef = useRef<HTMLDivElement | null>(null);
   const saveTimerRef = useRef<number | null>(null);
@@ -590,6 +597,7 @@ function AppShell() {
     rightSidebarWidth: RIGHT_SIDEBAR_DEFAULT_WIDTH,
   });
   const lastPointerRef = useRef({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
+  const lastPointerTargetRef = useRef<EventTarget | null>(null);
 
   const currentProject = useMemo(
     () => projects.find((project) => project.id === currentProjectId) ?? projects[0] ?? null,
@@ -796,6 +804,7 @@ function AppShell() {
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
       lastPointerRef.current = { x: event.clientX, y: event.clientY };
+      lastPointerTargetRef.current = event.target;
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (sidebarResizeRef.current) return;
@@ -818,6 +827,7 @@ function AppShell() {
       }
 
       if (event.key === "Control" && !event.repeat && !consoleOpen && !isEditableTarget(event.target)) {
+        if (!isPointerOverCanvas || !isReactFlowTarget(lastPointerTargetRef.current) || isEditableTarget(lastPointerTargetRef.current)) return;
         setCtrlWheel({ ...lastPointerRef.current });
       }
     };
@@ -833,7 +843,7 @@ function AppShell() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [consoleOpen]);
+  }, [consoleOpen, isPointerOverCanvas]);
 
   useEffect(() => {
     if (!loaded || projects.length === 0) return;
@@ -2493,7 +2503,14 @@ function AppShell() {
           )}
         </header>
 
-        <div className="canvas-wrap">
+        <div
+          className="canvas-wrap"
+          onMouseEnter={() => setIsPointerOverCanvas(true)}
+          onMouseLeave={() => {
+            setIsPointerOverCanvas(false);
+            setCtrlWheel(null);
+          }}
+        >
           {showIntegrityBanner && integrityReport && (
             <div className="integrity-banner integrity-banner-warning">
               <span>Data integrity warnings found: {integrityReport.issueCount} issue(s). The scan is read-only and did not write changes to disk.</span>
