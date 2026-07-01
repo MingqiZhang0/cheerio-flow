@@ -4,39 +4,96 @@ Local-first desktop research workflow planning tool built with Tauri, React, Typ
 
 Cheerio Flow is designed for researchers, students, and technical writers who need to plan complex research processes visually: concepts, equations, assumptions, datasets, experiments, arguments, dependencies, and presentation structure can be arranged as editable nodes and arrows on a local canvas.
 
-The project is in active development, with v0.1.5 completing the first real storage migration and v0.1.4 having established the data-safety foundation.
+The project is in active development, with v0.1.6 introducing atomic save and a storage operation console, building on v0.1.5's group-folder migration and v0.1.4's data-safety foundation.
 
 ## Current version
 
 ```text
-v0.1.5 — Group Folder Migration
+v0.1.6 — Atomic Save & Storage Operation Console
 ```
 
-v0.1.5 introduces Cheerio Flow's first formal data version migration: **dataVersion 1 → dataVersion 2 (group-folder layout)**.
+v0.1.6 introduces **atomic writes for active JSON files** and a **Storage Operation Console**, building on the v0.1.5 Group Folder Migration and v0.1.4 Data Safety Foundation.
 
-### Version highlights
+### v0.1.6 highlights
 
-- Introduces **dataVersion 2**.
-- New project storage layout:
+#### Atomic save for active data
+
+All active JSON files now use atomic write (write-temp → flush → sync_all → verify → rename → verify):
+
+- Active project JSON files.
+- `groups.json`.
+- `app-state.json`.
+- Fresh workspace bootstrap active JSON.
+
+Temp files are named `.<original-filename>.tmp` (for example `.app-state.json.tmp`, `.groups.json.tmp`, `.project-a.json.tmp`) and live in the same directory as the target file.
+
+Boundaries:
+
+- Pre-rename failure preserves the old target file.
+- Post-rename verification failure is detected and returned as an error.
+- v0.1.6 does **not** implement post-rename rollback.
+- v1 flat project saves remain in v1 layout.
+- v2 group-folder project saves remain in v2 layout.
+- v1 autosave does **not** automatically migrate to v2.
+- v2 group-move stale quarantine behavior is preserved.
+
+#### Storage Operation Console
+
+A read-only modal/dialog opened by clicking the bottom save/status area:
+
+- Displays recent storage events from the in-memory ring buffer.
+- Supports **Copy Log**, **Clear**, **Close**, and **Escape** dismissal.
+- Ctrl radial menu is suppressed while the console is open; returns to normal on canvas after closing.
+- The console is read-only — it has no Restore, Migration, Delete, or Repair buttons.
+
+#### StorageEvent / Operation Log Buffer
+
+- Frontend in-memory ring buffer (capacity **512**).
+- Not persisted — cleared on app restart.
+- Observes `load`, `save`, `backup`, `restore`, `migration` (dry-run), `storage-root`, and `console` events.
+- This is an **observability aid**, not a persistent audit log.
+
+#### Manual desktop validation
+
+v0.1.6 completed manual desktop smoke testing in the **real Tauri desktop window** (browser fallback is not a valid desktop verification environment):
+
+| Test | Name | Result |
+|------|------|--------|
+| S5-T1 | Storage Console Open | PASS |
+| S5-T2 | Copy Log (Real Tauri) | PASS |
+| S5-T3 | Clear Console | PASS |
+| S5-T4 | Close / Escape | PASS |
+| S5-T5 | Ctrl Radial Scope | PASS |
+| S5-T6 | Fresh v2 Bootstrap | PASS |
+| S5-T7 | v2 Normal Save | PASS |
+| S5-T8 | v1 Autosave No Migration | PASS |
+| S5-T9 | v2 Group Move Stale Quarantine | PASS |
+| S5-T10 | Bad JSON Load Failed | PASS |
+| S5-T11 | Duplicate Project ID Load Failed | PASS |
+| S5-T12 | Stale .tmp Not Loaded as Project | PASS |
+
+Full report: `docs/V0.1.6_MANUAL_DESKTOP_SMOKE_TEST_REPORT.md`
+
+#### Validation summary
 
 ```text
-CheerioFlowData/projects/ungrouped/{project-id}.json
-CheerioFlowData/projects/groups/{group-id}/{project-id}.json
+pnpm exec tsc --noEmit        # Passed
+pnpm build                    # Passed (existing Vite chunk-size warning only)
+cargo fmt --check             # Passed
+cargo check                   # Passed (no warnings)
+cargo test                    # 30 passed, 0 failed
 ```
 
-- Fresh workspaces initialize as `dataVersion: 2` with group-folder layout.
-- Existing v1 workspaces remain fully supported — they load and save in flat layout without change.
-- v1 workspaces are **not** automatically migrated during normal load, save, or autosave.
-- v1 → v2 migration requires explicit dry-run, zero blockers, and typed confirmation **MIGRATE**.
-- Migration creates a full backup, stages the v2 layout, verifies staged data, activates by rename, and preserves the previous data directory as `CheerioFlowData.before-migration-*`.
-- Restoring an old v1 backup after migration returns the workspace to v1 without auto-migrating.
-- Duplicate project IDs and bad JSON block loading and migration — no migration artifacts are created.
+Final read-only review found no blockers.
 
-The next planned development line is:
+#### v0.1.5 recap (foundation for v0.1.6)
 
-```text
-v0.1.6 — Atomic Save Layer
-```
+v0.1.6 is built on the v0.1.5 migration engine:
+
+- **dataVersion 2** group-folder layout.
+- Dry-run + **MIGRATE** confirmation + backup + staging + verification + rollback.
+- v1 workspaces are fully supported — no automatic migration.
+- Duplicate project IDs and bad JSON block load and migration.
 
 ## What this project does
 
@@ -280,6 +337,9 @@ Desktop development and desktop packaging require a working Rust/Tauri environme
 | Image asset import              |       Not implemented | Planned future extension                      |
 | Presentation mode               |       Not implemented | Planned future extension                      |
 | Real group-folder migration     | Implemented in v0.1.5 | Dry-run + MIGRATE confirmation + backup + staging + rollback |
+| Atomic write for active JSON  | Implemented in v0.1.6 | write-temp → flush → sync_all → verify → rename              |
+| Storage Operation Console     | Implemented in v0.1.6 | Read-only modal, in-memory event log                         |
+| Storage event buffer          | Implemented in v0.1.6 | Frontend ring buffer, capacity 512                           |
 
 ## Data Safety Demo
 
@@ -287,7 +347,7 @@ Cheerio Flow treats local data safety as a first-class design goal.
 
 v0.1.4 focused on preventing accidental local data loss caused by failed loads, broken JSON files, unsafe saves, restore failures, or future storage migrations.
 
-v0.1.5 adds the real migration engine with backup enforcement, staging, verification, and rollback, plus duplicate project ID detection, storage error type labels, and Ctrl radial menu canvas scoping.
+v0.1.5 adds the real migration engine with backup enforcement, staging, verification, and rollback, plus duplicate project ID detection, storage error type labels, and Ctrl radial menu canvas scoping. v0.1.6 strengthens active JSON save reliability through atomic writes and adds observability through the Storage Operation Console.
 
 ```mermaid
 flowchart TD
@@ -359,6 +419,8 @@ The diagram above shows the intended v0.1.4 safety model:
 | Stale migration report guard | Old dry-run reports are cleared when switching workspaces.|
 | Storage error type labels    | Distinguishes Load/Save/Restore/Migration failed in status bar.|
 | Ctrl radial menu scope       | Module creation radial menu only opens over the canvas. |
+| Atomic write for active JSON | write-temp → flush → sync_all → verify → rename for active saves. |
+| Storage operation event buffer | In-memory ring buffer observes storage operations.    |
 | Symlink avoidance            | All file operations reject and skip symlinks.           |
 
 ## Storage model
@@ -669,16 +731,17 @@ Current limitations:
 * There is no plugin system yet.
 * Large project performance still needs further testing.
 * Automatic repair is intentionally not implemented in v0.1.4.
+* v0.1.6 does **not** include: single-writer workspace lock, checksum manifest, Recovery Center, pseudo-server backup root, GitHub backup adapter, persistent operation log, automatic stale `.tmp` cleanup, directory fsync hardening, stronger Windows-specific write hardening, post-rename rollback, kill-process save interruption validation, or end-to-end encryption.
+* Backup, restore, migration, and quarantine remain on the v0.1.5 safety model and were not rewritten in v0.1.6.
+* Interrupted-save kill-process test was not run in Slice 5.
 
 ## Roadmap
 
 Planned directions:
 
-### v0.1.6 — Atomic Save Layer
+### v0.1.6 — Atomic Save & Storage Operation Console ✅
 
-Next planned development line. Build on the v0.1.5 migration foundation to introduce atomic save: write to temp file, fsync, then rename — so that interrupted saves never leave a partially written project file on disk.
-
-A Storage Operation Console / Activity Console is planned as a future observability enhancement, likely around the Atomic Save work.
+Completed. Introduced atomic write for all active JSON files (write-temp → flush → sync_all → verify → rename) and a read-only Storage Operation Console with an in-memory ring buffer for storage event observability. Manual desktop smoke testing passed in the real Tauri desktop window (12/12 tests PASS). See the Current version section above for details.
 
 ### Future features
 
@@ -696,7 +759,7 @@ Possible future extensions:
 
 ## Future Data Reliability
 
-Cheerio Flow has evolved from the v0.1.4 Data Safety Foundation through v0.1.5 Group Folder Migration toward professional-grade local data reliability for research workflow projects.
+Cheerio Flow has evolved from the v0.1.4 Data Safety Foundation through v0.1.5 Group Folder Migration to v0.1.6 Atomic Save & Storage Operation Console — improving local-first active JSON save reliability and storage operation observability under tested desktop scenarios.
 
 See:
 
@@ -723,6 +786,7 @@ AI assistance was used for implementation support, review prompts, and release o
 Release tags:
 
 ```text
+v0.1.6       Atomic Save & Storage Operation Console
 v0.1.5       Group Folder Migration
 v0.1.5-rc1   Group Folder Migration release candidate
 v0.1.4       Data Safety Foundation
