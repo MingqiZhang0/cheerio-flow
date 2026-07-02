@@ -750,6 +750,19 @@ function AppShell() {
         relatedPath: report.dataDir,
         dataVersion: currentAppState.dataVersion,
       });
+      for (const warning of report.warnings ?? []) {
+        if (warning.kind !== "snapshot-manifest") continue;
+        appendStorageEvent({
+          severity: "warning",
+          operation: "manifest",
+          phase: "warning",
+          message: "Snapshot manifest was not updated, but active data was saved.",
+          details: warning.message,
+          relatedPath: warning.relatedPath ?? ".cheerio/snapshot-manifest.json",
+          errorKind: "manifest",
+          dataVersion: currentAppState.dataVersion,
+        });
+      }
     } catch (reason: unknown) {
       const message = reason instanceof Error ? reason.message : String(reason);
       console.error("Failed to save Cheerio Flow data", reason);

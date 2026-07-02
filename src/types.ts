@@ -75,6 +75,12 @@ export interface AppState {
   rightSidebarWidth: number;
 }
 
+export interface StorageWarning {
+  kind: string;
+  message: string;
+  relatedPath?: string | null;
+}
+
 export interface StorageReport {
   storageRoot: string;
   dataDir: string;
@@ -85,6 +91,7 @@ export interface StorageReport {
   projectCount: number;
   moduleCount: number;
   arrowCount: number;
+  warnings: StorageWarning[];
 }
 
 export type StorageEventSeverity = "info" | "warning" | "error";
@@ -95,6 +102,7 @@ export type StorageOperation =
   | "backup"
   | "restore"
   | "migration"
+  | "manifest"
   | "atomic-write"
   | "storage-root"
   | "console";
@@ -106,11 +114,12 @@ export type StoragePhase =
   | "renamed"
   | "verified"
   | "committed"
+  | "warning"
   | "failed"
   | "blocked"
   | "rollback";
 
-export type StorageEventErrorKind = "load" | "save" | "restore" | "migration" | "backup" | "storage-root";
+export type StorageEventErrorKind = "load" | "save" | "restore" | "migration" | "backup" | "storage-root" | "manifest";
 
 export interface StorageEvent {
   id: string;

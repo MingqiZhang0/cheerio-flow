@@ -26,6 +26,7 @@ function createBrowserReport(data: PersistedData): StorageReport {
     projectCount: data.projects.length,
     moduleCount: data.projects.reduce((total, project) => total + project.modules.length, 0),
     arrowCount: data.projects.reduce((total, project) => total + project.arrows.length, 0),
+    warnings: [],
   };
 }
 

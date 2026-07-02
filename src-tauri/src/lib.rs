@@ -115,6 +115,14 @@ struct AppState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct StorageWarning {
+    kind: String,
+    message: String,
+    related_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StorageReport {
     storage_root: String,
     data_dir: String,
@@ -125,6 +133,7 @@ struct StorageReport {
     project_count: usize,
     module_count: usize,
     arrow_count: usize,
+    warnings: Vec<StorageWarning>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1013,6 +1022,7 @@ fn build_report(
         project_count: projects.len(),
         module_count: projects.iter().map(|project| project.modules.len()).sum(),
         arrow_count: projects.iter().map(|project| project.arrows.len()).sum(),
+        warnings: vec![],
     }
 }
 
@@ -1375,12 +1385,25 @@ pub fn generate_and_write_snapshot_manifest_for_data_root(
     write_snapshot_manifest_atomic(data_root, &manifest)
 }
 
-fn best_effort_generate_snapshot_manifest(data_root: &Path, context: &str) {
-    if let Err(error) = generate_and_write_snapshot_manifest_for_data_root(data_root) {
-        eprintln!(
-            "Cheerio Flow warning: active data saved during {context}, but snapshot manifest generation failed for {}: {error}",
-            data_root.display()
-        );
+fn best_effort_generate_snapshot_manifest(
+    data_root: &Path,
+    context: &str,
+) -> Option<StorageWarning> {
+    match generate_and_write_snapshot_manifest_for_data_root(data_root) {
+        Ok(_) => None,
+        Err(error) => {
+            let message =
+                format!("Snapshot manifest was not updated, but active data was saved. {error}");
+            eprintln!(
+                "Cheerio Flow warning: active data saved during {context}, but snapshot manifest generation failed for {}: {error}",
+                data_root.display()
+            );
+            Some(StorageWarning {
+                kind: "snapshot-manifest".to_string(),
+                message,
+                related_path: Some(".cheerio/snapshot-manifest.json".to_string()),
+            })
+        }
     }
 }
 
@@ -1692,6 +1715,7 @@ fn load_database_from_paths(
         }
     };
 
+    let mut storage_warnings = Vec::new();
     if projects.is_empty() {
         if classification != DataRootClassification::NewEmptyWorkspace {
             return Err(format!(
@@ -1708,11 +1732,16 @@ fn load_database_from_paths(
         atomic_write_groups_json(&data_root.join(GROUPS_FILE), &groups)?;
         atomic_write_app_state_json(&data_root.join(APP_STATE_FILE), &app_state)?;
         projects.push(project);
-        best_effort_generate_snapshot_manifest(&data_root, "fresh workspace bootstrap");
+        if let Some(warning) =
+            best_effort_generate_snapshot_manifest(&data_root, "fresh workspace bootstrap")
+        {
+            storage_warnings.push(warning);
+        }
     }
 
     projects.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    let report = build_report(&storage_root, &data_root, &bootstrap, &projects);
+    let mut report = build_report(&storage_root, &data_root, &bootstrap, &projects);
+    report.warnings = storage_warnings;
 
     Ok(PersistedData {
         data_dir: report.data_dir.clone(),
@@ -1788,9 +1817,12 @@ fn save_database_to_paths(
     }
     atomic_write_groups_json(&data_root.join(GROUPS_FILE), &payload.groups)?;
     atomic_write_app_state_json(&data_root.join(APP_STATE_FILE), &payload.app_state)?;
-    best_effort_generate_snapshot_manifest(&data_root, "active save");
+    let storage_warnings = best_effort_generate_snapshot_manifest(&data_root, "active save")
+        .into_iter()
+        .collect();
 
-    let report = build_report(&storage_root, &data_root, &bootstrap, &payload.projects);
+    let mut report = build_report(&storage_root, &data_root, &bootstrap, &payload.projects);
+    report.warnings = storage_warnings;
     println!(
         "Cheerio Flow saved {} projects, {} modules, {} arrows to {}",
         report.project_count, report.module_count, report.arrow_count, report.data_dir
@@ -4110,7 +4142,7 @@ mod tests {
         let ungrouped_project = sample_project("project-b", None);
         let group = sample_group("group-a", vec!["project-a"]);
 
-        save_database_to_paths(
+        let report = save_database_to_paths(
             storage_root.clone(),
             bootstrap,
             sample_payload(
@@ -4140,6 +4172,7 @@ mod tests {
             .join("group-a")
             .join(".project-a.json.tmp")
             .exists());
+        assert!(report.warnings.is_empty());
 
         fs::remove_dir_all(storage_root).ok();
     }
@@ -4217,7 +4250,7 @@ mod tests {
         let ungrouped_project = sample_project("project-b", None);
         let group = sample_group("group-a", vec!["project-a"]);
 
-        save_database_to_paths(
+        let report = save_database_to_paths(
             storage_root.clone(),
             bootstrap,
             sample_payload(
@@ -4235,6 +4268,7 @@ mod tests {
         assert_eq!(manifest["manifestVersion"], SNAPSHOT_MANIFEST_VERSION);
         assert_eq!(manifest["dataVersion"], CURRENT_DATA_VERSION);
         assert_eq!(manifest["layoutKind"], "v2-group-folder");
+        assert!(report.warnings.is_empty());
         assert!(paths.contains(&"app-state.json".to_string()));
         assert!(paths.contains(&"groups.json".to_string()));
         assert!(paths.contains(&"projects/groups/group-a/project-a.json".to_string()));
@@ -4359,6 +4393,15 @@ mod tests {
         .expect("active save should still succeed");
 
         assert_eq!(report.project_count, 1);
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].kind, "snapshot-manifest");
+        assert!(report.warnings[0]
+            .message
+            .contains("Snapshot manifest was not updated, but active data was saved."));
+        assert_eq!(
+            report.warnings[0].related_path.as_deref(),
+            Some(".cheerio/snapshot-manifest.json")
+        );
         assert!(data_root
             .join("projects")
             .join("ungrouped")
