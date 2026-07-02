@@ -1,5 +1,7 @@
 # Cheerio Flow
 
+[English](./README.md) | [中文版](./README_CN.md)
+
 Local-first desktop research workflow planning tool built with Tauri, React, TypeScript, Rust, React Flow, and KaTeX.
 
 Cheerio Flow is designed for researchers, students, and technical writers who need to plan complex research processes visually: concepts, equations, assumptions, datasets, experiments, arguments, dependencies, and presentation structure can be arranged as editable nodes and arrows on a local canvas.
