@@ -16,6 +16,7 @@ const BOOTSTRAP_FILE: &str = "cheerio-flow-bootstrap.json";
 const LEGACY_DATA_VERSION: u32 = 1;
 const CURRENT_DATA_VERSION: u32 = 2;
 const SHA256_READ_BUFFER_SIZE: usize = 64 * 1024;
+const SNAPSHOT_MANIFEST_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -669,6 +670,29 @@ pub struct SnapshotFileInventory {
     pub files: Vec<SnapshotFileInventoryEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotManifestFileEntry {
+    pub path: String,
+    pub role: SnapshotFileRole,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotManifest {
+    pub manifest_version: u32,
+    pub data_version: u32,
+    pub created_at: String,
+    pub app_version: String,
+    pub generator: String,
+    pub layout_kind: SnapshotLayoutKind,
+    pub project_count: usize,
+    pub group_count: usize,
+    pub files: Vec<SnapshotManifestFileEntry>,
+}
+
 fn count_top_level_project_json_files(projects_dir: &Path) -> Result<usize, String> {
     if !projects_dir.exists() {
         return Ok(0);
@@ -1093,6 +1117,96 @@ pub fn collect_active_snapshot_file_inventory(
     Ok(SnapshotFileInventory {
         layout_kind,
         data_version,
+        files,
+    })
+}
+
+fn validate_snapshot_manifest_relative_path(
+    data_root: &Path,
+    relative_path: &str,
+) -> Result<(), String> {
+    if relative_path.is_empty() {
+        return Err("Snapshot manifest file path cannot be empty".to_string());
+    }
+    if relative_path.contains('\\') {
+        return Err(format!(
+            "Snapshot manifest file path must use forward slashes: {relative_path}"
+        ));
+    }
+    if Path::new(relative_path).is_absolute() {
+        return Err(format!(
+            "Snapshot manifest file path cannot be absolute: {relative_path}"
+        ));
+    }
+    let data_root_text = data_root.to_string_lossy();
+    if relative_path.contains(data_root_text.as_ref()) {
+        return Err(format!(
+            "Snapshot manifest file path cannot include data root prefix: {relative_path}"
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_manifest_file_path(data_root: &Path, relative_path: &str) -> PathBuf {
+    relative_path
+        .split('/')
+        .fold(data_root.to_path_buf(), |path, segment| path.join(segment))
+}
+
+fn active_group_count_for_snapshot_manifest(data_root: &Path) -> Result<usize, String> {
+    let groups_path = data_root.join(GROUPS_FILE);
+    let groups = read_json::<Vec<ProjectGroup>>(&groups_path)?;
+    Ok(groups.len())
+}
+
+pub fn build_snapshot_manifest_in_memory(
+    data_root: &Path,
+    app_version: &str,
+    created_at: &str,
+) -> Result<SnapshotManifest, String> {
+    let inventory = collect_active_snapshot_file_inventory(data_root)?;
+    let group_count = active_group_count_for_snapshot_manifest(data_root)?;
+    let project_count = inventory
+        .files
+        .iter()
+        .filter(|entry| entry.role == SnapshotFileRole::Project)
+        .count();
+    let mut files = Vec::with_capacity(inventory.files.len());
+
+    for inventory_entry in inventory.files {
+        validate_snapshot_manifest_relative_path(data_root, &inventory_entry.relative_path)?;
+        let path = snapshot_manifest_file_path(data_root, &inventory_entry.relative_path);
+        let sha256 = compute_file_sha256_hex(&path)?;
+        let metadata = fs::metadata(&path).map_err(|err| {
+            format!(
+                "Failed to read metadata for snapshot manifest file {}: {err}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "Snapshot manifest file path is not a file: {}",
+                path.display()
+            ));
+        }
+        files.push(SnapshotManifestFileEntry {
+            path: inventory_entry.relative_path,
+            role: inventory_entry.role,
+            sha256,
+            size_bytes: metadata.len(),
+        });
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(SnapshotManifest {
+        manifest_version: SNAPSHOT_MANIFEST_VERSION,
+        data_version: inventory.data_version,
+        created_at: created_at.to_string(),
+        app_version: app_version.to_string(),
+        generator: format!("Cheerio Flow v{app_version}"),
+        layout_kind: inventory.layout_kind,
+        project_count,
+        group_count,
         files,
     })
 }
@@ -4108,6 +4222,25 @@ mod tests {
             .collect()
     }
 
+    fn manifest_paths(manifest: &SnapshotManifest) -> Vec<String> {
+        manifest
+            .files
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    fn manifest_entry<'a>(
+        manifest: &'a SnapshotManifest,
+        path: &str,
+    ) -> &'a SnapshotManifestFileEntry {
+        manifest
+            .files
+            .iter()
+            .find(|entry| entry.path == path)
+            .expect("manifest entry")
+    }
+
     #[test]
     fn snapshot_inventory_collects_v1_flat_layout_files() {
         let data_root = temp_test_dir("snapshot-inventory-v1");
@@ -4499,6 +4632,372 @@ mod tests {
             assert!(!Path::new(&entry.relative_path).is_absolute());
             assert!(!entry.relative_path.contains(data_root_text.as_ref()));
         }
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_builds_v1_in_memory() {
+        let data_root = temp_test_dir("snapshot-manifest-v1");
+        let created_at = "2026-07-01T12:34:56Z";
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(LEGACY_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-a", vec!["project-a"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root.join("projects").join("project-b.json"),
+            &sample_project("project-b", None),
+        )
+        .expect("write project b");
+        write_json(
+            &data_root.join("projects").join("project-a.json"),
+            &sample_project("project-a", Some("group-a")),
+        )
+        .expect("write project a");
+
+        let manifest = build_snapshot_manifest_in_memory(&data_root, "0.1.7", created_at)
+            .expect("build manifest");
+        let project_a_path = data_root.join("projects").join("project-a.json");
+        let project_a_entry = manifest_entry(&manifest, "projects/project-a.json");
+        let app_state_entry = manifest_entry(&manifest, APP_STATE_FILE);
+
+        assert_eq!(manifest.manifest_version, SNAPSHOT_MANIFEST_VERSION);
+        assert_eq!(manifest.data_version, LEGACY_DATA_VERSION);
+        assert_eq!(manifest.layout_kind, SnapshotLayoutKind::V1Flat);
+        assert_eq!(manifest.app_version, "0.1.7");
+        assert_eq!(manifest.generator, "Cheerio Flow v0.1.7");
+        assert_eq!(manifest.created_at, created_at);
+        assert_eq!(manifest.project_count, 2);
+        assert_eq!(manifest.group_count, 1);
+        assert_eq!(
+            manifest_paths(&manifest),
+            vec![
+                "app-state.json".to_string(),
+                "groups.json".to_string(),
+                "projects/project-a.json".to_string(),
+                "projects/project-b.json".to_string(),
+            ]
+        );
+        assert_eq!(
+            project_a_entry.sha256,
+            compute_file_sha256_hex(&project_a_path).expect("hash project a")
+        );
+        assert_lowercase_sha256_hex(&project_a_entry.sha256);
+        assert_eq!(
+            app_state_entry.size_bytes,
+            fs::metadata(data_root.join(APP_STATE_FILE))
+                .expect("app-state metadata")
+                .len()
+        );
+        assert!(!data_root.join(".cheerio").exists());
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_builds_v2_in_memory() {
+        let data_root = temp_test_dir("snapshot-manifest-v2");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-a", vec!["project-b"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-a")),
+        )
+        .expect("write grouped project");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write ungrouped project");
+
+        let manifest =
+            build_snapshot_manifest_in_memory(&data_root, "0.1.7", "2026-07-01T12:34:56Z")
+                .expect("build manifest");
+
+        assert_eq!(manifest.manifest_version, SNAPSHOT_MANIFEST_VERSION);
+        assert_eq!(manifest.data_version, CURRENT_DATA_VERSION);
+        assert_eq!(manifest.layout_kind, SnapshotLayoutKind::V2GroupFolder);
+        assert_eq!(manifest.project_count, 2);
+        assert_eq!(manifest.group_count, 1);
+        assert_eq!(
+            manifest_paths(&manifest),
+            vec![
+                "app-state.json".to_string(),
+                "groups.json".to_string(),
+                "projects/groups/group-a/project-b.json".to_string(),
+                "projects/ungrouped/project-a.json".to_string(),
+            ]
+        );
+        assert!(!data_root.join(".cheerio").exists());
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_paths_are_safe_relative_forward_slash_paths() {
+        let data_root = temp_test_dir("snapshot-manifest-path-safety");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-b"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-a", vec!["project-b"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-a")),
+        )
+        .expect("write grouped project");
+
+        let manifest =
+            build_snapshot_manifest_in_memory(&data_root, "0.1.7", "2026-07-01T12:34:56Z")
+                .expect("build manifest");
+        let data_root_text = data_root.to_string_lossy();
+
+        assert!(manifest_paths(&manifest)
+            .contains(&"projects/groups/group-a/project-b.json".to_string()));
+        for entry in manifest.files {
+            assert!(!entry.path.contains('\\'));
+            assert!(!Path::new(&entry.path).is_absolute());
+            assert!(!entry.path.contains(data_root_text.as_ref()));
+        }
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_files_are_sorted_deterministically() {
+        let data_root = temp_test_dir("snapshot-manifest-sorted");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-c"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-b", vec!["project-b"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-c.json"),
+            &sample_project("project-c", None),
+        )
+        .expect("write project c");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-b")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-b")),
+        )
+        .expect("write project b");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-a.json"),
+            &sample_project("project-a", Some("group-a")),
+        )
+        .expect("write project a");
+
+        let manifest =
+            build_snapshot_manifest_in_memory(&data_root, "0.1.7", "2026-07-01T12:34:56Z")
+                .expect("build manifest");
+        let paths = manifest_paths(&manifest);
+        let mut sorted_paths = paths.clone();
+        sorted_paths.sort();
+
+        assert_eq!(paths, sorted_paths);
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_inherits_inventory_exclusions() {
+        let data_root = temp_test_dir("snapshot-manifest-exclusion");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-a", vec!["project-b"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write ungrouped project");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-a")),
+        )
+        .expect("write grouped project");
+        write_json(
+            &data_root.join("projects").join("project-old-flat.json"),
+            &sample_project("project-old-flat", None),
+        )
+        .expect("write old flat project");
+        fs::write(
+            data_root
+                .join("projects")
+                .join("ungrouped")
+                .join(".project-a.json.tmp"),
+            r#"{"id":"project-a"}"#,
+        )
+        .expect("write ungrouped temp");
+        fs::write(
+            data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join(".project-b.json.tmp"),
+            r#"{"id":"project-b"}"#,
+        )
+        .expect("write grouped temp");
+        write_json(
+            &data_root.join(".cheerio").join("snapshot-manifest.json"),
+            &serde_json::json!({ "manifestVersion": 1 }),
+        )
+        .expect("write manifest");
+        write_json(
+            &data_root
+                .join(".cheerio")
+                .join("stale-project-files")
+                .join("stamp")
+                .join("projects")
+                .join("project-stale.json"),
+            &sample_project("project-stale", None),
+        )
+        .expect("write stale quarantine project");
+        write_json(
+            &data_root
+                .join("before-restore-20260702")
+                .join("project.json"),
+            &sample_project("project-before-restore", None),
+        )
+        .expect("write before restore project");
+        write_json(
+            &data_root
+                .join("before-migration-20260702")
+                .join("project.json"),
+            &sample_project("project-before-migration", None),
+        )
+        .expect("write before migration project");
+
+        let manifest =
+            build_snapshot_manifest_in_memory(&data_root, "0.1.7", "2026-07-01T12:34:56Z")
+                .expect("build manifest");
+
+        assert_eq!(
+            manifest_paths(&manifest),
+            vec![
+                "app-state.json".to_string(),
+                "groups.json".to_string(),
+                "projects/groups/group-a/project-b.json".to_string(),
+                "projects/ungrouped/project-a.json".to_string(),
+            ]
+        );
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_missing_groups_json_returns_error() {
+        let data_root = temp_test_dir("snapshot-manifest-missing-groups");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(&data_root.join(GROUPS_FILE), &Vec::<ProjectGroup>::new())
+            .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write project");
+        fs::remove_file(data_root.join(GROUPS_FILE)).expect("remove groups");
+
+        let error = build_snapshot_manifest_in_memory(&data_root, "0.1.7", "2026-07-01T12:34:56Z")
+            .expect_err("missing groups should fail");
+
+        assert!(error.contains("Failed to read file"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_invalid_groups_json_returns_error() {
+        let data_root = temp_test_dir("snapshot-manifest-invalid-groups");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &serde_json::json!({ "groups": [] }),
+        )
+        .expect("write invalid groups shape");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write project");
+
+        let error = build_snapshot_manifest_in_memory(&data_root, "0.1.7", "2026-07-01T12:34:56Z")
+            .expect_err("invalid groups should fail");
+
+        assert!(error.contains("Failed to parse JSON"));
 
         fs::remove_dir_all(data_root).ok();
     }
