@@ -111,3 +111,66 @@ These must be touched with extreme care across all versions:
 - Deep scan + conservative repair buttons
 - Backup cleanup strategy (keep last N)
 - Should not change primary storage structure
+
+---
+
+## Session: 2026-07-02
+
+### v0.1.7 Closeout — Snapshot Manifest & Integrity Warnings
+
+- **Verdict:** PASS — release gate confirmed
+- **Scope:** Snapshot manifest generation, SHA-256 checksums, warning-mode load verification, Storage Console visibility, Browse directory memory
+
+**Key design decisions:**
+- Manifest is integrity observation, not recovery — never blocks load
+- Manifest write failure does not fail active save
+- Active JSON corruption and duplicate IDs still block load
+- No Recovery Center, no repair/retry/recalculate, no auto-regenerate-on-load
+- Warning messages sanitized — no local absolute paths exposed
+
+**Commits included (12):**
+```
+3991b74 docs: complete v0.1.7 manual validation records
+168cfd6 fix: remember last browse directory
+c8f1243 fix: sanitize snapshot manifest warning messages
+67f819e docs: add v0.1.7 validation report
+53fb517 refactor: polish snapshot manifest warning events
+20afc8b feat: warn on snapshot manifest verification issues
+3f39991 feat: surface snapshot manifest warnings
+1caaff9 feat: generate snapshot manifest after save
+2888b18 feat: add atomic snapshot manifest writer
+43e4056 feat: build snapshot manifest in memory
+ad92ec2 feat: add sha256 checksum helper
+f1e6025 feat: add snapshot manifest inventory helpers
+```
+
+**Automated validation:**
+- `cargo fmt --check` — PASS
+- `cargo check` — PASS
+- `cargo test` — PASS (86 passed)
+- `pnpm exec tsc --noEmit` — PASS
+- `pnpm build` — PASS (Vite chunk-size warning only)
+
+**Manual desktop validation:**
+- A–J: PASS
+- K: NOT RUN (no trusted v1 flat-layout fixture)
+- L–O: PASS
+- Browse UX: PASS
+- Full log: `docs/MANUAL_TEST_LOG_v0.1.7.md`
+
+**Issues found and resolved during manual testing:**
+1. Save-time manifest warning leaked local absolute paths → `c8f1243`
+2. Browse dialog did not remember last folder → `168cfd6`
+
+**Known non-blocking:**
+- Vite chunk-size warning
+- v1 legacy flat-layout: pending trusted fixture
+
+**Release gate: PASS**
+
+**Docs:**
+- `docs/VALIDATION_v0.1.7.md`
+- `docs/MANUAL_TEST_LOG_v0.1.7.md`
+- `docs/RELEASE_NOTES_v0.1.7.md`
+
+**Protected foundations: all v0.1.x foundations intact (see Protected Foundation table above).**
