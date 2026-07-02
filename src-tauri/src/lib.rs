@@ -482,6 +482,131 @@ fn verify_app_state_json_value(value: &serde_json::Value) -> Result<(), String> 
     Ok(())
 }
 
+fn is_lowercase_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+}
+
+fn is_manifest_json_path_absolute(path: &str) -> bool {
+    Path::new(path).is_absolute()
+        || path.starts_with('/')
+        || path
+            .as_bytes()
+            .get(1)
+            .map(|item| *item == b':')
+            .unwrap_or(false)
+}
+
+fn json_non_empty_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str, String> {
+    let value = object
+        .get(field)
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| format!("Snapshot manifest {field} must be a string"))?;
+    if value.is_empty() {
+        return Err(format!("Snapshot manifest {field} cannot be empty"));
+    }
+    Ok(value)
+}
+
+pub fn verify_snapshot_manifest_json_value(value: &serde_json::Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Snapshot manifest JSON must be an object".to_string())?;
+
+    let manifest_version = object
+        .get("manifestVersion")
+        .and_then(|item| item.as_u64())
+        .ok_or_else(|| "Snapshot manifest manifestVersion must be 1".to_string())?;
+    if manifest_version != u64::from(SNAPSHOT_MANIFEST_VERSION) {
+        return Err(format!(
+            "Snapshot manifest manifestVersion {manifest_version} is not supported"
+        ));
+    }
+
+    let data_version = object
+        .get("dataVersion")
+        .and_then(|item| item.as_u64())
+        .ok_or_else(|| "Snapshot manifest dataVersion must be 1 or 2".to_string())?;
+    if data_version != u64::from(LEGACY_DATA_VERSION)
+        && data_version != u64::from(CURRENT_DATA_VERSION)
+    {
+        return Err(format!(
+            "Snapshot manifest dataVersion {data_version} is not supported"
+        ));
+    }
+
+    json_non_empty_string(object, "createdAt")?;
+    json_non_empty_string(object, "appVersion")?;
+    json_non_empty_string(object, "generator")?;
+
+    let layout_kind = json_non_empty_string(object, "layoutKind")?;
+    if layout_kind != "v1-flat" && layout_kind != "v2-group-folder" {
+        return Err(format!(
+            "Snapshot manifest layoutKind {layout_kind} is not supported"
+        ));
+    }
+
+    object
+        .get("projectCount")
+        .and_then(|item| item.as_u64())
+        .ok_or_else(|| {
+            "Snapshot manifest projectCount must be a non-negative integer".to_string()
+        })?;
+    object
+        .get("groupCount")
+        .and_then(|item| item.as_u64())
+        .ok_or_else(|| "Snapshot manifest groupCount must be a non-negative integer".to_string())?;
+
+    let files = object
+        .get("files")
+        .and_then(|item| item.as_array())
+        .ok_or_else(|| "Snapshot manifest files must be an array".to_string())?;
+    for file in files {
+        let file_object = file
+            .as_object()
+            .ok_or_else(|| "Snapshot manifest file entry must be an object".to_string())?;
+        let path = json_non_empty_string(file_object, "path")?;
+        if path.contains('\\') {
+            return Err(format!(
+                "Snapshot manifest file path must use forward slashes: {path}"
+            ));
+        }
+        if is_manifest_json_path_absolute(path) {
+            return Err(format!(
+                "Snapshot manifest file path cannot be absolute: {path}"
+            ));
+        }
+
+        let role = json_non_empty_string(file_object, "role")?;
+        if role != "app-state" && role != "groups" && role != "project" {
+            return Err(format!(
+                "Snapshot manifest file role {role} is not supported"
+            ));
+        }
+
+        let sha256 = json_non_empty_string(file_object, "sha256")?;
+        if !is_lowercase_sha256_hex(sha256) {
+            return Err(format!(
+                "Snapshot manifest file sha256 must be 64-character lowercase hex: {path}"
+            ));
+        }
+
+        file_object
+            .get("sizeBytes")
+            .and_then(|item| item.as_u64())
+            .ok_or_else(|| {
+                format!("Snapshot manifest file sizeBytes must be a non-negative integer: {path}")
+            })?;
+    }
+
+    Ok(())
+}
+
 // AtomicWriteHelper protects the old target for failures before activation.
 // Post-rename verification failure is detected and reported, but this first
 // helper does not implement rollback after replacement.
@@ -1159,6 +1284,10 @@ fn active_group_count_for_snapshot_manifest(data_root: &Path) -> Result<usize, S
     Ok(groups.len())
 }
 
+fn snapshot_manifest_path(data_root: &Path) -> PathBuf {
+    data_root.join(".cheerio").join("snapshot-manifest.json")
+}
+
 pub fn build_snapshot_manifest_in_memory(
     data_root: &Path,
     app_version: &str,
@@ -1209,6 +1338,31 @@ pub fn build_snapshot_manifest_in_memory(
         group_count,
         files,
     })
+}
+
+pub fn write_snapshot_manifest_atomic(
+    data_root: &Path,
+    manifest: &SnapshotManifest,
+) -> Result<PathBuf, String> {
+    let manifest_path = snapshot_manifest_path(data_root);
+    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        format!(
+            "Snapshot manifest path has no parent: {}",
+            manifest_path.display()
+        )
+    })?;
+    fs::create_dir_all(manifest_dir).map_err(|err| {
+        format!(
+            "Failed to create snapshot manifest directory {}: {err}",
+            manifest_dir.display()
+        )
+    })?;
+    atomic_write_json(
+        &manifest_path,
+        manifest,
+        verify_snapshot_manifest_json_value,
+    )?;
+    Ok(manifest_path)
 }
 
 fn load_project_file(
@@ -4241,6 +4395,43 @@ mod tests {
             .expect("manifest entry")
     }
 
+    fn sample_v2_manifest_workspace(label: &str) -> PathBuf {
+        let data_root = temp_test_dir(label);
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-a", vec!["project-b"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write ungrouped project");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-a")),
+        )
+        .expect("write grouped project");
+        data_root
+    }
+
+    fn sample_manifest_for_test(data_root: &Path) -> SnapshotManifest {
+        build_snapshot_manifest_in_memory(data_root, "0.1.7", "2026-07-01T12:34:56Z")
+            .expect("build manifest")
+    }
+
     #[test]
     fn snapshot_inventory_collects_v1_flat_layout_files() {
         let data_root = temp_test_dir("snapshot-inventory-v1");
@@ -4998,6 +5189,245 @@ mod tests {
             .expect_err("invalid groups should fail");
 
         assert!(error.contains("Failed to parse JSON"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn write_snapshot_manifest_atomic_creates_manifest_file() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-write");
+        let manifest = sample_manifest_for_test(&data_root);
+
+        let manifest_path =
+            write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+        let value = read_json::<serde_json::Value>(&manifest_path).expect("read manifest");
+
+        assert!(manifest_path.exists());
+        assert_eq!(value["manifestVersion"], SNAPSHOT_MANIFEST_VERSION);
+        assert!(value["files"].as_array().is_some());
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn write_snapshot_manifest_atomic_returns_expected_path_and_creates_cheerio_dir() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-path");
+        let manifest = sample_manifest_for_test(&data_root);
+        let expected_path = data_root.join(".cheerio").join("snapshot-manifest.json");
+
+        assert!(!data_root.join(".cheerio").exists());
+        let actual_path =
+            write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+
+        assert_eq!(actual_path, expected_path);
+        assert!(data_root.join(".cheerio").is_dir());
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn write_snapshot_manifest_atomic_leaves_no_temp_file_on_success() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-no-temp");
+        let manifest = sample_manifest_for_test(&data_root);
+
+        write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+
+        assert!(!data_root
+            .join(".cheerio")
+            .join(".snapshot-manifest.json.tmp")
+            .exists());
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn write_snapshot_manifest_atomic_overwrites_existing_manifest() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-overwrite");
+        let mut old_manifest = sample_manifest_for_test(&data_root);
+        old_manifest.app_version = "0.1.6".to_string();
+        old_manifest.generator = "Cheerio Flow v0.1.6".to_string();
+        let mut new_manifest = sample_manifest_for_test(&data_root);
+        new_manifest.app_version = "0.1.7".to_string();
+        new_manifest.generator = "Cheerio Flow v0.1.7".to_string();
+
+        let manifest_path =
+            write_snapshot_manifest_atomic(&data_root, &old_manifest).expect("write old manifest");
+        write_snapshot_manifest_atomic(&data_root, &new_manifest).expect("write new manifest");
+        let value = read_json::<serde_json::Value>(&manifest_path).expect("read manifest");
+
+        assert_eq!(value["appVersion"], "0.1.7");
+        assert_eq!(value["generator"], "Cheerio Flow v0.1.7");
+        verify_snapshot_manifest_json_value(&value).expect("verify final manifest");
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn verify_snapshot_manifest_accepts_valid_manifest_json() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-verify-valid");
+        let manifest = sample_manifest_for_test(&data_root);
+        let value = serde_json::to_value(&manifest).expect("manifest to json");
+
+        verify_snapshot_manifest_json_value(&value).expect("valid manifest");
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn verify_snapshot_manifest_rejects_missing_manifest_version() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-verify-missing-version");
+        let manifest = sample_manifest_for_test(&data_root);
+        let mut value = serde_json::to_value(&manifest).expect("manifest to json");
+        value
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("manifestVersion");
+
+        let error = verify_snapshot_manifest_json_value(&value)
+            .expect_err("missing manifestVersion should fail");
+
+        assert!(error.contains("manifestVersion"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn verify_snapshot_manifest_rejects_invalid_sha256() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-verify-bad-sha");
+        let manifest = sample_manifest_for_test(&data_root);
+        let mut value = serde_json::to_value(&manifest).expect("manifest to json");
+        value["files"][0]["sha256"] = serde_json::Value::String("abc".to_string());
+
+        let error =
+            verify_snapshot_manifest_json_value(&value).expect_err("invalid sha256 should fail");
+
+        assert!(error.contains("sha256"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn verify_snapshot_manifest_rejects_uppercase_sha256() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-verify-uppercase-sha");
+        let manifest = sample_manifest_for_test(&data_root);
+        let mut value = serde_json::to_value(&manifest).expect("manifest to json");
+        value["files"][0]["sha256"] = serde_json::Value::String("A".repeat(64));
+
+        let error =
+            verify_snapshot_manifest_json_value(&value).expect_err("uppercase sha256 should fail");
+
+        assert!(error.contains("sha256"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn verify_snapshot_manifest_rejects_absolute_path() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-verify-absolute-path");
+        let manifest = sample_manifest_for_test(&data_root);
+        let mut value = serde_json::to_value(&manifest).expect("manifest to json");
+        value["files"][0]["path"] =
+            serde_json::Value::String("C:/Users/test/project.json".to_string());
+
+        let error =
+            verify_snapshot_manifest_json_value(&value).expect_err("absolute path should fail");
+
+        assert!(error.contains("absolute"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn verify_snapshot_manifest_rejects_backslash_path() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-verify-backslash-path");
+        let manifest = sample_manifest_for_test(&data_root);
+        let mut value = serde_json::to_value(&manifest).expect("manifest to json");
+        value["files"][0]["path"] =
+            serde_json::Value::String("projects\\project-a.json".to_string());
+
+        let error =
+            verify_snapshot_manifest_json_value(&value).expect_err("backslash path should fail");
+
+        assert!(error.contains("forward slashes"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn verify_snapshot_manifest_rejects_invalid_role() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-verify-invalid-role");
+        let manifest = sample_manifest_for_test(&data_root);
+        let mut value = serde_json::to_value(&manifest).expect("manifest to json");
+        value["files"][0]["role"] = serde_json::Value::String("unknown".to_string());
+
+        let error =
+            verify_snapshot_manifest_json_value(&value).expect_err("invalid role should fail");
+
+        assert!(error.contains("role"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn invalid_snapshot_manifest_json_does_not_overwrite_existing_target() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-invalid-preserve");
+        let manifest = sample_manifest_for_test(&data_root);
+        let manifest_path =
+            write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+        let before = fs::read(&manifest_path).expect("read manifest before");
+        let invalid_manifest = serde_json::json!({
+            "dataVersion": CURRENT_DATA_VERSION,
+            "createdAt": "2026-07-01T12:34:56Z",
+            "appVersion": "0.1.7",
+            "generator": "Cheerio Flow v0.1.7",
+            "layoutKind": "v2-group-folder",
+            "projectCount": 0,
+            "groupCount": 0,
+            "files": []
+        });
+
+        let error = atomic_write_json(
+            &manifest_path,
+            &invalid_manifest,
+            verify_snapshot_manifest_json_value,
+        )
+        .expect_err("invalid manifest should fail before overwrite");
+        let after = fs::read(&manifest_path).expect("read manifest after");
+
+        assert!(error.contains("manifestVersion"));
+        assert_eq!(before, after);
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn write_snapshot_manifest_atomic_does_not_modify_active_files() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-active-unchanged");
+        let app_state_path = data_root.join(APP_STATE_FILE);
+        let groups_path = data_root.join(GROUPS_FILE);
+        let project_path = data_root
+            .join("projects")
+            .join("ungrouped")
+            .join("project-a.json");
+        let app_state_before = fs::read(&app_state_path).expect("read app-state before");
+        let groups_before = fs::read(&groups_path).expect("read groups before");
+        let project_before = fs::read(&project_path).expect("read project before");
+        let manifest = sample_manifest_for_test(&data_root);
+
+        write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+
+        assert_eq!(
+            app_state_before,
+            fs::read(&app_state_path).expect("read app-state after")
+        );
+        assert_eq!(
+            groups_before,
+            fs::read(&groups_path).expect("read groups after")
+        );
+        assert_eq!(
+            project_before,
+            fs::read(&project_path).expect("read project after")
+        );
 
         fs::remove_dir_all(data_root).ok();
     }
