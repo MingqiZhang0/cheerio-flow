@@ -121,6 +121,7 @@ const MODULE_RESIZE_MIN_WIDTH = 170;
 const MODULE_RESIZE_MAX_WIDTH = 2400;
 const MODULE_RESIZE_MIN_HEIGHT = 96;
 const MODULE_RESIZE_MAX_HEIGHT = 400;
+const LAST_BROWSE_DIRECTORY_KEY = "cheerio-flow:last-browse-directory";
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -162,6 +163,32 @@ function isCheerioFlowDataFolder(path: string) {
   const normalized = path.replace(/[\\/]+$/, "");
   const segments = normalized.split(/[\\/]/).filter(Boolean);
   return segments[segments.length - 1] === "CheerioFlowData";
+}
+
+function parentDirectoryPath(path: string) {
+  const trimmed = path.trim().replace(/[\\/]+$/, "");
+  const separatorIndex = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  return separatorIndex > 0 ? trimmed.slice(0, separatorIndex) : "";
+}
+
+function browseMemoryPathForSelection(path: string) {
+  return isCheerioFlowDataFolder(path) ? parentDirectoryPath(path) || path : path;
+}
+
+function readLastBrowseDirectory() {
+  try {
+    return window.localStorage.getItem(LAST_BROWSE_DIRECTORY_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeLastBrowseDirectory(path: string) {
+  try {
+    window.localStorage.setItem(LAST_BROWSE_DIRECTORY_KEY, path);
+  } catch {
+    // This is a local UI preference; storage failures should not affect workspace flow.
+  }
 }
 
 function normalizeWorkspacePath(path: string) {
@@ -549,6 +576,7 @@ function AppShell() {
   const [storageErrorKind, setStorageErrorKind] = useState<StorageErrorKind>(null);
   const [storageReport, setStorageReport] = useState<StorageReport | null>(null);
   const [storageRootInput, setStorageRootInput] = useState("");
+  const [lastBrowseDirectory, setLastBrowseDirectory] = useState(readLastBrowseDirectory);
   const [folderPickerStatus, setFolderPickerStatus] = useState<FolderPickerStatus>("idle");
   const [folderPickerError, setFolderPickerError] = useState<string | null>(null);
   const [storageRootInputWarning, setStorageRootInputWarning] = useState<string | null>(null);
@@ -1559,11 +1587,20 @@ function AppShell() {
     setFolderPickerError(null);
 
     try {
-      const selected = await openDialog({
+      const dialogOptions = {
         directory: true,
         multiple: false,
         title: "Choose storage parent folder",
-      });
+      } as const;
+      let selected;
+      try {
+        selected = await openDialog(
+          lastBrowseDirectory ? { ...dialogOptions, defaultPath: lastBrowseDirectory } : dialogOptions,
+        );
+      } catch (reason) {
+        if (!lastBrowseDirectory) throw reason;
+        selected = await openDialog(dialogOptions);
+      }
       const selectedPath = Array.isArray(selected) ? selected[0] ?? "" : selected ?? "";
 
       if (!selectedPath) {
@@ -1574,6 +1611,9 @@ function AppShell() {
       if (normalizeWorkspacePath(selectedPath) !== normalizeWorkspacePath(loadedStorageRoot)) {
         invalidateMigrationState();
       }
+      const browseMemoryPath = browseMemoryPathForSelection(selectedPath);
+      setLastBrowseDirectory(browseMemoryPath);
+      writeLastBrowseDirectory(browseMemoryPath);
       setStorageRootInput(selectedPath);
       setStorageRootInputWarning(isCheerioFlowDataFolder(selectedPath) ? "You selected a folder named CheerioFlowData. Choose its parent folder so the app can create/use CheerioFlowData inside it." : null);
       setFolderPickerStatus("idle");
@@ -1581,7 +1621,7 @@ function AppShell() {
       setFolderPickerStatus("error");
       setFolderPickerError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, [invalidateMigrationState, loadedStorageRoot]);
+  }, [invalidateMigrationState, lastBrowseDirectory, loadedStorageRoot]);
 
   const openProjectDetails = useCallback((projectId: string) => {
     setCurrentProjectId(projectId);
