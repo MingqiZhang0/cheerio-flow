@@ -17,6 +17,7 @@ const LEGACY_DATA_VERSION: u32 = 1;
 const CURRENT_DATA_VERSION: u32 = 2;
 const SHA256_READ_BUFFER_SIZE: usize = 64 * 1024;
 const SNAPSHOT_MANIFEST_VERSION: u32 = 1;
+const SNAPSHOT_MANIFEST_APP_VERSION: &str = "0.1.7";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1365,6 +1366,24 @@ pub fn write_snapshot_manifest_atomic(
     Ok(manifest_path)
 }
 
+pub fn generate_and_write_snapshot_manifest_for_data_root(
+    data_root: &Path,
+) -> Result<PathBuf, String> {
+    let created_at = now_string();
+    let manifest =
+        build_snapshot_manifest_in_memory(data_root, SNAPSHOT_MANIFEST_APP_VERSION, &created_at)?;
+    write_snapshot_manifest_atomic(data_root, &manifest)
+}
+
+fn best_effort_generate_snapshot_manifest(data_root: &Path, context: &str) {
+    if let Err(error) = generate_and_write_snapshot_manifest_for_data_root(data_root) {
+        eprintln!(
+            "Cheerio Flow warning: active data saved during {context}, but snapshot manifest generation failed for {}: {error}",
+            data_root.display()
+        );
+    }
+}
+
 fn load_project_file(
     data_root: &Path,
     path: &Path,
@@ -1689,6 +1708,7 @@ fn load_database_from_paths(
         atomic_write_groups_json(&data_root.join(GROUPS_FILE), &groups)?;
         atomic_write_app_state_json(&data_root.join(APP_STATE_FILE), &app_state)?;
         projects.push(project);
+        best_effort_generate_snapshot_manifest(&data_root, "fresh workspace bootstrap");
     }
 
     projects.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -1768,6 +1788,7 @@ fn save_database_to_paths(
     }
     atomic_write_groups_json(&data_root.join(GROUPS_FILE), &payload.groups)?;
     atomic_write_app_state_json(&data_root.join(APP_STATE_FILE), &payload.app_state)?;
+    best_effort_generate_snapshot_manifest(&data_root, "active save");
 
     let report = build_report(&storage_root, &data_root, &bootstrap, &payload.projects);
     println!(
@@ -4189,6 +4210,243 @@ mod tests {
     }
 
     #[test]
+    fn save_database_to_paths_v2_writes_snapshot_manifest_after_save() {
+        let storage_root = temp_test_dir("save-v2-manifest");
+        let bootstrap = bootstrap_path_for_test(&storage_root);
+        let grouped_project = sample_project("project-a", Some("group-a"));
+        let ungrouped_project = sample_project("project-b", None);
+        let group = sample_group("group-a", vec!["project-a"]);
+
+        save_database_to_paths(
+            storage_root.clone(),
+            bootstrap,
+            sample_payload(
+                vec![grouped_project, ungrouped_project],
+                vec![group],
+                CURRENT_DATA_VERSION,
+            ),
+        )
+        .expect("save v2");
+
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        let manifest = read_snapshot_manifest_value(&data_root);
+        let paths = snapshot_manifest_value_paths(&manifest);
+
+        assert_eq!(manifest["manifestVersion"], SNAPSHOT_MANIFEST_VERSION);
+        assert_eq!(manifest["dataVersion"], CURRENT_DATA_VERSION);
+        assert_eq!(manifest["layoutKind"], "v2-group-folder");
+        assert!(paths.contains(&"app-state.json".to_string()));
+        assert!(paths.contains(&"groups.json".to_string()));
+        assert!(paths.contains(&"projects/groups/group-a/project-a.json".to_string()));
+        assert!(paths.contains(&"projects/ungrouped/project-b.json".to_string()));
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn save_database_to_paths_v1_writes_snapshot_manifest_without_migration() {
+        let storage_root = temp_test_dir("save-v1-manifest");
+        let bootstrap = bootstrap_path_for_test(&storage_root);
+        let project_a = sample_project("project-a", None);
+        let project_b = sample_project("project-b", None);
+
+        save_database_to_paths(
+            storage_root.clone(),
+            bootstrap,
+            sample_payload(vec![project_a, project_b], vec![], LEGACY_DATA_VERSION),
+        )
+        .expect("save v1");
+
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        let manifest = read_snapshot_manifest_value(&data_root);
+        let paths = snapshot_manifest_value_paths(&manifest);
+
+        assert_eq!(manifest["dataVersion"], LEGACY_DATA_VERSION);
+        assert_eq!(manifest["layoutKind"], "v1-flat");
+        assert!(data_root.join("projects").join("project-a.json").exists());
+        assert!(data_root.join("projects").join("project-b.json").exists());
+        assert!(!data_root.join("projects").join("ungrouped").exists());
+        assert!(!data_root.join("projects").join("groups").exists());
+        assert!(paths.contains(&"projects/project-a.json".to_string()));
+        assert!(paths.contains(&"projects/project-b.json".to_string()));
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn fresh_workspace_bootstrap_writes_snapshot_manifest() {
+        let storage_root = temp_test_dir("fresh-bootstrap-manifest");
+        let data_root = storage_root.join(DATA_DIR_NAME);
+
+        let loaded =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect("fresh load");
+        let project_id = &loaded.projects[0].id;
+        let manifest = read_snapshot_manifest_value(&data_root);
+        let paths = snapshot_manifest_value_paths(&manifest);
+
+        assert!(data_root.join(APP_STATE_FILE).exists());
+        assert!(data_root.join(GROUPS_FILE).exists());
+        assert!(data_root
+            .join("projects")
+            .join("ungrouped")
+            .join(format!("{project_id}.json"))
+            .exists());
+        assert!(data_root
+            .join(".cheerio")
+            .join("snapshot-manifest.json")
+            .exists());
+        assert!(paths.contains(&"app-state.json".to_string()));
+        assert!(paths.contains(&"groups.json".to_string()));
+        assert!(paths.contains(&format!("projects/ungrouped/{project_id}.json")));
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn save_database_to_paths_v2_group_move_manifest_is_after_stale_quarantine() {
+        let storage_root = temp_test_dir("save-v2-manifest-after-quarantine");
+        let bootstrap = bootstrap_path_for_test(&storage_root);
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        let old_path = data_root
+            .join("projects")
+            .join("ungrouped")
+            .join("project-a.json");
+        write_json(&old_path, &sample_project("project-a", None)).expect("write old project");
+
+        save_database_to_paths(
+            storage_root.clone(),
+            bootstrap,
+            sample_payload(
+                vec![sample_project("project-a", Some("group-a"))],
+                vec![sample_group("group-a", vec!["project-a"])],
+                CURRENT_DATA_VERSION,
+            ),
+        )
+        .expect("save v2 group move");
+
+        let manifest = read_snapshot_manifest_value(&data_root);
+        let paths = snapshot_manifest_value_paths(&manifest);
+
+        assert!(!old_path.exists());
+        assert!(data_root
+            .join(".cheerio")
+            .join("stale-project-files")
+            .exists());
+        assert!(!paths.contains(&"projects/ungrouped/project-a.json".to_string()));
+        assert!(paths.contains(&"projects/groups/group-a/project-a.json".to_string()));
+        assert!(!paths
+            .iter()
+            .any(|path| path.contains("stale-project-files")));
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn manifest_write_failure_does_not_fail_active_save() {
+        let storage_root = temp_test_dir("save-manifest-failure-ok");
+        let bootstrap = bootstrap_path_for_test(&storage_root);
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        fs::create_dir_all(&data_root).expect("create data root");
+        fs::write(data_root.join(".cheerio"), b"not a directory").expect("write cheerio file");
+        let project = sample_project("project-a", None);
+
+        let report = save_database_to_paths(
+            storage_root.clone(),
+            bootstrap,
+            sample_payload(vec![project], vec![], CURRENT_DATA_VERSION),
+        )
+        .expect("active save should still succeed");
+
+        assert_eq!(report.project_count, 1);
+        assert!(data_root
+            .join("projects")
+            .join("ungrouped")
+            .join("project-a.json")
+            .exists());
+        read_json::<Vec<ProjectGroup>>(&data_root.join(GROUPS_FILE)).expect("groups readable");
+        read_json::<AppState>(&data_root.join(APP_STATE_FILE)).expect("app-state readable");
+        read_json::<Project>(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+        )
+        .expect("project readable");
+        assert!(data_root.join(".cheerio").is_file());
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn failed_active_save_does_not_write_snapshot_manifest() {
+        let storage_root = temp_test_dir("failed-save-no-manifest");
+        let bootstrap = bootstrap_path_for_test(&storage_root);
+
+        let error = save_database_to_paths(
+            storage_root.clone(),
+            bootstrap,
+            sample_payload(vec![], vec![], CURRENT_DATA_VERSION),
+        )
+        .expect_err("empty project save should fail");
+
+        assert!(error.contains("Refusing to save empty project list"));
+        assert!(!storage_root
+            .join(DATA_DIR_NAME)
+            .join(".cheerio")
+            .join("snapshot-manifest.json")
+            .exists());
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn manifest_generation_does_not_modify_active_files() {
+        let storage_root = temp_test_dir("manifest-generation-active-unchanged");
+        let bootstrap = bootstrap_path_for_test(&storage_root);
+
+        save_database_to_paths(
+            storage_root.clone(),
+            bootstrap,
+            sample_payload(
+                vec![sample_project("project-a", None)],
+                vec![],
+                CURRENT_DATA_VERSION,
+            ),
+        )
+        .expect("save v2");
+
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        let app_state_path = data_root.join(APP_STATE_FILE);
+        let groups_path = data_root.join(GROUPS_FILE);
+        let project_path = data_root
+            .join("projects")
+            .join("ungrouped")
+            .join("project-a.json");
+        let app_state_before = fs::read(&app_state_path).expect("read app-state before");
+        let groups_before = fs::read(&groups_path).expect("read groups before");
+        let project_before = fs::read(&project_path).expect("read project before");
+
+        generate_and_write_snapshot_manifest_for_data_root(&data_root)
+            .expect("regenerate manifest");
+
+        assert_eq!(
+            app_state_before,
+            fs::read(&app_state_path).expect("read app-state after")
+        );
+        assert_eq!(
+            groups_before,
+            fs::read(&groups_path).expect("read groups after")
+        );
+        assert_eq!(
+            project_before,
+            fs::read(&project_path).expect("read project after")
+        );
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
     fn storage_temp_files_are_not_loaded_as_project_json() {
         let data_root = temp_test_dir("temp-files-not-loaded");
         let projects_dir = data_root.join("projects");
@@ -4430,6 +4688,25 @@ mod tests {
     fn sample_manifest_for_test(data_root: &Path) -> SnapshotManifest {
         build_snapshot_manifest_in_memory(data_root, "0.1.7", "2026-07-01T12:34:56Z")
             .expect("build manifest")
+    }
+
+    fn read_snapshot_manifest_value(data_root: &Path) -> serde_json::Value {
+        read_json::<serde_json::Value>(&data_root.join(".cheerio").join("snapshot-manifest.json"))
+            .expect("read snapshot manifest")
+    }
+
+    fn snapshot_manifest_value_paths(value: &serde_json::Value) -> Vec<String> {
+        value["files"]
+            .as_array()
+            .expect("manifest files")
+            .iter()
+            .map(|entry| {
+                entry["path"]
+                    .as_str()
+                    .expect("manifest file path")
+                    .to_string()
+            })
+            .collect()
     }
 
     #[test]
