@@ -76,6 +76,7 @@ import {
   type PersistedData,
   type StorageEvent,
   type StorageReport,
+  type StorageWarning,
 } from "./types";
 import {
   applyGroupMembership,
@@ -640,9 +641,9 @@ function AppShell() {
     copyText: copyStorageEventsText,
   } = useStorageOperationLog();
 
-  const appendManifestWarningEvents = useCallback(
-    (data: PersistedData) => {
-      for (const warning of data.report?.warnings ?? []) {
+  const appendStorageWarningsAsEvents = useCallback(
+    (warnings: StorageWarning[] | undefined, dataVersion: number) => {
+      for (const warning of warnings ?? []) {
         if (warning.kind !== "snapshot-manifest") continue;
         appendStorageEvent({
           severity: "warning",
@@ -652,11 +653,17 @@ function AppShell() {
           details: warning.message,
           relatedPath: warning.relatedPath ?? ".cheerio/snapshot-manifest.json",
           errorKind: "manifest",
-          dataVersion: data.appState.dataVersion,
+          dataVersion,
         });
       }
     },
     [appendStorageEvent],
+  );
+  const appendManifestWarningEvents = useCallback(
+    (data: PersistedData) => {
+      appendStorageWarningsAsEvents(data.report?.warnings, data.appState.dataVersion);
+    },
+    [appendStorageWarningsAsEvents],
   );
 
   const currentProject = useMemo(
@@ -769,19 +776,7 @@ function AppShell() {
         relatedPath: report.dataDir,
         dataVersion: currentAppState.dataVersion,
       });
-      for (const warning of report.warnings ?? []) {
-        if (warning.kind !== "snapshot-manifest") continue;
-        appendStorageEvent({
-          severity: "warning",
-          operation: "manifest",
-          phase: "warning",
-          message: "Snapshot manifest was not updated, but active data was saved.",
-          details: warning.message,
-          relatedPath: warning.relatedPath ?? ".cheerio/snapshot-manifest.json",
-          errorKind: "manifest",
-          dataVersion: currentAppState.dataVersion,
-        });
-      }
+      appendStorageWarningsAsEvents(report.warnings, currentAppState.dataVersion);
     } catch (reason: unknown) {
       const message = reason instanceof Error ? reason.message : String(reason);
       console.error("Failed to save Cheerio Flow data", reason);
@@ -799,7 +794,7 @@ function AppShell() {
         dataVersion: appStateRef.current.dataVersion,
       });
     }
-  }, [appendStorageEvent]);
+  }, [appendStorageEvent, appendStorageWarningsAsEvents]);
 
   const refreshBackups = useCallback(async () => {
     setRestoreStatus("loading");
