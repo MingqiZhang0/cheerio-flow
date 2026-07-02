@@ -1403,8 +1403,7 @@ fn best_effort_generate_snapshot_manifest(
     match generate_and_write_snapshot_manifest_for_data_root(data_root) {
         Ok(_) => None,
         Err(error) => {
-            let message =
-                format!("Snapshot manifest was not updated, but active data was saved. {error}");
+            let message = "Snapshot manifest was not updated, but active data was saved. Check local storage permissions or the .cheerio path.".to_string();
             eprintln!(
                 "Cheerio Flow warning: active data saved during {context}, but snapshot manifest generation failed for {}: {error}",
                 data_root.display()
@@ -4615,7 +4614,8 @@ mod tests {
         let bootstrap = bootstrap_path_for_test(&storage_root);
         let data_root = storage_root.join(DATA_DIR_NAME);
         fs::create_dir_all(&data_root).expect("create data root");
-        fs::write(data_root.join(".cheerio"), b"not a directory").expect("write cheerio file");
+        let manifest_dir = data_root.join(".cheerio");
+        fs::write(&manifest_dir, b"not a directory").expect("write cheerio file");
         let project = sample_project("project-a", None);
 
         let report = save_database_to_paths(
@@ -4628,9 +4628,15 @@ mod tests {
         assert_eq!(report.project_count, 1);
         assert_eq!(report.warnings.len(), 1);
         assert_eq!(report.warnings[0].kind, "snapshot-manifest");
-        assert!(report.warnings[0]
-            .message
+        let warning_message = &report.warnings[0].message;
+        assert!(warning_message
             .contains("Snapshot manifest was not updated, but active data was saved."));
+        assert!(!warning_message.contains(data_root.to_string_lossy().as_ref()));
+        assert!(!warning_message.contains(manifest_dir.to_string_lossy().as_ref()));
+        assert!(!warning_message.contains(storage_root.to_string_lossy().as_ref()));
+        assert!(!warning_message.contains("C:\\"));
+        assert!(!warning_message.contains("\\CheerioFlowData\\"));
+        assert!(!warning_message.contains("/tmp/"));
         assert_eq!(
             report.warnings[0].related_path.as_deref(),
             Some(".cheerio/snapshot-manifest.json")
