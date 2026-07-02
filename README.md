@@ -344,130 +344,199 @@ v0.1.7 adds a **snapshot manifest layer** between active save and backup/restore
 
 ```mermaid
 flowchart TD
-    subgraph UX["1. Frontend"]
+    subgraph UX["1. Frontend UX"]
         direction LR
-        UE["User Edit"]
-        AT["Autosave ~2s"]
-        SB["Status Bar → Console"]
+        UE["User edit"]
+        AS["Autosave / Manual save"]
+        BR["Browse storage root"]
+        BM["Remember last Browse folder<br/>localStorage only"]
+        SB["Status bar"]
+        UE --> AS
+        BM -.->|"defaultPath"| BR
+        BR -.->|"stores selected outer root"| BM
+        AS --> SB
     end
 
-    subgraph GATE["2. Load Gate"]
-        L["Load"]
-        L -->|bad JSON| BJ["Block"]
-        L -->|dup ID| DI["Block"]
-        L -->|ok| PG["canPersist = true"]
-        BJ --> NG["autosave disabled<br/>disk untouched"]
-        DI --> NG
+    subgraph LOAD["2. Load Gate"]
+        direction TB
+        LD["Load / Apply storage root"]
+        BADJSON["Invalid active JSON"]
+        DUPID["Duplicate project ID"]
+        BLOCK["Block load"]
+        SAFEFAIL["canPersist = false<br/>autosave disabled<br/>disk untouched"]
+        LC["Load committed"]
+        CAN["canPersist = true"]
+
+        LD -->|"bad JSON"| BADJSON --> BLOCK --> SAFEFAIL
+        LD -->|"duplicate ID"| DUPID --> BLOCK
+        LD -->|"active data OK"| LC --> CAN
     end
 
     subgraph SAVE["3. Active Save — v0.1.6 Atomic Write"]
-        TW[".tmp write"]
-        FS["flush + sync_all"]
-        VT["verify temp"]
-        RN["rename"]
-        VF["verify target"]
-        TW --> FS --> VT --> RN --> VF
-        TW -->|pre-rename fail| OLD["old target preserved"]
-        RN -->|post-rename fail| ERR["error, no rollback"]
-    end
-
-    subgraph DISK["4. Active Data + Layout"]
-        V1["v1 flat<br/>projects/*.json"]
-        V2["v2 grouped<br/>projects/ungrouped/<br/>projects/groups/"]
-        NM["no silent<br/>v1→v2 migration"]
-    end
-
-    subgraph MANIFEST["5. Snapshot Manifest — v0.1.7"]
         direction LR
-        SM["Atomic manifest write"]
-        SH["SHA-256 checksums"]
-        WM["Warning-mode verify"]
-        SM --> SH --> WM
+        SR["Save requested"]
+        TMP["write .tmp"]
+        SYNC["flush + sync_all"]
+        VTP["verify temp"]
+        REN["rename target"]
+        VTF["verify target"]
+        SOK["Active save committed"]
+
+        PRESERVE["old target preserved"]
+        POSTERR["error surfaced<br/>no rollback after rename"]
+
+        SR --> TMP --> SYNC --> VTP --> REN --> VTF --> SOK
+        TMP -->|"pre-rename fail"| PRESERVE
+        VTP -->|"verify temp fail"| PRESERVE
+        REN -->|"post-rename / target fail"| POSTERR
+        VTF -->|"target verify fail"| POSTERR
     end
 
-    subgraph OLD["6. Safety Paths — v0.1.5 model"]
+    subgraph LAYOUT["4. Active Data Layout"]
+        direction TB
+        DL["Current active layout"]
+        V1["v1 flat layout<br/>projects/*.json"]
+        V2["v2 group-folder layout<br/>projects/ungrouped/<br/>projects/groups/&lt;group-id&gt;/"]
+        NOMIG["No silent v1 → v2 migration"]
+
+        DL --> V1
+        DL --> V2
+        V1 --> NOMIG
+        V2 --> NOMIG
+    end
+
+    subgraph MGEN["5A. Snapshot Manifest Generation — v0.1.7"]
+        direction LR
+        INV["Collect active file inventory"]
+        HASH["SHA-256 + size"]
+        BUILD["Build manifest in memory"]
+        MWRITE["Atomic write<br/>.cheerio/snapshot-manifest.json"]
+        MOK["Manifest updated"]
+        MFAIL["Manifest write failed<br/>active save still OK"]
+
+        INV --> HASH --> BUILD --> MWRITE
+        MWRITE -->|"ok"| MOK
+        MWRITE -->|"fail"| MFAIL
+    end
+
+    subgraph MVERIFY["5B. Snapshot Manifest Verification — v0.1.7"]
+        direction TB
+        WV["Warning-mode verify<br/>after successful load"]
+        WOK["Manifest OK"]
+        WISSUE["Manifest issue detected"]
+        WLIST["missing / corrupt / invalid schema<br/>size mismatch / checksum mismatch<br/>extra active file / missing listed file<br/>dataVersion or layout mismatch"]
+        WNONBLOCK["Do not block load<br/>do not repair<br/>do not auto-regenerate"]
+
+        WV -->|"clean"| WOK
+        WV -->|"issue"| WISSUE --> WLIST --> WNONBLOCK
+    end
+
+    subgraph SAFETY["6. Existing Safety Paths"]
         direction LR
         BK["Backup"]
         RS["Restore"]
         MG["Migration"]
-        SQ["Stale Quarantine"]
+        SQ["Stale / tmp / quarantine exclusion"]
     end
 
-    subgraph CONSOLE["7. Storage Console — v0.1.6/v0.1.7"]
-        direction LR
-        SC["Read-only modal"]
-        CP["Copy Log"]
-        CL["Clear / Close / Esc"]
-        CR["Ctrl-scoped"]
+    subgraph CONSOLE["7. Storage Console — v0.1.6 / v0.1.7"]
+        direction TB
+        EV["load / storage-root / save events"]
         MW["manifest/warning"]
+        SC["Read-only Storage Console"]
+        COPY["Copy log"]
+        CLEAR["Clear / Close / Esc"]
+        NOFIX["No repair / retry / recalculate"]
+
+        EV --> SC
+        MW --> SC
+        SC --> COPY
+        SC --> CLEAR
+        SC --> NOFIX
     end
 
-    subgraph FUT["8. Deferred — not in v0.1.7"]
+    subgraph DEFER["8. Deferred — Not in v0.1.7"]
         direction LR
         D1["single-writer lock"]
-        D2["recovery center"]
+        D2["Recovery Center"]
         D3[".tmp auto-cleanup"]
         D4["kill-process test"]
+        D5[".chf package"]
+        D6["nested workflow graph"]
     end
 
-    UE --> AT --> L
-    PG --> TW
-    VF --> V1
-    VF --> V2
-    V1 --> NM
-    V2 --> NM
-    VF --> SM
-    SB --> SC
+    UE --> AS
+    AS --> SR
+    LD --> LC
+    CAN --> SR
+    SOK --> DL
+    SOK --> INV
+    LC --> WV
 
-    SC -.->|observes| SAVE
-    SC -.->|observes| GATE
-    SC -.->|observes| MANIFEST
-    SC -.->|observes| OLD
+    SOK -.-> EV
+    LD -.-> EV
+    LC -.-> EV
+    MFAIL -.-> MW
+    WISSUE -.-> MW
+    BK -.-> EV
+    RS -.-> EV
+    MG -.-> EV
+    SQ -.-> EV
 
     style UX fill:#ede7f6,stroke:#7c4dff
-    style GATE fill:#fff3e0,stroke:#ff9800
+    style LOAD fill:#fff3e0,stroke:#ff9800
     style SAVE fill:#c8e6c9,stroke:#388e3c
-    style DISK fill:#e3f2fd,stroke:#1976d2
-    style MANIFEST fill:#fce4ec,stroke:#e91e63
-    style OLD fill:#e8f4f8,stroke:#5b9bd5
+    style LAYOUT fill:#e3f2fd,stroke:#1976d2
+    style MGEN fill:#fce4ec,stroke:#e91e63
+    style MVERIFY fill:#fff0f6,stroke:#c2185b
+    style SAFETY fill:#e8f4f8,stroke:#5b9bd5
     style CONSOLE fill:#e8f5e9,stroke:#4caf50
-    style FUT fill:#f5f5f5,stroke:#999,stroke-dasharray: 5 5
+    style DEFER fill:#f5f5f5,stroke:#999,stroke-dasharray: 5 5
 ```
 
 ### How to read this diagram
 
-**Layers 1–4 (active path, v0.1.6 enhanced):**
+**Layer 1 (Frontend UX):**
 
-- User edits trigger autosave (~2s debounce), which goes through the Load Gate first.
+- User edit triggers autosave (~2s debounce) or manual save, which go through the Load Gate first.
+- Browse remembers the last manually selected outer storage root as a localStorage-only UI preference — not written to workspace data.
+
+**Layer 2 (Load Gate):**
+
 - A failed load (bad JSON or duplicate project ID) disables the persistence gate — autosave is blocked and existing files are left untouched on disk.
-- A successful load opens the gate; the Active Save path writes project JSON, `groups.json`, and `app-state.json` through Atomic Write.
-- Atomic Write: write `.tmp` → flush → `sync_all` → verify temp JSON → rename into place → verify target JSON.
-- **Pre-rename failure** preserves the old target file. **Post-rename verify failure** is detected and reported, but v0.1.6 does not implement post-rename rollback.
+- A successful load opens the gate (`canPersist = true`) and triggers warning-mode manifest verification.
+
+**Layer 3 (Active Save — v0.1.6 Atomic Write):**
+
+- Save writes project JSON, `groups.json`, and `app-state.json` through Atomic Write: `.tmp` → flush → `sync_all` → verify temp → rename → verify target.
+- **Pre-rename failure** preserves the old target file. **Post-rename verification failure** is detected and reported, but v0.1.6 does not implement post-rename rollback.
+
+**Layer 4 (Active Data Layout):**
+
 - Active data stays in its native layout: v1 flat or v2 group-folder. v1 autosave does **not** silently migrate to v2.
 
-**Layer 5 (snapshot manifest, v0.1.7 — integrity observation):**
+**Layer 5A (Snapshot Manifest Generation — v0.1.7):**
 
-- After each successful active save, a snapshot manifest is generated and written atomically.
-- The manifest records each active file with its path, role, size, and SHA-256 checksum.
-- On load, the manifest is verified in **warning-mode**: missing, corrupt, checksum-mismatched, size-mismatched, extra, or missing-listed files produce warnings — never load blockers.
+- After each successful active save: collect inventory → SHA-256 + size → build manifest → atomic write `.cheerio/snapshot-manifest.json`.
 - Manifest write failure does **not** fail the active save; it surfaces as a `manifest/warning`.
-- The manifest is an integrity observation layer. It is **not** a backup, **not** a restore system, and **not** a load blocker.
-- Warning messages are sanitized — no local absolute paths are exposed.
 
-**Layer 6 (existing safety paths, v0.1.5 model — not rewritten in v0.1.7):**
+**Layer 5B (Snapshot Manifest Verification — v0.1.7):**
 
-- Backup, Restore, Migration, and Stale Quarantine remain on the v0.1.5 staging/rename/rollback model.
+- On successful load, manifest is verified in **warning-mode**: missing, corrupt, checksum-mismatched, size-mismatched, extra, or missing-listed files produce warnings — never load blockers.
+- No repair, no auto-regenerate-on-load.
 
-**Layer 7 (Storage Console, v0.1.6/v0.1.7 — read-only observability):**
+**Layer 6 (Existing Safety Paths — not rewritten in v0.1.7):**
 
-- Opened from the status bar. Displays in-memory storage events including `manifest/warning` events from v0.1.7.
-- Supports Copy Log, Clear, Close, Escape.
-- Ctrl radial menu is suppressed while the console is open.
-- The Console is read-only — it has no Restore, Migration, Delete, Repair, Retry, or Recalculate functionality.
+- Backup, Restore, Migration, and Stale/tmp/quarantine exclusion remain on the v0.1.5 safety model.
 
-**Layer 8 (deferred — not in v0.1.7):**
+**Layer 7 (Storage Console — v0.1.6/v0.1.7):**
 
-- Single-writer workspace lock, Recovery Center, automatic `.tmp` cleanup, and kill-process-during-save validation are **not implemented** in v0.1.7.
+- Read-only modal displaying load/save/storage-root events and `manifest/warning` events.
+- Supports Copy log, Clear, Close, Escape. No repair/retry/recalculate functionality.
+
+**Layer 8 (Deferred — not in v0.1.7):**
+
+- Single-writer lock, Recovery Center, `.tmp` auto-cleanup, kill-process test, `.chf` package, nested workflow graph are **not implemented** in v0.1.7.
 
 **Summary:** v0.1.7 adds snapshot manifest integrity observation on top of v0.1.6's atomic save foundation. It does **not** claim zero data loss, crash-proof guarantees, or hardware failure protection.
 
