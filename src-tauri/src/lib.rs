@@ -606,6 +606,36 @@ enum DataRootClassification {
     RecoveryNeeded(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SnapshotLayoutKind {
+    V1Flat,
+    V2GroupFolder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SnapshotFileRole {
+    AppState,
+    Groups,
+    Project,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotFileInventoryEntry {
+    pub relative_path: String,
+    pub role: SnapshotFileRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotFileInventory {
+    pub layout_kind: SnapshotLayoutKind,
+    pub data_version: u32,
+    pub files: Vec<SnapshotFileInventoryEntry>,
+}
+
 fn count_top_level_project_json_files(projects_dir: &Path) -> Result<usize, String> {
     if !projects_dir.exists() {
         return Ok(0);
@@ -862,6 +892,176 @@ fn register_loaded_project(
     }
     projects.push(project);
     Ok(())
+}
+
+fn push_inventory_file_if_present(
+    data_root: &Path,
+    path: &Path,
+    role: SnapshotFileRole,
+    files: &mut Vec<SnapshotFileInventoryEntry>,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    ensure_regular_file(path, "snapshot inventory file")?;
+    files.push(SnapshotFileInventoryEntry {
+        relative_path: relative_to_data_root(data_root, path),
+        role,
+    });
+    Ok(())
+}
+
+fn collect_project_inventory_from_dir(
+    data_root: &Path,
+    dir: &Path,
+    files: &mut Vec<SnapshotFileInventoryEntry>,
+) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    ensure_directory(dir, "snapshot project inventory directory")?;
+    for entry in fs::read_dir(dir).map_err(|err| {
+        format!(
+            "Failed to scan snapshot project inventory directory {}: {err}",
+            dir.display()
+        )
+    })? {
+        let entry = entry.map_err(|err| {
+            format!("Failed to read snapshot project inventory directory entry: {err}")
+        })?;
+        let path = entry.path();
+        if is_storage_temp_file(&path) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|err| {
+            format!(
+                "Failed to inspect snapshot project inventory path {}: {err}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Snapshot project inventory path is a symlink: {}",
+                relative_to_data_root(data_root, &path)
+            ));
+        }
+        if metadata.file_type().is_file()
+            && path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        {
+            files.push(SnapshotFileInventoryEntry {
+                relative_path: relative_to_data_root(data_root, &path),
+                role: SnapshotFileRole::Project,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_v1_project_inventory(
+    data_root: &Path,
+    files: &mut Vec<SnapshotFileInventoryEntry>,
+) -> Result<(), String> {
+    collect_project_inventory_from_dir(data_root, &data_root.join("projects"), files)
+}
+
+fn collect_v2_project_inventory(
+    data_root: &Path,
+    files: &mut Vec<SnapshotFileInventoryEntry>,
+) -> Result<(), String> {
+    let projects_dir = data_root.join("projects");
+    collect_project_inventory_from_dir(data_root, &projects_dir.join("ungrouped"), files)?;
+
+    let groups_dir = projects_dir.join("groups");
+    if !groups_dir.exists() {
+        return Ok(());
+    }
+    ensure_directory(&groups_dir, "snapshot project groups inventory directory")?;
+    for group_entry in fs::read_dir(&groups_dir).map_err(|err| {
+        format!(
+            "Failed to scan snapshot project groups inventory directory {}: {err}",
+            groups_dir.display()
+        )
+    })? {
+        let group_entry = group_entry
+            .map_err(|err| format!("Failed to read snapshot project group entry: {err}"))?;
+        let group_path = group_entry.path();
+        let group_metadata = fs::symlink_metadata(&group_path).map_err(|err| {
+            format!(
+                "Failed to inspect snapshot project group path {}: {err}",
+                group_path.display()
+            )
+        })?;
+        if group_metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Snapshot project group path is a symlink: {}",
+                relative_to_data_root(data_root, &group_path)
+            ));
+        }
+        if !group_metadata.file_type().is_dir() {
+            continue;
+        }
+        let group_id = group_path
+            .file_name()
+            .and_then(|item| item.to_str())
+            .unwrap_or_default();
+        ensure_group_id_safe(group_id)?;
+        collect_project_inventory_from_dir(data_root, &group_path, files)?;
+    }
+    Ok(())
+}
+
+pub fn collect_active_snapshot_file_inventory(
+    data_root: &Path,
+) -> Result<SnapshotFileInventory, String> {
+    let classification = classify_data_root(data_root)?;
+    if let Some(error) = classification_error(classification.clone(), data_root) {
+        return Err(error);
+    }
+
+    let (layout_kind, data_version) = match classification {
+        DataRootClassification::NewEmptyWorkspace => {
+            (SnapshotLayoutKind::V2GroupFolder, CURRENT_DATA_VERSION)
+        }
+        DataRootClassification::ExistingLegacyV1Workspace
+        | DataRootClassification::ExistingV1Workspace => {
+            (SnapshotLayoutKind::V1Flat, LEGACY_DATA_VERSION)
+        }
+        DataRootClassification::ExistingV2Workspace => {
+            (SnapshotLayoutKind::V2GroupFolder, CURRENT_DATA_VERSION)
+        }
+        DataRootClassification::UnsupportedVersion(_)
+        | DataRootClassification::ExistingV2LikeWorkspace
+        | DataRootClassification::AmbiguousLayout
+        | DataRootClassification::RecoveryNeeded(_) => {
+            unreachable!("blocked classifications returned before inventory collection")
+        }
+    };
+
+    let mut files = Vec::new();
+    push_inventory_file_if_present(
+        data_root,
+        &data_root.join(APP_STATE_FILE),
+        SnapshotFileRole::AppState,
+        &mut files,
+    )?;
+    push_inventory_file_if_present(
+        data_root,
+        &data_root.join(GROUPS_FILE),
+        SnapshotFileRole::Groups,
+        &mut files,
+    )?;
+
+    match layout_kind {
+        SnapshotLayoutKind::V1Flat => collect_v1_project_inventory(data_root, &mut files)?,
+        SnapshotLayoutKind::V2GroupFolder => collect_v2_project_inventory(data_root, &mut files)?,
+    }
+
+    files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(SnapshotFileInventory {
+        layout_kind,
+        data_version,
+        files,
+    })
 }
 
 fn load_project_file(
@@ -3705,6 +3905,417 @@ mod tests {
         let projects = load_v1_project_files(&data_root, &projects_dir).expect("load v1");
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, "project-a");
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    fn inventory_pairs(inventory: &SnapshotFileInventory) -> Vec<(String, SnapshotFileRole)> {
+        inventory
+            .files
+            .iter()
+            .map(|entry| (entry.relative_path.clone(), entry.role.clone()))
+            .collect()
+    }
+
+    fn inventory_paths(inventory: &SnapshotFileInventory) -> Vec<String> {
+        inventory
+            .files
+            .iter()
+            .map(|entry| entry.relative_path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_inventory_collects_v1_flat_layout_files() {
+        let data_root = temp_test_dir("snapshot-inventory-v1");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(LEGACY_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(&data_root.join(GROUPS_FILE), &Vec::<ProjectGroup>::new())
+            .expect("write groups");
+        write_json(
+            &data_root.join("projects").join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write project a");
+        write_json(
+            &data_root.join("projects").join("project-b.json"),
+            &sample_project("project-b", None),
+        )
+        .expect("write project b");
+
+        let inventory =
+            collect_active_snapshot_file_inventory(&data_root).expect("collect inventory");
+
+        assert_eq!(inventory.layout_kind, SnapshotLayoutKind::V1Flat);
+        assert_eq!(inventory.data_version, LEGACY_DATA_VERSION);
+        assert_eq!(
+            inventory_pairs(&inventory),
+            vec![
+                ("app-state.json".to_string(), SnapshotFileRole::AppState),
+                ("groups.json".to_string(), SnapshotFileRole::Groups),
+                (
+                    "projects/project-a.json".to_string(),
+                    SnapshotFileRole::Project
+                ),
+                (
+                    "projects/project-b.json".to_string(),
+                    SnapshotFileRole::Project
+                ),
+            ]
+        );
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_inventory_v1_excludes_non_active_files() {
+        let data_root = temp_test_dir("snapshot-inventory-v1-exclusion");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(LEGACY_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(&data_root.join(GROUPS_FILE), &Vec::<ProjectGroup>::new())
+            .expect("write groups");
+        write_json(
+            &data_root.join("projects").join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write active project");
+        fs::write(
+            data_root.join("projects").join(".project-a.json.tmp"),
+            r#"{"id":"project-a"}"#,
+        )
+        .expect("write project temp");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-stale.json"),
+            &sample_project("project-stale", None),
+        )
+        .expect("write nested ungrouped stale project");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-stale.json"),
+            &sample_project("project-stale", Some("group-a")),
+        )
+        .expect("write nested grouped stale project");
+        write_json(
+            &data_root.join(".cheerio").join("snapshot-manifest.json"),
+            &serde_json::json!({ "manifestVersion": 1 }),
+        )
+        .expect("write manifest");
+        fs::write(
+            data_root
+                .join(".cheerio")
+                .join(".snapshot-manifest.json.tmp"),
+            r#"{"manifestVersion":1}"#,
+        )
+        .expect("write manifest temp");
+        write_json(
+            &data_root
+                .join(".cheerio")
+                .join("stale-project-files")
+                .join("stamp")
+                .join("projects")
+                .join("project-stale.json"),
+            &sample_project("project-stale", None),
+        )
+        .expect("write stale quarantine project");
+
+        let inventory =
+            collect_active_snapshot_file_inventory(&data_root).expect("collect inventory");
+
+        assert_eq!(
+            inventory_paths(&inventory),
+            vec![
+                "app-state.json".to_string(),
+                "groups.json".to_string(),
+                "projects/project-a.json".to_string(),
+            ]
+        );
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_inventory_collects_v2_group_folder_layout_files() {
+        let data_root = temp_test_dir("snapshot-inventory-v2");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-a", vec!["project-b"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write ungrouped project");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-a")),
+        )
+        .expect("write grouped project");
+
+        let inventory =
+            collect_active_snapshot_file_inventory(&data_root).expect("collect inventory");
+
+        assert_eq!(inventory.layout_kind, SnapshotLayoutKind::V2GroupFolder);
+        assert_eq!(inventory.data_version, CURRENT_DATA_VERSION);
+        assert_eq!(
+            inventory_pairs(&inventory),
+            vec![
+                ("app-state.json".to_string(), SnapshotFileRole::AppState),
+                ("groups.json".to_string(), SnapshotFileRole::Groups),
+                (
+                    "projects/groups/group-a/project-b.json".to_string(),
+                    SnapshotFileRole::Project
+                ),
+                (
+                    "projects/ungrouped/project-a.json".to_string(),
+                    SnapshotFileRole::Project
+                ),
+            ]
+        );
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_inventory_v2_excludes_non_active_files() {
+        let data_root = temp_test_dir("snapshot-inventory-v2-exclusion");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-a", vec!["project-b"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write ungrouped project");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-a")),
+        )
+        .expect("write grouped project");
+        write_json(
+            &data_root.join("projects").join("project-old-flat.json"),
+            &sample_project("project-old-flat", None),
+        )
+        .expect("write old flat project");
+        fs::write(
+            data_root
+                .join("projects")
+                .join("ungrouped")
+                .join(".project-a.json.tmp"),
+            r#"{"id":"project-a"}"#,
+        )
+        .expect("write ungrouped temp");
+        fs::write(
+            data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join(".project-b.json.tmp"),
+            r#"{"id":"project-b"}"#,
+        )
+        .expect("write grouped temp");
+        write_json(
+            &data_root.join(".cheerio").join("snapshot-manifest.json"),
+            &serde_json::json!({ "manifestVersion": 1 }),
+        )
+        .expect("write manifest");
+        fs::write(
+            data_root
+                .join(".cheerio")
+                .join(".snapshot-manifest.json.tmp"),
+            r#"{"manifestVersion":1}"#,
+        )
+        .expect("write manifest temp");
+        write_json(
+            &data_root
+                .join(".cheerio")
+                .join("stale-project-files")
+                .join("stamp")
+                .join("projects")
+                .join("project-stale.json"),
+            &sample_project("project-stale", None),
+        )
+        .expect("write stale quarantine project");
+        write_json(
+            &data_root
+                .join("before-restore-20260702")
+                .join("project.json"),
+            &sample_project("project-before-restore", None),
+        )
+        .expect("write before restore project");
+        write_json(
+            &data_root
+                .join("before-migration-20260702")
+                .join("project.json"),
+            &sample_project("project-before-migration", None),
+        )
+        .expect("write before migration project");
+
+        let inventory =
+            collect_active_snapshot_file_inventory(&data_root).expect("collect inventory");
+
+        assert_eq!(
+            inventory_paths(&inventory),
+            vec![
+                "app-state.json".to_string(),
+                "groups.json".to_string(),
+                "projects/groups/group-a/project-b.json".to_string(),
+                "projects/ungrouped/project-a.json".to_string(),
+            ]
+        );
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_inventory_files_are_sorted_deterministically() {
+        let data_root = temp_test_dir("snapshot-inventory-sorted");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-c"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-b", vec!["project-b"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-c.json"),
+            &sample_project("project-c", None),
+        )
+        .expect("write project c");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-b")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-b")),
+        )
+        .expect("write project b");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-a.json"),
+            &sample_project("project-a", Some("group-a")),
+        )
+        .expect("write project a");
+
+        let inventory =
+            collect_active_snapshot_file_inventory(&data_root).expect("collect inventory");
+        let paths = inventory_paths(&inventory);
+        let mut sorted_paths = paths.clone();
+        sorted_paths.sort();
+
+        assert_eq!(paths, sorted_paths);
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_inventory_uses_forward_slash_relative_paths() {
+        let data_root = temp_test_dir("snapshot-inventory-forward-slash");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-b"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-a", vec!["project-b"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-a")),
+        )
+        .expect("write grouped project");
+
+        let inventory =
+            collect_active_snapshot_file_inventory(&data_root).expect("collect inventory");
+        let paths = inventory_paths(&inventory);
+
+        assert!(paths.contains(&"projects/groups/group-a/project-b.json".to_string()));
+        assert!(paths.iter().all(|path| !path.contains('\\')));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_inventory_paths_are_not_absolute_or_prefixed_by_data_root() {
+        let data_root = temp_test_dir("snapshot-inventory-relative");
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(&data_root.join(GROUPS_FILE), &Vec::<ProjectGroup>::new())
+            .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write project");
+
+        let inventory =
+            collect_active_snapshot_file_inventory(&data_root).expect("collect inventory");
+        let data_root_text = data_root.to_string_lossy();
+
+        for entry in inventory.files {
+            assert!(!Path::new(&entry.relative_path).is_absolute());
+            assert!(!entry.relative_path.contains(data_root_text.as_ref()));
+        }
 
         fs::remove_dir_all(data_root).ok();
     }
