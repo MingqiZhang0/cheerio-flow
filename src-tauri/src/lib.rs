@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 use time::{format_description, OffsetDateTime};
@@ -14,6 +15,7 @@ const APP_STATE_FILE: &str = "app-state.json";
 const BOOTSTRAP_FILE: &str = "cheerio-flow-bootstrap.json";
 const LEGACY_DATA_VERSION: u32 = 1;
 const CURRENT_DATA_VERSION: u32 = 2;
+const SHA256_READ_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -376,6 +378,37 @@ where
     let text = serde_json::to_string_pretty(value)
         .map_err(|err| format!("Failed to serialize JSON for {}: {err}", path.display()))?;
     fs::write(path, text).map_err(|err| format!("Failed to write file {}: {err}", path.display()))
+}
+
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+pub fn compute_file_sha256_hex(path: &Path) -> Result<String, String> {
+    ensure_regular_file(path, "SHA-256 input file")?;
+
+    let mut file = fs::File::open(path)
+        .map_err(|err| format!("Failed to open file for SHA-256 {}: {err}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; SHA256_READ_BUFFER_SIZE];
+
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("Failed to read file for SHA-256 {}: {err}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(bytes_to_lower_hex(&hasher.finalize()))
 }
 
 fn atomic_temp_path(target: &Path) -> Result<PathBuf, String> {
@@ -3907,6 +3940,156 @@ mod tests {
         assert_eq!(projects[0].id, "project-a");
 
         fs::remove_dir_all(data_root).ok();
+    }
+
+    fn assert_lowercase_sha256_hex(hash: &str) {
+        assert_eq!(hash.len(), 64);
+        assert!(hash
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch)));
+        assert!(!hash.chars().any(|ch| ch.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn sha256_helper_hashes_empty_file() {
+        let dir = temp_test_dir("sha256-empty");
+        let path = dir.join("empty.bin");
+        fs::write(&path, b"").expect("write empty file");
+
+        let hash = compute_file_sha256_hex(&path).expect("hash empty file");
+
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_lowercase_sha256_hex(&hash);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sha256_helper_hashes_abc_raw_bytes() {
+        let dir = temp_test_dir("sha256-abc");
+        let path = dir.join("abc.txt");
+        fs::write(&path, b"abc").expect("write abc file");
+
+        let hash = compute_file_sha256_hex(&path).expect("hash abc file");
+
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_lowercase_sha256_hex(&hash);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sha256_helper_hashes_hello_world_raw_bytes() {
+        let dir = temp_test_dir("sha256-hello-world");
+        let path = dir.join("hello.txt");
+        fs::write(&path, b"hello world").expect("write hello world file");
+
+        let hash = compute_file_sha256_hex(&path).expect("hash hello world file");
+
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_lowercase_sha256_hex(&hash);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sha256_helper_hashes_hello_world_with_lf_raw_bytes() {
+        let dir = temp_test_dir("sha256-hello-world-lf");
+        let path = dir.join("hello-lf.txt");
+        fs::write(&path, b"hello world\n").expect("write hello world lf file");
+
+        let hash = compute_file_sha256_hex(&path).expect("hash hello world lf file");
+
+        assert_eq!(
+            hash,
+            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+        assert_lowercase_sha256_hex(&hash);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sha256_helper_returns_error_for_missing_file() {
+        let dir = temp_test_dir("sha256-missing");
+        let path = dir.join("missing.bin");
+
+        let error = compute_file_sha256_hex(&path).expect_err("missing file should fail");
+
+        assert!(error.contains("Failed to inspect SHA-256 input file"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sha256_helper_returns_error_for_directory_path() {
+        let dir = temp_test_dir("sha256-directory");
+
+        let error = compute_file_sha256_hex(&dir).expect_err("directory path should fail");
+
+        assert!(error.contains("SHA-256 input file is not a file"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sha256_helper_hashes_non_utf8_raw_bytes_without_normalization() {
+        let dir = temp_test_dir("sha256-non-utf8");
+        let path = dir.join("raw.bin");
+        let bytes = [0xff, 0x00, 0x41, 0x0a];
+        fs::write(&path, bytes).expect("write raw bytes");
+
+        let hash = compute_file_sha256_hex(&path).expect("hash raw bytes");
+
+        assert_lowercase_sha256_hex(&hash);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sha256_helper_hashes_large_file_and_leaves_it_unchanged() {
+        let dir = temp_test_dir("sha256-large");
+        let path = dir.join("large.bin");
+        let bytes = (0..1_100_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &bytes).expect("write large file");
+        let before = fs::read(&path).expect("read before checksum");
+
+        let hash = compute_file_sha256_hex(&path).expect("hash large file");
+        let after = fs::read(&path).expect("read after checksum");
+
+        assert_lowercase_sha256_hex(&hash);
+        assert_eq!(before, after);
+        assert_eq!(after, bytes);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sha256_helper_does_not_modify_file_bytes() {
+        let dir = temp_test_dir("sha256-unchanged");
+        let path = dir.join("unchanged.txt");
+        let bytes = b"line one\nline two\n";
+        fs::write(&path, bytes).expect("write file");
+        let before = fs::read(&path).expect("read before checksum");
+
+        let hash = compute_file_sha256_hex(&path).expect("hash file");
+        let after = fs::read(&path).expect("read after checksum");
+
+        assert_lowercase_sha256_hex(&hash);
+        assert_eq!(before, after);
+
+        fs::remove_dir_all(dir).ok();
     }
 
     fn inventory_pairs(inventory: &SnapshotFileInventory) -> Vec<(String, SnapshotFileRole)> {
