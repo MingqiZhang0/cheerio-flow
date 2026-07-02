@@ -4,94 +4,83 @@ Local-first desktop research workflow planning tool built with Tauri, React, Typ
 
 Cheerio Flow is designed for researchers, students, and technical writers who need to plan complex research processes visually: concepts, equations, assumptions, datasets, experiments, arguments, dependencies, and presentation structure can be arranged as editable nodes and arrows on a local canvas.
 
-The project is in active development, with v0.1.6 introducing atomic save and a storage operation console, building on v0.1.5's group-folder migration and v0.1.4's data-safety foundation.
+The project is in active development. v0.1.7 introduces snapshot manifest and SHA-256 integrity warnings, building on v0.1.6's atomic save, v0.1.5's group-folder migration, and v0.1.4's data-safety foundation.
 
 ## Current version
 
 ```text
-v0.1.6 — Atomic Save & Storage Operation Console
+v0.1.7 — Snapshot Manifest & Integrity Warnings
 ```
 
-v0.1.6 introduces **atomic writes for active JSON files** and a **Storage Operation Console**, building on the v0.1.5 Group Folder Migration and v0.1.4 Data Safety Foundation.
+v0.1.7 introduces a **snapshot manifest** for active workspace files, **SHA-256 checksums**, and **warning-mode load verification**, building on the v0.1.6 Atomic Save foundation.
 
-### v0.1.6 highlights
+### v0.1.7 highlights
 
-#### Atomic save for active data
+#### Snapshot manifest
 
-All active JSON files now use atomic write (write-temp → flush → sync_all → verify → rename → verify):
+After every successful active save, Cheerio Flow writes a snapshot manifest:
 
-- Active project JSON files.
-- `groups.json`.
-- `app-state.json`.
-- Fresh workspace bootstrap active JSON.
-
-Temp files are named `.<original-filename>.tmp` (for example `.app-state.json.tmp`, `.groups.json.tmp`, `.project-a.json.tmp`) and live in the same directory as the target file.
-
-Boundaries:
-
-- Pre-rename failure preserves the old target file.
-- Post-rename verification failure is detected and returned as an error.
-- v0.1.6 does **not** implement post-rename rollback.
-- v1 flat project saves remain in v1 layout.
-- v2 group-folder project saves remain in v2 layout.
-- v1 autosave does **not** automatically migrate to v2.
-- v2 group-move stale quarantine behavior is preserved.
-
-#### Storage Operation Console
-
-A read-only modal/dialog opened by clicking the bottom save/status area:
-
-- Displays recent storage events from the in-memory ring buffer.
-- Supports **Copy Log**, **Clear**, **Close**, and **Escape** dismissal.
-- Ctrl radial menu is suppressed while the console is open; returns to normal on canvas after closing.
-- The console is read-only — it has no Restore, Migration, Delete, or Repair buttons.
-
-#### StorageEvent / Operation Log Buffer
-
-- Frontend in-memory ring buffer (capacity **512**).
-- Not persisted — cleared on app restart.
-- Observes `load`, `save`, `backup`, `restore`, `migration` (dry-run), `storage-root`, and `console` events.
-- This is an **observability aid**, not a persistent audit log.
-
-#### Manual desktop validation
-
-v0.1.6 completed manual desktop smoke testing in the **real Tauri desktop window** (browser fallback is not a valid desktop verification environment):
-
-| Test | Name | Result |
-|------|------|--------|
-| S5-T1 | Storage Console Open | PASS |
-| S5-T2 | Copy Log (Real Tauri) | PASS |
-| S5-T3 | Clear Console | PASS |
-| S5-T4 | Close / Escape | PASS |
-| S5-T5 | Ctrl Radial Scope | PASS |
-| S5-T6 | Fresh v2 Bootstrap | PASS |
-| S5-T7 | v2 Normal Save | PASS |
-| S5-T8 | v1 Autosave No Migration | PASS |
-| S5-T9 | v2 Group Move Stale Quarantine | PASS |
-| S5-T10 | Bad JSON Load Failed | PASS |
-| S5-T11 | Duplicate Project ID Load Failed | PASS |
-| S5-T12 | Stale .tmp Not Loaded as Project | PASS |
-
-Full report: `docs/V0.1.6_MANUAL_DESKTOP_SMOKE_TEST_REPORT.md`
-
-#### Validation summary
-
-```text
-pnpm exec tsc --noEmit        # Passed
-pnpm build                    # Passed (existing Vite chunk-size warning only)
-cargo fmt --check             # Passed
-cargo check                   # Passed (no warnings)
-cargo test                    # 30 passed, 0 failed
+```
+CheerioFlowData/.cheerio/snapshot-manifest.json
 ```
 
-Final read-only review found no blockers.
+The manifest records each active workspace file with its role, size, and SHA-256 checksum. It covers:
 
-#### v0.1.5 recap (foundation for v0.1.6)
+- `app-state.json`
+- `groups.json`
+- Active project JSON files (canonical paths only)
 
-v0.1.6 is built on the v0.1.5 migration engine:
+It explicitly excludes backup files, stale quarantine files, `.tmp` files, and non-canonical project paths.
+
+The manifest is written atomically (same write-temp → flush → sync_all → verify → rename pipeline as active data).
+
+#### Warning-mode load verification
+
+On successful load, Cheerio Flow verifies the snapshot manifest in **warning-mode**. Manifest issues never block access to valid active data:
+
+| Scenario | Behavior |
+|---|---|
+| Manifest missing | Warning — load proceeds |
+| Manifest corrupt (bad JSON) | Warning — load proceeds |
+| Checksum mismatch | Warning — load proceeds |
+| Size mismatch | Warning — load proceeds |
+| Extra active file (disk not in manifest) | Warning — load proceeds |
+| Manifest-listed file missing from disk | Warning — load proceeds |
+| Active project JSON corrupt | **Blocked** — load fails |
+| Duplicate project ID | **Blocked** — load fails |
+
+The active JSON load gate still takes priority. Manifest problems warn; active data corruption still blocks.
+
+#### Manifest write failure does not fail active save
+
+If the manifest cannot be written (e.g. permission issue, `.cheerio` is a file instead of a directory), the active save still succeeds. The failure is surfaced as a `manifest/warning` in the Storage Console — never as **Save failed**.
+
+#### Storage Console manifest warnings
+
+The Storage Console (introduced in v0.1.6) now displays `manifest/warning` events for both save-time and load-time manifest issues. The Console remains read-only — no repair, retry, or recalculate buttons. No Recovery Center was added.
+
+#### Warning message sanitization
+
+All user-visible manifest warning messages use relative paths only. Local absolute paths are never exposed in warning text or Storage Console copy output.
+
+#### Browse directory memory
+
+The Browse folder picker now remembers the last manually selected outer storage root as a local UI preference (`localStorage` key: `cheerio-flow:last-browse-directory`). This does not write to workspace data or affect save/load correctness.
+
+### v0.1.6 recap (foundation for v0.1.7)
+
+v0.1.7 is built on the v0.1.6 Atomic Save foundation:
+
+- **Atomic write for active JSON** — project files, `groups.json`, `app-state.json` all use write-temp → flush → sync_all → verify → rename.
+- **Storage Operation Console** — read-only modal displaying in-memory storage events (Copy Log, Clear, Close, Escape).
+- **Storage event buffer** — frontend ring buffer (capacity 512), not persisted.
+
+### v0.1.5 recap
+
+v0.1.5 introduced the **group-folder migration** engine:
 
 - **dataVersion 2** group-folder layout.
-- Dry-run + **MIGRATE** confirmation + backup + staging + verification + rollback.
+- Dry-run + MIGRATE confirmation + backup + staging + verification + rollback.
 - v1 workspaces are fully supported — no automatic migration.
 - Duplicate project IDs and bad JSON block load and migration.
 
@@ -340,12 +329,16 @@ Desktop development and desktop packaging require a working Rust/Tauri environme
 | Atomic write for active JSON  | Implemented in v0.1.6 | write-temp → flush → sync_all → verify → rename              |
 | Storage Operation Console     | Implemented in v0.1.6 | Read-only modal, in-memory event log                         |
 | Storage event buffer          | Implemented in v0.1.6 | Frontend ring buffer, capacity 512                           |
+| Snapshot manifest             | Implemented in v0.1.7 | Active workspace file inventory with SHA-256 checksums       |
+| Warning-mode load verification| Implemented in v0.1.7 | Manifest issues warn; active data corruption still blocks    |
+| Manifest write failure safety | Implemented in v0.1.7 | Manifest failure does not fail active save                   |
+| Browse directory memory       | Implemented in v0.1.7 | localStorage UI preference, not workspace data               |
 
 ## Data Safety Architecture
 
-Cheerio Flow treats local data safety as a first-class design goal. The diagram below shows the layered data safety architecture as of v0.1.6.
+Cheerio Flow treats local data safety as a first-class design goal. The diagram below shows the layered data safety architecture as of v0.1.7.
 
-v0.1.6 strengthens the **active JSON save path** with atomic writes (write-temp → flush → sync_all → verify → rename → verify). The Storage Console adds read-only observability. Backup, restore, migration, and quarantine remain on the v0.1.5 safety model.
+v0.1.7 adds a **snapshot manifest layer** between active save and backup/restore: after each successful active save, a manifest with SHA-256 checksums is written atomically. Load-time verification runs in warning-mode — manifest issues never block access to valid active data. v0.1.6's atomic write and Storage Console foundations remain intact.
 
 ```mermaid
 flowchart TD
@@ -382,7 +375,15 @@ flowchart TD
         NM["no silent<br/>v1→v2 migration"]
     end
 
-    subgraph OLD["5. Safety Paths — v0.1.5 model"]
+    subgraph MANIFEST["5. Snapshot Manifest — v0.1.7"]
+        direction LR
+        SM["Atomic manifest write"]
+        SH["SHA-256 checksums"]
+        WM["Warning-mode verify"]
+        SM --> SH --> WM
+    end
+
+    subgraph OLD["6. Safety Paths — v0.1.5 model"]
         direction LR
         BK["Backup"]
         RS["Restore"]
@@ -390,21 +391,21 @@ flowchart TD
         SQ["Stale Quarantine"]
     end
 
-    subgraph CONSOLE["6. Storage Console — v0.1.6"]
+    subgraph CONSOLE["7. Storage Console — v0.1.6/v0.1.7"]
         direction LR
         SC["Read-only modal"]
         CP["Copy Log"]
         CL["Clear / Close / Esc"]
         CR["Ctrl-scoped"]
+        MW["manifest/warning"]
     end
 
-    subgraph FUT["7. Deferred — not in v0.1.6"]
+    subgraph FUT["8. Deferred — not in v0.1.7"]
         direction LR
         D1["single-writer lock"]
-        D2["checksum manifest"]
-        D3["recovery center"]
-        D4[".tmp auto-cleanup"]
-        D5["kill-process test"]
+        D2["recovery center"]
+        D3[".tmp auto-cleanup"]
+        D4["kill-process test"]
     end
 
     UE --> AT --> L
@@ -413,16 +414,19 @@ flowchart TD
     VF --> V2
     V1 --> NM
     V2 --> NM
+    VF --> SM
     SB --> SC
 
     SC -.->|observes| SAVE
     SC -.->|observes| GATE
+    SC -.->|observes| MANIFEST
     SC -.->|observes| OLD
 
     style UX fill:#ede7f6,stroke:#7c4dff
     style GATE fill:#fff3e0,stroke:#ff9800
     style SAVE fill:#c8e6c9,stroke:#388e3c
     style DISK fill:#e3f2fd,stroke:#1976d2
+    style MANIFEST fill:#fce4ec,stroke:#e91e63
     style OLD fill:#e8f4f8,stroke:#5b9bd5
     style CONSOLE fill:#e8f5e9,stroke:#4caf50
     style FUT fill:#f5f5f5,stroke:#999,stroke-dasharray: 5 5
@@ -439,23 +443,31 @@ flowchart TD
 - **Pre-rename failure** preserves the old target file. **Post-rename verify failure** is detected and reported, but v0.1.6 does not implement post-rename rollback.
 - Active data stays in its native layout: v1 flat or v2 group-folder. v1 autosave does **not** silently migrate to v2.
 
-**Layer 5 (existing safety paths, v0.1.5 model — not rewritten in v0.1.6):**
+**Layer 5 (snapshot manifest, v0.1.7 — integrity observation):**
 
-- Backup, Restore, Migration, and Stale Quarantine all remain on the v0.1.5 staging/rename/rollback model.
-- These paths were intentionally excluded from the Slice 4 atomic-write scope.
+- After each successful active save, a snapshot manifest is generated and written atomically.
+- The manifest records each active file with its path, role, size, and SHA-256 checksum.
+- On load, the manifest is verified in **warning-mode**: missing, corrupt, checksum-mismatched, size-mismatched, extra, or missing-listed files produce warnings — never load blockers.
+- Manifest write failure does **not** fail the active save; it surfaces as a `manifest/warning`.
+- The manifest is an integrity observation layer. It is **not** a backup, **not** a restore system, and **not** a load blocker.
+- Warning messages are sanitized — no local absolute paths are exposed.
 
-**Layer 6 (Storage Console, v0.1.6 — read-only observability):**
+**Layer 6 (existing safety paths, v0.1.5 model — not rewritten in v0.1.7):**
 
-- Opened from the status bar. Displays in-memory storage events. Supports Copy Log, Clear, Close, Escape.
+- Backup, Restore, Migration, and Stale Quarantine remain on the v0.1.5 staging/rename/rollback model.
+
+**Layer 7 (Storage Console, v0.1.6/v0.1.7 — read-only observability):**
+
+- Opened from the status bar. Displays in-memory storage events including `manifest/warning` events from v0.1.7.
+- Supports Copy Log, Clear, Close, Escape.
 - Ctrl radial menu is suppressed while the console is open.
-- The Console is read-only — it has no Restore, Migration, Delete, or Repair functionality.
+- The Console is read-only — it has no Restore, Migration, Delete, Repair, Retry, or Recalculate functionality.
 
-**Layer 7 (deferred — not in v0.1.6):**
+**Layer 8 (deferred — not in v0.1.7):**
 
-- Single-writer workspace lock, checksum manifest, recovery center, automatic `.tmp` cleanup, directory fsync hardening, and kill-process-during-save validation are **not implemented** in v0.1.6.
-- The kill-process interrupted-save test was not run in Slice 5.
+- Single-writer workspace lock, Recovery Center, automatic `.tmp` cleanup, and kill-process-during-save validation are **not implemented** in v0.1.7.
 
-**Summary:** v0.1.6 improves local-first active JSON save reliability (atomic write for the active save path) and storage operation observability (in-memory console). It does **not** claim zero data loss, crash-proof guarantees, or hardware failure protection.
+**Summary:** v0.1.7 adds snapshot manifest integrity observation on top of v0.1.6's atomic save foundation. It does **not** claim zero data loss, crash-proof guarantees, or hardware failure protection.
 
 ## Data safety features
 
@@ -482,6 +494,10 @@ flowchart TD
 | Ctrl radial menu scope       | Module creation radial menu only opens over the canvas. |
 | Atomic write for active JSON | write-temp → flush → sync_all → verify → rename for active saves. |
 | Storage operation event buffer | In-memory ring buffer observes storage operations.    |
+| Snapshot manifest             | Active workspace file inventory with SHA-256 checksums, written atomically after save. |
+| Warning-mode verification     | Manifest issues warn; never block valid active data load. |
+| Manifest write failure safety | Manifest failure does not fail active save; surfaced as warning. |
+| Manifest path sanitization    | Warning messages use relative paths only; no local absolute paths exposed. |
 | Symlink avoidance            | All file operations reject and skip symlinks.           |
 
 ## Storage model
@@ -508,7 +524,7 @@ Choose its parent folder.
 
 ## Current data layout
 
-v0.1.5 data layout (dataVersion 2, group-folder):
+v0.1.7 data layout (dataVersion 2, group-folder, with snapshot manifest):
 
 ```text
 CheerioFlowData/
@@ -520,6 +536,9 @@ CheerioFlowData/
         {project-id}.json
   groups.json
   app-state.json
+  .cheerio/
+    snapshot-manifest.json
+    stale-project-files/       (quarantined stale files after group move)
 ```
 
 Legacy v1 data layout (dataVersion 1, still supported for loading and saving):
@@ -712,6 +731,7 @@ Cheerio Flow writes only to the selected local storage area.
 | `CheerioFlowData/projects/{project-id}.json`             | Legacy v1 flat project files (still supported).  |
 | `CheerioFlowData/groups.json`                            | Group list and project membership metadata.      |
 | `CheerioFlowData/app-state.json`                         | UI/app state, including `dataVersion`.           |
+| `CheerioFlowData/.cheerio/snapshot-manifest.json`        | Snapshot manifest — active file inventory with SHA-256 checksums. |
 | `CheerioFlowData/.cheerio/stale-project-files/`          | Quarantined stale project files after group move.|
 | `CheerioFlowBackups/backup-*/CheerioFlowData/`           | Full backup copy of data folder.                 |
 | `CheerioFlowBackups/backup-*/backup-manifest.json`       | Backup metadata.                                 |
@@ -721,6 +741,49 @@ Cheerio Flow writes only to the selected local storage area.
 Cheerio Flow does not require a server for these operations.
 
 ## Validation
+
+### v0.1.7 validation
+
+Automated validation:
+
+```text
+cargo fmt --check             # PASS
+cargo check                   # PASS
+cargo test                    # 86 passed, 0 failed
+pnpm exec tsc --noEmit        # PASS
+pnpm build                    # PASS (existing Vite chunk-size warning only)
+```
+
+Manual desktop validation was completed by the user on a real Windows desktop environment. Claude / Codex did not perform or fabricate native Tauri window interactions.
+
+| ID | Scenario | Result |
+|---|---|---|
+| A | Fresh workspace / v2 happy path | PASS |
+| B | Existing v2 save generates manifest | PASS |
+| C | Missing manifest warning-mode load | PASS |
+| D | Corrupt manifest warning-mode load | PASS |
+| E | Checksum mismatch warning-mode load | PASS |
+| F | Size mismatch warning-mode load | PASS |
+| G | Extra active file warning | PASS |
+| H | Manifest-listed missing file warning | PASS |
+| I | Active JSON bad still blocks load | PASS |
+| J | Duplicate project ID still blocks load | PASS |
+| K | v1 legacy layout compatibility | NOT RUN (no trusted v1 fixture) |
+| L | v2 stale/tmp exclusion | PASS |
+| M | Manifest write failure does not fail save | PASS |
+| N | Storage Console behavior | PASS |
+| O | Repo / stash audit | PASS |
+| UX | Browse directory memory | PASS |
+
+Two issues were found and resolved during manual testing:
+
+- Save-time manifest warning exposed local absolute path — fixed in `c8f1243`.
+- Browse dialog did not remember last selected folder — fixed in `168cfd6`.
+
+Full reports:
+- `docs/VALIDATION_v0.1.7.md`
+- `docs/MANUAL_TEST_LOG_v0.1.7.md`
+- `docs/RELEASE_NOTES_v0.1.7.md`
 
 ### v0.1.5 validation
 
@@ -792,17 +855,22 @@ Current limitations:
 * There is no plugin system yet.
 * Large project performance still needs further testing.
 * Automatic repair is intentionally not implemented in v0.1.4.
-* v0.1.6 does **not** include: single-writer workspace lock, checksum manifest, Recovery Center, pseudo-server backup root, GitHub backup adapter, persistent operation log, automatic stale `.tmp` cleanup, directory fsync hardening, stronger Windows-specific write hardening, post-rename rollback, kill-process save interruption validation, or end-to-end encryption.
-* Backup, restore, migration, and quarantine remain on the v0.1.5 safety model and were not rewritten in v0.1.6.
-* Interrupted-save kill-process test was not run in Slice 5.
+* v0.1.7 does **not** include: single-writer workspace lock, Recovery Center, repair/retry/recalculate functionality, auto-regenerate-on-load, auto-repair, persistent operation log, automatic stale `.tmp` cleanup, directory fsync hardening, post-rename rollback, kill-process save interruption validation, or end-to-end encryption.
+* v1 legacy flat-layout compatibility (scenario K) was not manually validated — no trusted v1 flat-layout fixture was available.
+* Backup, restore, migration, and quarantine remain on the v0.1.5 safety model and were not rewritten in v0.1.7.
+* Snapshot manifest is an integrity observation layer — it is not a backup, not a restore system, not a load blocker, and not a repair mechanism.
 
 ## Roadmap
 
 Planned directions:
 
+### v0.1.7 — Snapshot Manifest & Integrity Warnings ✅
+
+Completed. Introduced snapshot manifest with SHA-256 checksums, warning-mode load verification, and manifest/warning events in Storage Console. Manual desktop validation passed (A–J, L–O, UX PASS; K NOT RUN — no trusted v1 flat-layout fixture). See the Current version section above for details.
+
 ### v0.1.6 — Atomic Save & Storage Operation Console ✅
 
-Completed. Introduced atomic write for all active JSON files (write-temp → flush → sync_all → verify → rename) and a read-only Storage Operation Console with an in-memory ring buffer for storage event observability. Manual desktop smoke testing passed in the real Tauri desktop window (12/12 tests PASS). See the Current version section above for details.
+Completed. Introduced atomic write for all active JSON files and a read-only Storage Operation Console.
 
 ### Future features
 
@@ -820,7 +888,7 @@ Possible future extensions:
 
 ## Future Data Reliability
 
-Cheerio Flow has evolved from the v0.1.4 Data Safety Foundation through v0.1.5 Group Folder Migration to v0.1.6 Atomic Save & Storage Operation Console — improving local-first active JSON save reliability and storage operation observability under tested desktop scenarios.
+Cheerio Flow has evolved from the v0.1.4 Data Safety Foundation through v0.1.5 Group Folder Migration and v0.1.6 Atomic Save to v0.1.7 Snapshot Manifest — improving local-first active data integrity observability under tested desktop scenarios.
 
 See:
 
@@ -847,6 +915,7 @@ AI assistance was used for implementation support, review prompts, and release o
 Release tags:
 
 ```text
+v0.1.7       Snapshot Manifest & Integrity Warnings
 v0.1.6       Atomic Save & Storage Operation Console
 v0.1.5       Group Folder Migration
 v0.1.5-rc1   Group Folder Migration release candidate
