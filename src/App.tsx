@@ -640,6 +640,25 @@ function AppShell() {
     copyText: copyStorageEventsText,
   } = useStorageOperationLog();
 
+  const appendManifestWarningEvents = useCallback(
+    (data: PersistedData) => {
+      for (const warning of data.report?.warnings ?? []) {
+        if (warning.kind !== "snapshot-manifest") continue;
+        appendStorageEvent({
+          severity: "warning",
+          operation: "manifest",
+          phase: "warning",
+          message: warning.message || "Snapshot manifest warning.",
+          details: warning.message,
+          relatedPath: warning.relatedPath ?? ".cheerio/snapshot-manifest.json",
+          errorKind: "manifest",
+          dataVersion: data.appState.dataVersion,
+        });
+      }
+    },
+    [appendStorageEvent],
+  );
+
   const currentProject = useMemo(
     () => projects.find((project) => project.id === currentProjectId) ?? projects[0] ?? null,
     [currentProjectId, projects],
@@ -860,6 +879,7 @@ function AppShell() {
           relatedPath: data.dataDir,
           dataVersion: data.appState.dataVersion,
         });
+        appendManifestWarningEvents(data);
         void refreshBackups();
       })
       .catch((reason: unknown) => {
@@ -894,7 +914,7 @@ function AppShell() {
     return () => {
       cancelled = true;
     };
-  }, [appendStorageEvent, hydrateLoadedData, invalidateMigrationState, refreshBackups]);
+  }, [appendManifestWarningEvents, appendStorageEvent, hydrateLoadedData, invalidateMigrationState, refreshBackups]);
 
   useEffect(() => {
     if (!loaded || !canPersistRef.current) return;
@@ -1610,6 +1630,7 @@ function AppShell() {
         relatedPath: data.dataDir,
         dataVersion: data.appState.dataVersion,
       });
+      appendManifestWarningEvents(data);
       console.info(shouldSaveCurrentData ? "Cheerio Flow storage root set" : "Cheerio Flow storage root switched", data.report);
     } catch (reason: unknown) {
       const message = reason instanceof Error ? reason.message : String(reason);
@@ -1633,7 +1654,7 @@ function AppShell() {
         dataVersion: appStateRef.current.dataVersion,
       });
     }
-  }, [appendStorageEvent, hydrateLoadedData, invalidateMigrationState, refreshBackups, storageRootInput]);
+  }, [appendManifestWarningEvents, appendStorageEvent, hydrateLoadedData, invalidateMigrationState, refreshBackups, storageRootInput]);
 
   const handleCreateFullBackup = useCallback(async () => {
     if (!canPersistRef.current) {
@@ -1745,6 +1766,7 @@ function AppShell() {
         relatedPath: report.restoredDataDir,
         dataVersion: data.appState.dataVersion,
       });
+      appendManifestWarningEvents(data);
     } catch (reason: unknown) {
       setRestoreStatus("error");
       const restoreMessage = reason instanceof Error ? reason.message : String(reason);
@@ -1765,6 +1787,7 @@ function AppShell() {
       try {
         const data = await loadDatabase();
         hydrateLoadedData(data);
+        appendManifestWarningEvents(data);
         setError(restoreMessage);
         setStorageErrorKind("restore");
       } catch (loadReason: unknown) {
@@ -1778,7 +1801,7 @@ function AppShell() {
         setStorageErrorKind("restore");
       }
     }
-  }, [appendStorageEvent, hydrateLoadedData, invalidateMigrationState, restoreConfirmation, selectedBackupId]);
+  }, [appendManifestWarningEvents, appendStorageEvent, hydrateLoadedData, invalidateMigrationState, restoreConfirmation, selectedBackupId]);
 
   const handleGenerateMigrationDryRunPlan = useCallback(async () => {
     invalidateMigrationState();

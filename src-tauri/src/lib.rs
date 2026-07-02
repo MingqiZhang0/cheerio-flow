@@ -1299,6 +1299,17 @@ fn snapshot_manifest_path(data_root: &Path) -> PathBuf {
     data_root.join(".cheerio").join("snapshot-manifest.json")
 }
 
+fn snapshot_manifest_warning(
+    message: impl Into<String>,
+    related_path: impl Into<String>,
+) -> StorageWarning {
+    StorageWarning {
+        kind: "snapshot-manifest".to_string(),
+        message: message.into(),
+        related_path: Some(related_path.into()),
+    }
+}
+
 pub fn build_snapshot_manifest_in_memory(
     data_root: &Path,
     app_version: &str,
@@ -1405,6 +1416,223 @@ fn best_effort_generate_snapshot_manifest(
             })
         }
     }
+}
+
+fn collect_snapshot_manifest_verification_warnings(data_root: &Path) -> Vec<StorageWarning> {
+    let manifest_relative_path = ".cheerio/snapshot-manifest.json";
+    let manifest_path = snapshot_manifest_path(data_root);
+    let manifest_metadata = match fs::symlink_metadata(&manifest_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return vec![snapshot_manifest_warning(
+                "Snapshot manifest is missing; active data was loaded without integrity verification.",
+                manifest_relative_path,
+            )];
+        }
+        Err(_) => {
+            return vec![snapshot_manifest_warning(
+                "Snapshot manifest could not be inspected; active data was loaded without integrity verification.",
+                manifest_relative_path,
+            )];
+        }
+    };
+    if manifest_metadata.file_type().is_dir() {
+        return vec![snapshot_manifest_warning(
+            "Snapshot manifest path is a directory; active data was loaded without integrity verification.",
+            manifest_relative_path,
+        )];
+    }
+    if !manifest_metadata.file_type().is_file() {
+        return vec![snapshot_manifest_warning(
+            "Snapshot manifest is not a regular file; active data was loaded without integrity verification.",
+            manifest_relative_path,
+        )];
+    }
+
+    let manifest_text = match fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(_) => {
+            return vec![snapshot_manifest_warning(
+                "Snapshot manifest could not be read; active data was loaded without integrity verification.",
+                manifest_relative_path,
+            )];
+        }
+    };
+    let manifest_value = match serde_json::from_str::<serde_json::Value>(&manifest_text) {
+        Ok(value) => value,
+        Err(_) => {
+            return vec![snapshot_manifest_warning(
+                "Snapshot manifest could not be parsed; active data was loaded without integrity verification.",
+                manifest_relative_path,
+            )];
+        }
+    };
+    if verify_snapshot_manifest_json_value(&manifest_value).is_err() {
+        return vec![snapshot_manifest_warning(
+            "Snapshot manifest schema is invalid; active data was loaded without integrity verification.",
+            manifest_relative_path,
+        )];
+    }
+    let manifest = match serde_json::from_value::<SnapshotManifest>(manifest_value) {
+        Ok(manifest) => manifest,
+        Err(_) => {
+            return vec![snapshot_manifest_warning(
+                "Snapshot manifest schema is invalid; active data was loaded without integrity verification.",
+                manifest_relative_path,
+            )];
+        }
+    };
+
+    let inventory = match collect_active_snapshot_file_inventory(data_root) {
+        Ok(inventory) => inventory,
+        Err(_) => {
+            return vec![snapshot_manifest_warning(
+                "Active data inventory could not be collected; active data was loaded without manifest deep verification.",
+                manifest_relative_path,
+            )];
+        }
+    };
+    let current_group_count = match active_group_count_for_snapshot_manifest(data_root) {
+        Ok(count) => count,
+        Err(_) => {
+            return vec![snapshot_manifest_warning(
+                "Active data group count could not be collected; active data was loaded without manifest deep verification.",
+                manifest_relative_path,
+            )];
+        }
+    };
+
+    let mut warnings = Vec::new();
+    if manifest.data_version != inventory.data_version {
+        warnings.push(snapshot_manifest_warning(
+            format!(
+                "Snapshot manifest dataVersion {} does not match active dataVersion {}.",
+                manifest.data_version, inventory.data_version
+            ),
+            manifest_relative_path,
+        ));
+    }
+    if manifest.layout_kind != inventory.layout_kind {
+        warnings.push(snapshot_manifest_warning(
+            "Snapshot manifest layoutKind does not match active layoutKind.",
+            manifest_relative_path,
+        ));
+    }
+
+    let current_project_count = inventory
+        .files
+        .iter()
+        .filter(|entry| entry.role == SnapshotFileRole::Project)
+        .count();
+    if manifest.project_count != current_project_count {
+        warnings.push(snapshot_manifest_warning(
+            format!(
+                "Snapshot manifest projectCount {} does not match active project count {}.",
+                manifest.project_count, current_project_count
+            ),
+            manifest_relative_path,
+        ));
+    }
+    if manifest.group_count != current_group_count {
+        warnings.push(snapshot_manifest_warning(
+            format!(
+                "Snapshot manifest groupCount {} does not match active group count {}.",
+                manifest.group_count, current_group_count
+            ),
+            manifest_relative_path,
+        ));
+    }
+
+    let manifest_files = manifest
+        .files
+        .iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<HashMap<_, _>>();
+    let current_files = inventory
+        .files
+        .iter()
+        .map(|entry| (entry.relative_path.clone(), entry))
+        .collect::<HashMap<_, _>>();
+
+    for manifest_entry in &manifest.files {
+        let related_path = manifest_entry.path.clone();
+        let Some(current_entry) = current_files.get(&manifest_entry.path) else {
+            warnings.push(snapshot_manifest_warning(
+                format!(
+                    "Snapshot manifest references a file that is missing: {}.",
+                    manifest_entry.path
+                ),
+                related_path,
+            ));
+            continue;
+        };
+        if manifest_entry.role != current_entry.role {
+            warnings.push(snapshot_manifest_warning(
+                format!(
+                    "Snapshot manifest role mismatch for {}.",
+                    manifest_entry.path
+                ),
+                related_path.clone(),
+            ));
+        }
+
+        let file_path = snapshot_manifest_file_path(data_root, &manifest_entry.path);
+        let metadata = match fs::metadata(&file_path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                warnings.push(snapshot_manifest_warning(
+                    format!(
+                        "Active file could not be inspected for snapshot manifest verification: {}.",
+                        manifest_entry.path
+                    ),
+                    related_path.clone(),
+                ));
+                continue;
+            }
+        };
+        if metadata.len() != manifest_entry.size_bytes {
+            warnings.push(snapshot_manifest_warning(
+                format!(
+                    "Snapshot manifest size mismatch for {}.",
+                    manifest_entry.path
+                ),
+                related_path.clone(),
+            ));
+        }
+        match compute_file_sha256_hex(&file_path) {
+            Ok(sha256) if sha256 != manifest_entry.sha256 => {
+                warnings.push(snapshot_manifest_warning(
+                    format!(
+                        "Snapshot manifest checksum mismatch for {}.",
+                        manifest_entry.path
+                    ),
+                    related_path.clone(),
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => warnings.push(snapshot_manifest_warning(
+                format!(
+                    "Active file could not be checksummed for snapshot manifest verification: {}.",
+                    manifest_entry.path
+                ),
+                related_path.clone(),
+            )),
+        }
+    }
+
+    for current_entry in &inventory.files {
+        if !manifest_files.contains_key(&current_entry.relative_path) {
+            warnings.push(snapshot_manifest_warning(
+                format!(
+                    "Active file is not listed in snapshot manifest: {}.",
+                    current_entry.relative_path
+                ),
+                current_entry.relative_path.clone(),
+            ));
+        }
+    }
+
+    warnings
 }
 
 fn load_project_file(
@@ -1716,6 +1944,7 @@ fn load_database_from_paths(
     };
 
     let mut storage_warnings = Vec::new();
+    let mut bootstrapped_new_workspace = false;
     if projects.is_empty() {
         if classification != DataRootClassification::NewEmptyWorkspace {
             return Err(format!(
@@ -1737,10 +1966,14 @@ fn load_database_from_paths(
         {
             storage_warnings.push(warning);
         }
+        bootstrapped_new_workspace = true;
     }
 
     projects.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     let mut report = build_report(&storage_root, &data_root, &bootstrap, &projects);
+    if !bootstrapped_new_workspace {
+        storage_warnings.extend(collect_snapshot_manifest_verification_warnings(&data_root));
+    }
     report.warnings = storage_warnings;
 
     Ok(PersistedData {
@@ -4728,6 +4961,39 @@ mod tests {
         data_root
     }
 
+    fn sample_v2_manifest_storage_root(label: &str) -> (PathBuf, PathBuf) {
+        let storage_root = temp_test_dir(label);
+        let data_root = storage_root.join(DATA_DIR_NAME);
+        write_json(
+            &data_root.join(APP_STATE_FILE),
+            &sample_app_state(CURRENT_DATA_VERSION, "project-a"),
+        )
+        .expect("write app state");
+        write_json(
+            &data_root.join(GROUPS_FILE),
+            &vec![sample_group("group-a", vec!["project-b"])],
+        )
+        .expect("write groups");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a", None),
+        )
+        .expect("write ungrouped project");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("groups")
+                .join("group-a")
+                .join("project-b.json"),
+            &sample_project("project-b", Some("group-a")),
+        )
+        .expect("write grouped project");
+        (storage_root, data_root)
+    }
+
     fn sample_manifest_for_test(data_root: &Path) -> SnapshotManifest {
         build_snapshot_manifest_in_memory(data_root, "0.1.7", "2026-07-01T12:34:56Z")
             .expect("build manifest")
@@ -5721,6 +5987,189 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_manifest_verification_valid_manifest_returns_no_warnings() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-warning-valid");
+        let manifest = sample_manifest_for_test(&data_root);
+        write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+
+        let warnings = collect_snapshot_manifest_verification_warnings(&data_root);
+
+        assert!(warnings.is_empty());
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_verification_missing_manifest_returns_warning() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-warning-missing");
+        assert!(!data_root.join(".cheerio").exists());
+
+        let warnings = collect_snapshot_manifest_verification_warnings(&data_root);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].kind, "snapshot-manifest");
+        assert_eq!(
+            warnings[0].related_path.as_deref(),
+            Some(".cheerio/snapshot-manifest.json")
+        );
+        assert!(warnings[0].message.contains("manifest is missing"));
+        assert!(!data_root.join(".cheerio").exists());
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_verification_corrupt_manifest_returns_warning() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-warning-corrupt");
+        let manifest_path = data_root.join(".cheerio").join("snapshot-manifest.json");
+        fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
+            .expect("create manifest dir");
+        fs::write(&manifest_path, "{ not valid json").expect("write corrupt manifest");
+
+        let warnings = collect_snapshot_manifest_verification_warnings(&data_root);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("could not be parsed"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_verification_invalid_schema_returns_warning() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-warning-schema");
+        write_json(
+            &data_root.join(".cheerio").join("snapshot-manifest.json"),
+            &serde_json::json!({ "manifestVersion": 1 }),
+        )
+        .expect("write invalid manifest schema");
+
+        let warnings = collect_snapshot_manifest_verification_warnings(&data_root);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("schema is invalid"));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_verification_checksum_and_size_mismatch_returns_warnings() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-warning-checksum");
+        let manifest = sample_manifest_for_test(&data_root);
+        write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-a.json"),
+            &sample_project("project-a-modified", None),
+        )
+        .expect("modify active project");
+
+        let warnings = collect_snapshot_manifest_verification_warnings(&data_root);
+
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.message.contains("size mismatch")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.message.contains("checksum mismatch")));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_verification_extra_active_file_returns_warning() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-warning-extra");
+        let manifest = sample_manifest_for_test(&data_root);
+        write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+        write_json(
+            &data_root
+                .join("projects")
+                .join("ungrouped")
+                .join("project-extra.json"),
+            &sample_project("project-extra", None),
+        )
+        .expect("write extra project");
+
+        let warnings = collect_snapshot_manifest_verification_warnings(&data_root);
+
+        assert!(warnings.iter().any(|warning| warning
+            .message
+            .contains("Active file is not listed in snapshot manifest")));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_verification_manifest_listed_missing_file_returns_warning() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-warning-listed-missing");
+        let mut manifest = sample_manifest_for_test(&data_root);
+        manifest.files.push(SnapshotManifestFileEntry {
+            path: "projects/ungrouped/missing-project.json".to_string(),
+            role: SnapshotFileRole::Project,
+            sha256: "0".repeat(64),
+            size_bytes: 12,
+        });
+        write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+
+        let warnings = collect_snapshot_manifest_verification_warnings(&data_root);
+
+        assert!(warnings.iter().any(|warning| warning
+            .message
+            .contains("references a file that is missing")));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_verification_version_and_layout_mismatch_returns_warning() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-warning-version-layout");
+        let mut manifest = sample_manifest_for_test(&data_root);
+        manifest.data_version = LEGACY_DATA_VERSION;
+        manifest.layout_kind = SnapshotLayoutKind::V1Flat;
+        write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+
+        let warnings = collect_snapshot_manifest_verification_warnings(&data_root);
+
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.message.contains("dataVersion")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.message.contains("layoutKind")));
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
+    fn snapshot_manifest_verification_does_not_write_files() {
+        let data_root = sample_v2_manifest_workspace("snapshot-manifest-warning-readonly");
+        let manifest = sample_manifest_for_test(&data_root);
+        let manifest_path =
+            write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+        let active_path = data_root
+            .join("projects")
+            .join("ungrouped")
+            .join("project-a.json");
+        let manifest_before = fs::read(&manifest_path).expect("read manifest before");
+        let active_before = fs::read(&active_path).expect("read active before");
+
+        let warnings = collect_snapshot_manifest_verification_warnings(&data_root);
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            fs::read(&manifest_path).expect("read manifest after"),
+            manifest_before
+        );
+        assert_eq!(
+            fs::read(&active_path).expect("read active after"),
+            active_before
+        );
+
+        fs::remove_dir_all(data_root).ok();
+    }
+
+    #[test]
     fn write_snapshot_manifest_atomic_does_not_modify_active_files() {
         let data_root = sample_v2_manifest_workspace("snapshot-manifest-active-unchanged");
         let app_state_path = data_root.join(APP_STATE_FILE);
@@ -5923,6 +6372,80 @@ mod tests {
             LEGACY_DATA_VERSION
         );
         assert_eq!(loaded.projects.len(), 1);
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn load_database_success_with_valid_manifest_has_empty_warnings() {
+        let (storage_root, data_root) =
+            sample_v2_manifest_storage_root("load-valid-manifest-warnings");
+        let manifest = sample_manifest_for_test(&data_root);
+        write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+
+        let loaded =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect("load workspace");
+
+        assert!(loaded.report.warnings.is_empty());
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn load_database_success_with_missing_manifest_returns_warning() {
+        let (storage_root, _data_root) =
+            sample_v2_manifest_storage_root("load-missing-manifest-warning");
+
+        let loaded =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect("load workspace");
+
+        assert!(!loaded.report.warnings.is_empty());
+        assert!(loaded
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == "snapshot-manifest"
+                && warning.related_path.as_deref() == Some(".cheerio/snapshot-manifest.json")));
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn load_database_success_with_corrupt_manifest_returns_warning() {
+        let (storage_root, data_root) =
+            sample_v2_manifest_storage_root("load-corrupt-manifest-warning");
+        let manifest_path = data_root.join(".cheerio").join("snapshot-manifest.json");
+        fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
+            .expect("create manifest dir");
+        fs::write(&manifest_path, "{ not valid json").expect("write corrupt manifest");
+
+        let loaded =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root))
+                .expect("load workspace");
+
+        assert!(loaded
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("could not be parsed")));
+
+        fs::remove_dir_all(storage_root).ok();
+    }
+
+    #[test]
+    fn load_database_active_load_failure_still_returns_error() {
+        let (storage_root, data_root) =
+            sample_v2_manifest_storage_root("load-active-failure-not-warning-ok");
+        let manifest = sample_manifest_for_test(&data_root);
+        write_snapshot_manifest_atomic(&data_root, &manifest).expect("write manifest");
+        fs::write(data_root.join(APP_STATE_FILE), "{ not valid json").expect("corrupt app state");
+
+        let result =
+            load_database_from_paths(storage_root.clone(), bootstrap_path_for_test(&storage_root));
+
+        assert!(result.is_err());
 
         fs::remove_dir_all(storage_root).ok();
     }
